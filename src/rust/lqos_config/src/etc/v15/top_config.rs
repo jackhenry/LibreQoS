@@ -597,7 +597,9 @@ mod test {
         raw.lines()
             .filter(|line| {
                 let trimmed = line.trim_start();
-                !keys.iter().any(|key| trimmed.starts_with(&format!("{key} =")))
+                !keys
+                    .iter()
+                    .any(|key| trimmed.starts_with(&format!("{key} =")))
             })
             .collect::<Vec<_>>()
             .join("\n")

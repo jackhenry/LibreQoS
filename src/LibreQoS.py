@@ -345,6 +345,46 @@ def _attachment_lookup_candidates(node_key, node_data):
     return candidates
 
 
+def _circuit_attachment_name_candidates(circuit):
+    candidates = []
+    for candidate_name in (
+        circuit.get('ParentNode', ''),
+        circuit.get('effectiveParentNodeName', ''),
+    ):
+        candidate = str(candidate_name or '').strip()
+        if candidate and candidate != 'none' and candidate not in candidates:
+            candidates.append(candidate)
+
+    if circuit.get('parentResolvedByShapingInputs') is not True:
+        logical_parent = str(circuit.get('logicalParentNode', '') or '').strip()
+        if logical_parent and logical_parent != 'none' and logical_parent not in candidates:
+            candidates.append(logical_parent)
+
+    return candidates
+
+
+def _validate_planned_circuit_attachment(node_name, node_data, circuit, planned_identity):
+    site_major = _parse_int_token(node_data.get('classMajor'))
+    site_up_major = _parse_int_token(node_data.get('up_classMajor'))
+    planned_major = _parse_int_token(planned_identity.get('class_major'))
+    planned_up_major = _parse_int_token(planned_identity.get('up_class_major'))
+    if None in (site_major, site_up_major, planned_major, planned_up_major):
+        raise ValueError(
+            f"Incomplete class identity while attaching circuit '{circuit.get('circuitID', '')}' to parent '{node_name}'"
+        )
+    if site_major != planned_major or site_up_major != planned_up_major:
+        raise ValueError(
+            "Planned circuit class majors do not match the selected parent node: "
+            f"circuit='{circuit.get('circuitID', '')}', parent='{node_name}', "
+            f"parentMajor={hex(site_major)}, parentUpMajor={hex(site_up_major)}, "
+            f"plannedMajor={hex(planned_major)}, plannedUpMajor={hex(planned_up_major)}, "
+            f"ParentNode='{circuit.get('ParentNode', '')}', "
+            f"logicalParentNode='{circuit.get('logicalParentNode', '')}', "
+            f"resolutionSource='{circuit.get('parentResolutionSource', '')}'"
+        )
+    return planned_major, planned_up_major
+
+
 def _current_topology_source_generation():
     try:
         generation = calculate_topology_source_generation()
@@ -461,6 +501,7 @@ def loadSubscriberCircuitsFromShapingInputs(shapingInputsPath):
             "circuitID": circuitID,
             "circuitName": str(circuit.get('circuit_name', '') or ''),
             "ParentNode": parent_node if parent_node != '' else 'none',
+            "effectiveParentNodeName": parent_node,
             "ParentNodeID": parent_node_id,
             "AnchorNodeID": anchor_node_id,
             "devices": devices,
@@ -1770,13 +1811,8 @@ def refreshShapers():
             if parent_id:
                 circuits_by_parent_id.setdefault(parent_id, []).append(circuit)
 
-            for parent_name in {
-                str(circuit.get('ParentNode', '') or '').strip(),
-                str(circuit.get('effectiveParentNodeName', '') or '').strip(),
-                str(circuit.get('logicalParentNode', '') or '').strip(),
-            }:
-                if parent_name:
-                    circuits_by_parent_name.setdefault(parent_name, []).append(circuit)
+            for parent_name in _circuit_attachment_name_candidates(circuit):
+                circuits_by_parent_name.setdefault(parent_name, []).append(circuit)
 
         # Parse network structure and add devices from ShapedDevices.csv
         print("Parsing network structure and tallying devices")
@@ -2184,8 +2220,9 @@ def refreshShapers():
             for node in sorted_node_keys(data, depth):
                 node_data = data[node]
                 queue_token = _parse_int_token(node_data.get('cpuNum'))
-                major = _parse_int_token(node_data.get('classMajor'))
-                if queue_token is None or major is None:
+                site_major = _parse_int_token(node_data.get('classMajor'))
+                site_up_major = _parse_int_token(node_data.get('up_classMajor'))
+                if queue_token is None or site_major is None or site_up_major is None:
                     continue
                 queue = queue_token + 1
                 circuitsForThisNetworkNode = []
@@ -2236,11 +2273,15 @@ def refreshShapers():
                         if planned_identity is None:
                             raise ValueError(f"Missing planned circuit identity for {planner_key}")
                         candidate_minor = int(planned_identity["class_minor"])
-                        major = int(planned_identity["class_major"])
-                        up_major = int(planned_identity["up_class_major"])
+                        planned_major, planned_up_major = _validate_planned_circuit_attachment(
+                            node,
+                            node_data,
+                            circuit,
+                            planned_identity,
+                        )
                         ensure_minor_capacity(queue, candidate_minor)
-                        flowIDstring = hex(major) + ':' + hex(candidate_minor)
-                        upFlowIDstring = hex(up_major) + ':' + hex(candidate_minor)
+                        flowIDstring = hex(planned_major) + ':' + hex(candidate_minor)
+                        upFlowIDstring = hex(planned_up_major) + ':' + hex(candidate_minor)
                         circuit['classid'] = flowIDstring
                         circuit['up_classid'] = upFlowIDstring
                         attached_circuit_ids.add(circuit_id)
@@ -2268,8 +2309,8 @@ def refreshShapers():
                             "devices": circuit['devices'],
                             "classid": flowIDstring,
                             "up_classid": upFlowIDstring,
-                            "classMajor": hex(major),
-                            "up_classMajor": hex(up_major),
+                            "classMajor": hex(planned_major),
+                            "up_classMajor": hex(planned_up_major),
                             "classMinor": hex(candidate_minor),
                             "comment": circuit['comment'],
                         }

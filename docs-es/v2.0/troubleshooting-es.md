@@ -134,6 +134,17 @@ sudo systemctl restart lqosd lqos_scheduler
 
 Si oscila entre ready/error, valide credenciales y timeouts de integración en `/etc/lqos.conf`.
 
+Si el shaping de arranque comienza antes de que topology runtime publique la generación actual de `shaping_inputs.json`, las versiones actuales mantienen el scheduler en un estado de espera de arranque y reintentan el shaping inicial cada pocos segundos. Un mensaje breve como `still building outputs for the current source generation` justo después de reiniciar normalmente significa que LibreQoS todavía está terminando el ciclo de importación y publicación de runtime, no que el shaping quede detenido hasta la siguiente actualización de 30 minutos.
+
+Si el arranque del scheduler permanece demasiado tiempo en esa espera, o entra en estado degradado con un mensaje indicando que topology runtime falló para la generación actual, revise:
+
+```bash
+cat /opt/libreqos/state/topology/topology_runtime_status.json
+ls -lh /opt/libreqos/state/topology/topology_effective_state.json /opt/libreqos/state/topology/network.effective.json /opt/libreqos/state/shaping/shaping_inputs.json
+journalctl -u lqos_scheduler --since "30 minutes ago"
+journalctl -u lqosd --since "30 minutes ago"
+```
+
 ### RTNETLINK answers: Invalid argument
 
 Suele indicar que no se pudo agregar correctamente qdisc MQ en la NIC (colas RX/TX insuficientes). Verifique [NICs recomendadas](requirements-es.md).

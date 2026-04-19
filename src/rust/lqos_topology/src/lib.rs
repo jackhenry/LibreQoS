@@ -23,7 +23,7 @@ use lqos_overrides::{
 };
 use lqos_topology_compile::{TopologyCompiledShapingFile, TopologyImportFile};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
@@ -106,7 +106,12 @@ fn optional_non_empty_owned(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| optional_non_empty(&value))
 }
 
-fn collect_exported_effective_nodes(value: &Value, by_id: &mut HashMap<String, String>) {
+fn collect_exported_effective_nodes(
+    value: &Value,
+    by_id: &mut HashMap<String, String>,
+    unique_names: &mut HashMap<String, Option<String>>,
+    ambiguous_names: &mut HashSet<String>,
+) {
     let Some(nodes) = value.as_object() else {
         return;
     };
@@ -124,11 +129,24 @@ fn collect_exported_effective_nodes(value: &Value, by_id: &mut HashMap<String, S
             .and_then(Value::as_str)
             .and_then(optional_non_empty)
             .or_else(|| optional_non_empty(key));
-        if !is_virtual && let (Some(node_id), Some(node_name)) = (node_id, node_name) {
-            by_id.insert(node_id, node_name);
+        if !is_virtual && let Some(node_name) = node_name {
+            if let Some(node_id) = node_id.clone() {
+                by_id.insert(node_id, node_name.clone());
+            }
+            if !ambiguous_names.contains(&node_name) {
+                match unique_names.entry(node_name) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(node_id);
+                    }
+                    Entry::Occupied(entry) => {
+                        let (duplicate_name, _) = entry.remove_entry();
+                        ambiguous_names.insert(duplicate_name);
+                    }
+                }
+            }
         }
         if let Some(children) = map.get("children") {
-            collect_exported_effective_nodes(children, by_id);
+            collect_exported_effective_nodes(children, by_id, unique_names, ambiguous_names);
         }
     }
 }
@@ -217,6 +235,7 @@ fn resolve_legacy_parent_from_effective_tree(
     parent_node: &str,
     parent_node_id: Option<&str>,
     exported_effective_nodes: &HashMap<String, String>,
+    exported_effective_names: &HashMap<String, Option<String>>,
     exported_effective_aliases: &HashMap<String, (String, String)>,
     queue_aliases_by_id: &HashMap<String, (String, String)>,
     queue_aliases_by_name: &HashMap<String, (String, String)>,
@@ -235,11 +254,12 @@ fn resolve_legacy_parent_from_effective_tree(
         return Some(resolved);
     }
     if let Some(parent_name) = trimmed_name.as_deref()
-        && let Some(parent_id) = exported_effective_nodes
-            .iter()
-            .find_map(|(node_id, node_name)| (node_name == parent_name).then(|| node_id.clone()))
+        && let Some(parent_id) = exported_effective_names.get(parent_name)
     {
-        return Some((parent_id, parent_name.to_string()));
+        return Some((
+            parent_id.clone().unwrap_or_default(),
+            parent_name.to_string(),
+        ));
     }
     if let Some(parent_name) = trimmed_name.as_deref()
         && let Some(resolved) = queue_aliases_by_name.get(parent_name).cloned()
@@ -496,10 +516,17 @@ fn build_shaping_inputs(
         .map(|node| (node.node_id.as_str(), node))
         .collect::<HashMap<_, _>>();
     let mut exported_effective_nodes = HashMap::<String, String>::new();
+    let mut exported_effective_names = HashMap::<String, Option<String>>::new();
     let mut exported_effective_aliases = HashMap::<String, (String, String)>::new();
+    let mut ambiguous_exported_effective_names = HashSet::<String>::new();
     let attachment_owner_by_attachment_id = build_attachment_owner_map(&artifacts.ui_state);
     if let Some(effective_network) = artifacts.effective_network.as_ref() {
-        collect_exported_effective_nodes(effective_network, &mut exported_effective_nodes);
+        collect_exported_effective_nodes(
+            effective_network,
+            &mut exported_effective_nodes,
+            &mut exported_effective_names,
+            &mut ambiguous_exported_effective_names,
+        );
         collect_exported_effective_aliases(effective_network, &mut exported_effective_aliases);
     }
     let (queue_aliases_by_id, queue_aliases_by_name) = build_effective_queue_aliases(
@@ -627,6 +654,7 @@ fn build_shaping_inputs(
                 &device.parent_node,
                 device.parent_node_id.as_deref(),
                 &exported_effective_nodes,
+                &exported_effective_names,
                 &exported_effective_aliases,
                 &queue_aliases_by_id,
                 &queue_aliases_by_name,
@@ -4758,6 +4786,63 @@ mod tests {
     }
 
     #[test]
+    fn shaping_inputs_resolve_legacy_parent_by_unique_effective_name_without_id() {
+        let lqos_directory = unique_temp_dir("lqos-topology-legacy-parent-name-only");
+        let config = Config {
+            lqos_directory: lqos_directory.to_string_lossy().to_string(),
+            state_directory: None,
+            ..Config::default()
+        };
+        fs::write(
+            lqos_directory.join("ShapedDevices.csv"),
+            concat!(
+                "Circuit ID,Circuit Name,Device ID,Device Name,Parent Node,Parent Node ID,Anchor Node ID,MAC,IPv4,IPv6,Download Min Mbps,Upload Min Mbps,Download Max Mbps,Upload Max Mbps,Comment\n",
+                "\"circuit-1\",\"Circuit 1\",\"device-1\",\"Device 1\",\"Tower 1\",\"\",\"\",\"aa:bb:cc:dd:ee:ff\",\"192.0.2.10/32\",\"\",\"10\",\"10\",\"100\",\"100\",\"\"\n",
+            ),
+        )
+        .expect("ShapedDevices.csv should write");
+
+        let artifacts = EffectiveTopologyArtifacts {
+            effective: TopologyEffectiveStateFile {
+                schema_version: 1,
+                generated_unix: Some(1),
+                canonical_generated_unix: Some(1),
+                health_generated_unix: Some(1),
+                nodes: Vec::new(),
+            },
+            ui_state: TopologyEditorStateFile {
+                schema_version: 1,
+                source: "test".to_string(),
+                generated_unix: Some(1),
+                ingress_identity: None,
+                nodes: Vec::new(),
+            },
+            effective_network: Some(json!({
+                "Tower 1": {
+                    "children": {}
+                }
+            })),
+        };
+
+        let shaping_inputs = build_shaping_inputs(&config, &artifacts)
+            .expect("shaping inputs should build")
+            .expect("shaping inputs should exist");
+        let circuit = shaping_inputs
+            .circuits
+            .iter()
+            .find(|circuit| circuit.circuit_id == "circuit-1")
+            .expect("expected circuit");
+
+        assert_eq!(circuit.effective_parent_node_id, "");
+        assert_eq!(circuit.effective_parent_node_name, "Tower 1");
+        assert_eq!(
+            circuit.resolution_source,
+            lqos_config::TopologyShapingResolutionSource::LegacyParent
+        );
+        assert!(shaping_inputs.warnings.is_empty());
+    }
+
+    #[test]
     fn shaping_inputs_skip_virtual_effective_nodes_when_resolving_physical_parent() {
         let lqos_directory = unique_temp_dir("lqos-topology-legacy-parent-virtual");
         let config = Config {
@@ -6214,7 +6299,10 @@ mod tests {
             .get("Root Aggregation")
             .and_then(Value::as_object)
             .expect("root node should remain exported");
-        assert_eq!(root_node.get("virtual").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            root_node.get("virtual").and_then(Value::as_bool),
+            Some(true)
+        );
         let children = root_node["children"]
             .as_object()
             .expect("root node should retain its logical children");

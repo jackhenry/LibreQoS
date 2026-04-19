@@ -33,9 +33,14 @@ shaping_runtime_hash = 0
 INTEGRATION_FAILURE_PREVIEW_LINES = 30
 INTEGRATION_FAILURE_PREVIEW_CHARS = 4000
 TOPOLOGY_RUNTIME_REFRESH_SECONDS = 3
+STARTUP_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 SCHEDULER_STARTUP_STEP_COUNT = 5
 SCHEDULER_REFRESH_STEP_COUNT = 4
 scheduler_status_bus_enabled = True
+startup_topology_runtime_pending = False
+startup_topology_runtime_generation = None
+startup_topology_runtime_started_monotonic = None
+startup_topology_runtime_last_report_state = None
 
 
 def configure_scheduler_stdio():
@@ -1004,6 +1009,10 @@ def importAndShapeFullReload():
     importFromCRM()
     publish_scheduler_progress(True, "starting_topology_runtime", "Starting topology runtime", 4, SCHEDULER_STARTUP_STEP_COUNT)
     if not ensure_topology_runtime_process(wait_for_outputs=True):
+        ready, detail, generation = topology_runtime_readiness_detail()
+        if not ready and _topology_runtime_not_ready_is_transient(detail):
+            _begin_startup_topology_runtime_wait(generation)
+            return False
         report_topology_runtime_not_ready(
             "Scheduler startup shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
@@ -1174,6 +1183,160 @@ def report_topology_runtime_not_ready(context: str, *, phase_label: str, step_co
     )
 
 
+def _reset_startup_topology_runtime_wait():
+    global startup_topology_runtime_pending
+    global startup_topology_runtime_generation
+    global startup_topology_runtime_started_monotonic
+    global startup_topology_runtime_last_report_state
+
+    startup_topology_runtime_pending = False
+    startup_topology_runtime_generation = None
+    startup_topology_runtime_started_monotonic = None
+    startup_topology_runtime_last_report_state = None
+
+
+def _topology_runtime_not_ready_is_transient(detail: str) -> bool:
+    detail_text = str(detail or "").strip()
+    if detail_text.startswith("Topology runtime failed for the current source generation:"):
+        return False
+    return True
+
+
+def _publish_startup_topology_runtime_wait(generation: str | None):
+    global startup_topology_runtime_last_report_state
+
+    generation_token = str(generation or "").strip() or "unknown"
+    state = ("waiting", generation_token)
+    if startup_topology_runtime_last_report_state == state:
+        return
+    startup_topology_runtime_last_report_state = state
+    if generation_token != "unknown":
+        print(
+            "Scheduler startup waiting for topology runtime outputs for "
+            f"generation {generation_token[:12]}."
+        )
+    else:
+        print("Scheduler startup waiting for topology runtime outputs.")
+    publish_scheduler_progress(
+        True,
+        "waiting_for_topology_runtime",
+        "Waiting for topology runtime",
+        4,
+        SCHEDULER_STARTUP_STEP_COUNT,
+        percent=80,
+    )
+
+
+def _begin_startup_topology_runtime_wait(generation: str | None):
+    global startup_topology_runtime_pending
+    global startup_topology_runtime_generation
+    global startup_topology_runtime_started_monotonic
+    global startup_topology_runtime_last_report_state
+
+    generation_token = str(generation or "").strip() or None
+    now = time.monotonic()
+    if (
+        not startup_topology_runtime_pending
+        or startup_topology_runtime_generation != generation_token
+    ):
+        startup_topology_runtime_pending = True
+        startup_topology_runtime_generation = generation_token
+        startup_topology_runtime_started_monotonic = now
+        startup_topology_runtime_last_report_state = None
+    _publish_startup_topology_runtime_wait(generation_token)
+
+
+def _continue_startup_topology_runtime_wait():
+    global shaping_runtime_hash
+    global startup_topology_runtime_generation
+    global startup_topology_runtime_started_monotonic
+    global startup_topology_runtime_last_report_state
+
+    ready, detail, generation = topology_runtime_readiness_detail()
+    generation_token = str(generation or "").strip() or None
+    now = time.monotonic()
+
+    if generation_token != startup_topology_runtime_generation:
+        startup_topology_runtime_generation = generation_token
+        startup_topology_runtime_started_monotonic = now
+        startup_topology_runtime_last_report_state = None
+
+    if ready:
+        publish_scheduler_progress(
+            True,
+            "initial_shaping_reload",
+            "Refreshing shaper state",
+            5,
+            SCHEDULER_STARTUP_STEP_COUNT,
+        )
+        try:
+            if not enable_insight_topology():
+                refreshShapers()
+            shaping_runtime_hash = calculate_shaping_runtime_hash()
+        except ValidationFailure as e:
+            _reset_startup_topology_runtime_wait()
+            report_scheduler_validation_failure(
+                "Scheduler startup shaping refresh blocked by validation",
+                e,
+                startup=True,
+                step_count=SCHEDULER_STARTUP_STEP_COUNT,
+            )
+            shaping_runtime_hash = 0
+            return
+        except Exception as e:
+            _reset_startup_topology_runtime_wait()
+            report_scheduler_runtime_failure(
+                "Scheduler startup shaping refresh failed",
+                e,
+                startup=True,
+            )
+            shaping_runtime_hash = 0
+            return
+
+        _reset_startup_topology_runtime_wait()
+        if shaping_runtime_hash != 0:
+            clear_scheduler_error()
+            publish_scheduler_progress(
+                False,
+                "ready",
+                "Scheduler ready",
+                SCHEDULER_STARTUP_STEP_COUNT,
+                SCHEDULER_STARTUP_STEP_COUNT,
+                percent=100,
+            )
+            return
+
+        report_scheduler_runtime_failure(
+            "Scheduler startup shaping refresh failed",
+            RuntimeError("Shaping runtime hash was not published after startup refresh."),
+            startup=True,
+        )
+        return
+
+    started = startup_topology_runtime_started_monotonic
+    if started is None:
+        startup_topology_runtime_started_monotonic = now
+        started = now
+    elapsed = max(0.0, now - started)
+
+    if (
+        _topology_runtime_not_ready_is_transient(detail)
+        and elapsed < STARTUP_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS
+    ):
+        _publish_startup_topology_runtime_wait(generation_token)
+        return
+
+    state = ("degraded", str(detail or "").strip(), generation_token or "")
+    if startup_topology_runtime_last_report_state == state:
+        return
+    startup_topology_runtime_last_report_state = state
+    report_topology_runtime_not_ready(
+        "Scheduler startup shaping refresh deferred",
+        phase_label="Scheduler waiting for topology runtime",
+        step_count=SCHEDULER_STARTUP_STEP_COUNT,
+    )
+
+
 def wait_for_topology_runtime_ready(timeout_seconds=8.0):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -1192,6 +1355,10 @@ def ensure_topology_runtime_process(wait_for_outputs=False):
 
 def topology_runtime_refresh_tick():
     global shaping_runtime_hash
+
+    if startup_topology_runtime_pending:
+        _continue_startup_topology_runtime_wait()
+        return
 
     if shaping_runtime_hash == 0:
         return

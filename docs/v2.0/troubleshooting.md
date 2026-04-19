@@ -154,19 +154,18 @@ ldd /opt/libreqos/src/liblqos_python.so
 
 Routine package upgrades now keep `lqosd` in charge of the main WebUI when `/etc/lqos.conf` already exists. Current packages no longer start the dedicated `lqos_setup` web service during a normal upgrade just because newer first-run checks are incomplete. If the upgraded host still needs a first admin user or a topology source, finish that work in the normal WebUI (`first-run.html` or `Complete Setup`) instead of expecting `lqos_setup` to take over port `9123`.
 
-If startup shaping fails because `shaping_inputs.json` is missing or stale, current builds leave the scheduler running in a degraded state and wait for the next scheduled full refresh to recover. The high-frequency topology refresh tick stays disabled until one shaping pass completes successfully, so repeated 3-second refresh attempts should not continue hammering a fresh install that has not produced runtime topology inputs yet.
+If startup shaping begins before topology runtime has finished publishing the current generation of `shaping_inputs.json`, current builds keep the scheduler in a startup wait state and retry the initial shaping pass every few seconds. A short `still building outputs for the current source generation` message right after restart now usually means LibreQoS is still finishing the import/runtime publish cycle, not that shaping is stuck until the next 30-minute refresh.
 
-If scheduler startup is degraded with a message about topology runtime still building, that usually means LibreQoS is still finishing an import or refreshing shaping data. Give the current cycle a little time to complete, then recheck Scheduler Status before changing unrelated settings.
-
-If scheduler startup is degraded with a message that topology runtime failed for the current generation, inspect:
+If scheduler startup stays in that wait state for an unusually long time, or degrades with a message that topology runtime failed for the current generation, inspect:
 
 ```bash
-cat /opt/libreqos/src/topology_runtime_status.json
-ls -lh /opt/libreqos/src/topology_effective_state.json /opt/libreqos/src/network.effective.json /opt/libreqos/src/shaping_inputs.json
+cat /opt/libreqos/state/topology/topology_runtime_status.json
+ls -lh /opt/libreqos/state/topology/topology_effective_state.json /opt/libreqos/state/topology/network.effective.json /opt/libreqos/state/shaping/shaping_inputs.json
 journalctl -u lqos_scheduler --since "30 minutes ago"
+journalctl -u lqosd --since "30 minutes ago"
 ```
 
-If Topology Manager changes or imports seem stuck on older data, check whether LibreQoS set older snapshots aside under `/opt/libreqos/src/.topology_stale/`, then review recent scheduler logs before retrying.
+If Topology Manager changes or imports seem stuck on older data, check whether LibreQoS set older snapshots aside under `/opt/libreqos/src/.topology_stale/`, then review recent scheduler and `lqosd` logs before retrying.
 
 If Insight topology looks wrong, review the current troubleshooting snapshot that `lqosd` is preparing for Insight:
 
