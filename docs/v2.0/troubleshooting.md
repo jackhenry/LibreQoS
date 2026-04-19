@@ -156,6 +156,8 @@ Routine package upgrades now keep `lqosd` in charge of the main WebUI when `/etc
 
 If startup shaping begins before topology runtime has finished publishing the current generation of `shaping_inputs.json`, current builds keep the scheduler in a startup wait state and retry the initial shaping pass every few seconds. A short `still building outputs for the current source generation` message right after restart now usually means LibreQoS is still finishing the import/runtime publish cycle, not that shaping is stuck until the next 30-minute refresh.
 
+If a scheduled integration refresh lands while topology runtime is still publishing outputs for the new source generation, current builds keep the scheduler in a waiting state for that generation and retry the scheduled shaping refresh automatically as soon as topology runtime finishes. Treat `Scheduled shaping refresh deferred` as a transient wait only when the message says topology runtime is still building outputs for the current generation. If the message instead says topology runtime failed for the current generation, investigate that runtime failure directly.
+
 If scheduler startup stays in that wait state for an unusually long time, or degrades with a message that topology runtime failed for the current generation, inspect:
 
 ```bash
@@ -174,6 +176,8 @@ cat /opt/libreqos/src/network.insight.debug.json
 ```
 
 Treat `network.insight.debug.json` as a troubleshooting snapshot only; do not edit it.
+
+If `journalctl -u lqosd` shows repeated `BeginIngest queue full`, `IngestChunk queue full`, or `EndIngest queue full` warnings during startup or immediately after a topology import, older builds were dropping Insight ingest frames because the node's outbound control-channel queue was too small for burst uploads. Current builds apply backpressure on the Insight socket for ingest batches instead, so those warnings should no longer be expected during short import/startup bursts. If they still appear after upgrading, inspect recent `lqosd` CPU pressure and control-channel connectivity before assuming shaping itself is unhealthy.
 
 If specific APs or switches appear multiple times with suffixed names such as `... [AP deadbeef]`, check whether UISP is returning duplicate rows for the same device ID. Current builds defensively deduplicate raw UISP devices by `identification.id` before topology graph construction, and skip any residual duplicate device IDs during graph assembly.
 

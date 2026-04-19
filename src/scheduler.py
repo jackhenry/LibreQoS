@@ -34,6 +34,7 @@ INTEGRATION_FAILURE_PREVIEW_LINES = 30
 INTEGRATION_FAILURE_PREVIEW_CHARS = 4000
 TOPOLOGY_RUNTIME_REFRESH_SECONDS = 3
 STARTUP_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
+PARTIAL_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 SCHEDULER_STARTUP_STEP_COUNT = 5
 SCHEDULER_REFRESH_STEP_COUNT = 4
 scheduler_status_bus_enabled = True
@@ -41,6 +42,10 @@ startup_topology_runtime_pending = False
 startup_topology_runtime_generation = None
 startup_topology_runtime_started_monotonic = None
 startup_topology_runtime_last_report_state = None
+partial_topology_runtime_pending = False
+partial_topology_runtime_generation = None
+partial_topology_runtime_started_monotonic = None
+partial_topology_runtime_last_report_state = None
 
 
 def configure_scheduler_stdio():
@@ -1045,6 +1050,10 @@ def importAndShapePartialReload():
     )
     publish_scheduler_progress(True, "partial_topology_runtime", "Refreshing topology runtime", 3, SCHEDULER_REFRESH_STEP_COUNT)
     if not ensure_topology_runtime_process(wait_for_outputs=True):
+        ready, detail, generation = topology_runtime_readiness_detail()
+        if not ready and _topology_runtime_not_ready_is_transient(detail):
+            _begin_partial_topology_runtime_wait(generation)
+            return
         report_topology_runtime_not_ready(
             "Scheduled shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
@@ -1195,6 +1204,18 @@ def _reset_startup_topology_runtime_wait():
     startup_topology_runtime_last_report_state = None
 
 
+def _reset_partial_topology_runtime_wait():
+    global partial_topology_runtime_pending
+    global partial_topology_runtime_generation
+    global partial_topology_runtime_started_monotonic
+    global partial_topology_runtime_last_report_state
+
+    partial_topology_runtime_pending = False
+    partial_topology_runtime_generation = None
+    partial_topology_runtime_started_monotonic = None
+    partial_topology_runtime_last_report_state = None
+
+
 def _topology_runtime_not_ready_is_transient(detail: str) -> bool:
     detail_text = str(detail or "").strip()
     if detail_text.startswith("Topology runtime failed for the current source generation:"):
@@ -1244,6 +1265,50 @@ def _begin_startup_topology_runtime_wait(generation: str | None):
         startup_topology_runtime_started_monotonic = now
         startup_topology_runtime_last_report_state = None
     _publish_startup_topology_runtime_wait(generation_token)
+
+
+def _publish_partial_topology_runtime_wait(generation: str | None):
+    global partial_topology_runtime_last_report_state
+
+    generation_token = str(generation or "").strip() or "unknown"
+    state = ("waiting", generation_token)
+    if partial_topology_runtime_last_report_state == state:
+        return
+    partial_topology_runtime_last_report_state = state
+    if generation_token != "unknown":
+        print(
+            "Scheduled shaping refresh waiting for topology runtime outputs for "
+            f"generation {generation_token[:12]}."
+        )
+    else:
+        print("Scheduled shaping refresh waiting for topology runtime outputs.")
+    publish_scheduler_progress(
+        True,
+        "waiting_for_topology_runtime",
+        "Waiting for topology runtime",
+        3,
+        SCHEDULER_REFRESH_STEP_COUNT,
+        percent=75,
+    )
+
+
+def _begin_partial_topology_runtime_wait(generation: str | None):
+    global partial_topology_runtime_pending
+    global partial_topology_runtime_generation
+    global partial_topology_runtime_started_monotonic
+    global partial_topology_runtime_last_report_state
+
+    generation_token = str(generation or "").strip() or None
+    now = time.monotonic()
+    if (
+        not partial_topology_runtime_pending
+        or partial_topology_runtime_generation != generation_token
+    ):
+        partial_topology_runtime_pending = True
+        partial_topology_runtime_generation = generation_token
+        partial_topology_runtime_started_monotonic = now
+        partial_topology_runtime_last_report_state = None
+    _publish_partial_topology_runtime_wait(generation_token)
 
 
 def _continue_startup_topology_runtime_wait():
@@ -1337,6 +1402,106 @@ def _continue_startup_topology_runtime_wait():
     )
 
 
+def _continue_partial_topology_runtime_wait():
+    global shaping_runtime_hash
+    global partial_topology_runtime_generation
+    global partial_topology_runtime_started_monotonic
+    global partial_topology_runtime_last_report_state
+
+    ready, detail, generation = topology_runtime_readiness_detail()
+    generation_token = str(generation or "").strip() or None
+    now = time.monotonic()
+
+    if generation_token != partial_topology_runtime_generation:
+        partial_topology_runtime_generation = generation_token
+        partial_topology_runtime_started_monotonic = now
+        partial_topology_runtime_last_report_state = None
+
+    if ready:
+        publish_scheduler_progress(
+            True,
+            "partial_runtime_hash",
+            "Checking shaping inputs",
+            4,
+            SCHEDULER_REFRESH_STEP_COUNT,
+        )
+        new_hash = calculate_shaping_runtime_hash()
+        if new_hash == 0:
+            _reset_partial_topology_runtime_wait()
+            report_scheduler_runtime_failure(
+                "Scheduled shaping refresh failed",
+                RuntimeError(
+                    "Shaping runtime hash was not published after topology runtime became ready."
+                ),
+            )
+            return
+        if new_hash != shaping_runtime_hash:
+            publish_scheduler_progress(
+                True,
+                "partial_reload",
+                "Applying incremental shaper refresh",
+                4,
+                SCHEDULER_REFRESH_STEP_COUNT,
+            )
+            try:
+                refreshShapers()
+            except ValidationFailure as e:
+                _reset_partial_topology_runtime_wait()
+                report_scheduler_validation_failure(
+                    "Scheduled shaping refresh blocked by validation",
+                    e,
+                )
+                return
+            except Exception as e:
+                _reset_partial_topology_runtime_wait()
+                report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
+                return
+            shaping_runtime_hash = calculate_shaping_runtime_hash()
+            if shaping_runtime_hash == 0:
+                _reset_partial_topology_runtime_wait()
+                report_scheduler_runtime_failure(
+                    "Scheduled shaping refresh failed",
+                    RuntimeError(
+                        "Shaping runtime hash was not published after scheduled refresh."
+                    ),
+                )
+                return
+        _reset_partial_topology_runtime_wait()
+        clear_scheduler_error()
+        publish_scheduler_progress(
+            False,
+            "ready",
+            "Scheduler ready",
+            SCHEDULER_REFRESH_STEP_COUNT,
+            SCHEDULER_REFRESH_STEP_COUNT,
+            percent=100,
+        )
+        return
+
+    started = partial_topology_runtime_started_monotonic
+    if started is None:
+        partial_topology_runtime_started_monotonic = now
+        started = now
+    elapsed = max(0.0, now - started)
+
+    if (
+        _topology_runtime_not_ready_is_transient(detail)
+        and elapsed < PARTIAL_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS
+    ):
+        _publish_partial_topology_runtime_wait(generation_token)
+        return
+
+    state = ("degraded", str(detail or "").strip(), generation_token or "")
+    if partial_topology_runtime_last_report_state == state:
+        return
+    partial_topology_runtime_last_report_state = state
+    report_topology_runtime_not_ready(
+        "Scheduled shaping refresh deferred",
+        phase_label="Scheduler waiting for topology runtime",
+        step_count=SCHEDULER_REFRESH_STEP_COUNT,
+    )
+
+
 def wait_for_topology_runtime_ready(timeout_seconds=8.0):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -1358,6 +1523,10 @@ def topology_runtime_refresh_tick():
 
     if startup_topology_runtime_pending:
         _continue_startup_topology_runtime_wait()
+        return
+
+    if partial_topology_runtime_pending:
+        _continue_partial_topology_runtime_wait()
         return
 
     if shaping_runtime_hash == 0:

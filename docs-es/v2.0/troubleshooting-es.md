@@ -137,6 +137,8 @@ Si oscila entre ready/error, valide credenciales y timeouts de integración en `
 
 Si el shaping de arranque comienza antes de que topology runtime publique la generación actual de `shaping_inputs.json`, las versiones actuales mantienen el scheduler en un estado de espera de arranque y reintentan el shaping inicial cada pocos segundos. Un mensaje breve como `still building outputs for the current source generation` justo después de reiniciar normalmente significa que LibreQoS todavía está terminando el ciclo de importación y publicación de runtime, no que el shaping quede detenido hasta la siguiente actualización de 30 minutos.
 
+Si una actualización programada de integración cae mientras topology runtime todavía está publicando salidas para la nueva generación de fuente, las versiones actuales mantienen el scheduler en estado de espera para esa generación y reintentan automáticamente el shaping programado en cuanto topology runtime termina. Trate `Scheduled shaping refresh deferred` como una espera transitoria solo cuando el mensaje indique que topology runtime todavía está construyendo salidas para la generación actual. Si en cambio indica que topology runtime falló para la generación actual, revise directamente esa falla de runtime.
+
 Si el arranque del scheduler permanece demasiado tiempo en esa espera, o entra en estado degradado con un mensaje indicando que topology runtime falló para la generación actual, revise:
 
 ```bash
@@ -145,6 +147,8 @@ ls -lh /opt/libreqos/state/topology/topology_effective_state.json /opt/libreqos/
 journalctl -u lqos_scheduler --since "30 minutes ago"
 journalctl -u lqosd --since "30 minutes ago"
 ```
+
+Si `journalctl -u lqosd` muestra advertencias repetidas como `BeginIngest queue full`, `IngestChunk queue full` o `EndIngest queue full` durante el arranque o justo después de una importación de topología, los builds anteriores estaban descartando tramas de ingesta hacia Insight porque la cola local del canal de control era demasiado pequeña para ráfagas grandes. Los builds actuales aplican backpressure sobre el socket de Insight para esos lotes de ingesta, por lo que esas advertencias ya no deberían aparecer durante ráfagas cortas de arranque o importación. Si siguen apareciendo después de actualizar, revise primero la presión de CPU de `lqosd` y la conectividad reciente del canal de control antes de asumir que el shaping está fallando.
 
 ### RTNETLINK answers: Invalid argument
 
