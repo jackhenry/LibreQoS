@@ -1580,6 +1580,38 @@ let topAsnSortColumn = 'rate';
 let topAsnSortDirection = 'desc';
 let trafficCurrentPage = 1;
 let trafficPageSize = DEFAULT_TRAFFIC_PAGE_SIZE;
+const TOP_ASN_TABLE_COLUMNS = [
+    { group: "attribution" },
+    { group: "attribution" },
+    { group: "rates", numeric: true },
+    { group: "rates", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "flows", numeric: true },
+];
+const TRAFFIC_TABLE_COLUMNS = [
+    { group: "identity" },
+    { group: "rates", numeric: true },
+    { group: "rates", numeric: true },
+    { group: "volume", numeric: true },
+    { group: "volume", numeric: true },
+    { group: "volume", numeric: true },
+    { group: "volume", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "quality", numeric: true },
+    { group: "attribution" },
+    { group: "attribution" },
+    { group: "attribution" },
+    { group: "actions", action: true },
+];
 
 function formatQooScore(score0to100, fallback = "-") {
     if (score0to100 === null || score0to100 === undefined) {
@@ -1628,6 +1660,106 @@ function truncatedTrafficCell(text, cellClass) {
     span.textContent = value;
     td.appendChild(span);
     return td;
+}
+
+function applyCircuitTableCellChrome(cell, columns, startIndex, endIndex) {
+    const descriptor = columns[startIndex];
+    if (!descriptor) {
+        return;
+    }
+
+    const group = String(descriptor.group || "default");
+    cell.classList.add("lqos-circuit-table-cell", `lqos-circuit-colgroup-${group}`);
+    if (descriptor.numeric) {
+        cell.classList.add("lqos-circuit-cell-numeric");
+    }
+    if (descriptor.action) {
+        cell.classList.add("lqos-circuit-cell-action");
+    }
+
+    if (startIndex > 0 && columns[startIndex - 1]?.group !== group) {
+        cell.classList.add("lqos-circuit-col-start");
+    }
+    if (endIndex < columns.length - 1 && columns[endIndex + 1]?.group !== group) {
+        cell.classList.add("lqos-circuit-col-end");
+    }
+
+    cell.dataset.columnStart = String(startIndex);
+    cell.dataset.columnEnd = String(endIndex);
+}
+
+function annotateCircuitDataTable(table, columns) {
+    const headRow = table.tHead?.rows?.[0];
+    if (headRow) {
+        let columnIndex = 0;
+        Array.from(headRow.cells).forEach((cell) => {
+            const span = Math.max(1, Number(cell.colSpan) || 1);
+            const startIndex = columnIndex;
+            const endIndex = Math.min(columns.length - 1, startIndex + span - 1);
+            applyCircuitTableCellChrome(cell, columns, startIndex, endIndex);
+            columnIndex += span;
+        });
+    }
+
+    Array.from(table.tBodies).forEach((tbody) => {
+        Array.from(tbody.rows).forEach((row) => {
+            if (row.cells.length !== columns.length) {
+                return;
+            }
+            Array.from(row.cells).forEach((cell, index) => {
+                applyCircuitTableCellChrome(cell, columns, index, index);
+            });
+        });
+    });
+
+    wireCircuitDataTableHover(table);
+}
+
+function wireCircuitDataTableHover(table) {
+    let activeStart = null;
+    let activeEnd = null;
+
+    const paintRange = (start, end) => {
+        Array.from(table.querySelectorAll("[data-column-start][data-column-end]")).forEach((cell) => {
+            const cellStart = Number.parseInt(cell.dataset.columnStart || "", 10);
+            const cellEnd = Number.parseInt(cell.dataset.columnEnd || "", 10);
+            const shouldHighlight = Number.isFinite(cellStart)
+                && Number.isFinite(cellEnd)
+                && cellStart <= end
+                && cellEnd >= start;
+            cell.classList.toggle("is-column-hover", shouldHighlight);
+        });
+    };
+
+    const clearRange = () => {
+        activeStart = null;
+        activeEnd = null;
+        Array.from(table.querySelectorAll(".is-column-hover")).forEach((cell) => {
+            cell.classList.remove("is-column-hover");
+        });
+    };
+
+    table.addEventListener("pointerover", (event) => {
+        const cell = event.target.closest("th, td");
+        if (!cell || !table.contains(cell)) {
+            return;
+        }
+        const start = Number.parseInt(cell.dataset.columnStart || "", 10);
+        const end = Number.parseInt(cell.dataset.columnEnd || "", 10);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+            return;
+        }
+        if (activeStart === start && activeEnd === end) {
+            return;
+        }
+        activeStart = start;
+        activeEnd = end;
+        paintRange(start, end);
+    });
+
+    table.addEventListener("pointerleave", () => {
+        clearRange();
+    });
 }
 
 function visibleTrafficRows() {
@@ -1735,7 +1867,7 @@ function renderTopAsnTab() {
     tableWrap.classList.add("lqos-table-wrap");
 
     const table = document.createElement("table");
-    table.classList.add("lqos-table", "lqos-table-tight", "lqos-circuit-traffic-table");
+    table.classList.add("lqos-table", "lqos-table-tight", "lqos-circuit-traffic-table", "lqos-circuit-data-table");
     const thead = document.createElement("thead", "small");
     thead.style.fontSize = "0.8em";
 
@@ -1797,6 +1929,7 @@ function renderTopAsnTab() {
     }
 
     table.appendChild(tbody);
+    annotateCircuitDataTable(table, TOP_ASN_TABLE_COLUMNS);
     tableWrap.appendChild(table);
     clearDiv(target);
     target.appendChild(tableWrap);
@@ -1818,7 +1951,7 @@ function renderTrafficTab() {
     tableWrap.classList.add("lqos-table-wrap");
 
     let table = document.createElement("table");
-    table.classList.add("lqos-table", "lqos-table-tight", "lqos-circuit-traffic-table");
+    table.classList.add("lqos-table", "lqos-table-tight", "lqos-circuit-traffic-table", "lqos-circuit-data-table");
     let thead = document.createElement("thead", "small");
     thead.style.fontSize = "0.8em";
 
@@ -1903,6 +2036,7 @@ function renderTrafficTab() {
     }
 
     table.appendChild(tbody);
+    annotateCircuitDataTable(table, TRAFFIC_TABLE_COLUMNS);
     tableWrap.appendChild(table);
     clearDiv(target);
     target.appendChild(tableWrap);
