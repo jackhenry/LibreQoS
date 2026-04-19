@@ -424,8 +424,10 @@ mod tests {
         assert_eq!(status.updated_unix, Some(last_seen_unix));
         assert!(!status.stale);
         assert_eq!(details.updated_unix, Some(last_seen_unix));
-        assert!(details
-            .details
-            .contains(&format!("Last updated Unix: {last_seen_unix}")));
+        assert!(
+            details
+                .details
+                .contains(&format!("Last updated Unix: {last_seen_unix}"))
+        );
     }
 }

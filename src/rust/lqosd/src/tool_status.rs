@@ -86,11 +86,7 @@ pub fn is_scheduler_available() -> bool {
 /// Returns the Unix timestamp of the scheduler's last heartbeat, if one has been seen.
 pub fn scheduler_last_seen_unix() -> Option<u64> {
     let last = SCHEDULER_LAST_SEEN.load(Ordering::Relaxed);
-    if last == 0 {
-        None
-    } else {
-        Some(last)
-    }
+    if last == 0 { None } else { Some(last) }
 }
 
 /// Returns the current scheduler error message, if any.
