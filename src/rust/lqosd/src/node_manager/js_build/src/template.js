@@ -119,9 +119,31 @@ function schedulerRelativeTime(updatedUnix) {
     return `Updated ${deltaDays}d ago`;
 }
 
+function schedulerErrorText(data) {
+    const error = data?.error;
+    if (!error) return "";
+    return String(error).trim();
+}
+
+function schedulerLooksRecovered(data) {
+    const progress = data?.progress || null;
+    if (!data?.available || !progress || progress.active) {
+        return false;
+    }
+    return String(progress.phase || "").trim() === "ready";
+}
+
+function schedulerHasLiveError(data) {
+    const errorText = schedulerErrorText(data);
+    if (!errorText) {
+        return false;
+    }
+    return !schedulerLooksRecovered(data);
+}
+
 function schedulerStateDescriptor(data) {
     const progress = data?.progress || null;
-    const hasError = !!(data?.error && String(data.error).trim().length > 0);
+    const hasError = schedulerHasLiveError(data);
     const available = !!data?.available;
     const active = !!progress?.active;
     const setupRequired = !!data?.setup_required;
@@ -231,6 +253,8 @@ function schedulerActivityItems(output, error, data) {
 function renderSchedulerDetails(data) {
     const progress = data?.progress || null;
     const descriptor = schedulerStateDescriptor(data);
+    const liveError = schedulerHasLiveError(data) ? schedulerErrorText(data) : "";
+    const historicalError = !liveError ? schedulerErrorText(data) : "";
     const percent = progress ? schedulerProgressPercent(progress) : (data?.available ? 100 : 0);
     const phaseLabel = progress?.phase_label || progress?.phase || descriptor.title;
     const stepCount = Number(progress?.step_count);
@@ -242,8 +266,8 @@ function renderSchedulerDetails(data) {
         ? schedulerRelativeTime(progress.updated_unix)
         : "Update time unavailable";
     const availabilityText = data?.setup_required ? "Setup Required" : (data?.available ? "Healthy" : "Unavailable");
-    const recentResult = schedulerSetupMessage(data) || summarizeSchedulerOutput(data?.output, data?.error);
-    const activity = schedulerActivityItems(data?.output, data?.error, data);
+    const recentResult = schedulerSetupMessage(data) || summarizeSchedulerOutput(data?.output, historicalError || liveError);
+    const activity = schedulerActivityItems(data?.output, historicalError || liveError, data);
     const progressMeta = data?.setup_required
         ? "Complete runtime setup to enable scheduler work"
         : progress?.active
@@ -254,8 +278,8 @@ function renderSchedulerDetails(data) {
     const setupAlert = data?.setup_required
         ? `<div class="alert alert-warning mt-3 mb-0" role="alert"><i class="fa fa-list-check me-2"></i>${escapeHtml(schedulerSetupMessage(data) || "Choose a topology source in Complete Setup before expecting scheduler activity.")}</div>`
         : "";
-    const alertMarkup = data?.error
-        ? `<div class="alert alert-danger mt-3 mb-0" role="alert"><i class="fa fa-triangle-exclamation me-2"></i>${escapeHtml(String(data.error).trim())}</div>`
+    const alertMarkup = liveError
+        ? `<div class="alert alert-danger mt-3 mb-0" role="alert"><i class="fa fa-triangle-exclamation me-2"></i>${escapeHtml(liveError)}</div>`
         : "";
     const activityMarkup = activity.length
         ? activity.map(line => `
@@ -413,7 +437,7 @@ function loadSchedulerStatus(force = false) {
             return;
         }
         const data = msg.data;
-        const hasError = !!(data.error && String(data.error).trim().length > 0);
+        const hasError = schedulerHasLiveError(data);
         const isHealthy = !!data.available && !hasError;
         const progress = data.progress || null;
         const progressActive = !!(progress && progress.active);
