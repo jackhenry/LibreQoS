@@ -35,9 +35,11 @@ const SCHEDULER_MODAL_ACTIVE_POLL_MS = 1000;
 let schedulerStatusPollTimer = null;
 let schedulerStatusRequestInFlight = false;
 let schedulerStatusFirstRequestedAt = null;
+let cachedSchedulerStatusData = null;
 let schedulerModalPollTimer = null;
 let schedulerModalRequestInFlight = false;
 let schedulerModalInstance = null;
+let cachedSchedulerDetailsData = null;
 let cachedQueueModeConfig = null;
 
 function listenOnceWithTimeout(eventName, timeoutMs, handler, onTimeout) {
@@ -125,6 +127,42 @@ function schedulerErrorText(data) {
     return String(error).trim();
 }
 
+function schedulerSnapshotUpdatedUnix(data) {
+    const progressUpdatedUnix = Number(data?.progress?.updated_unix);
+    if (Number.isFinite(progressUpdatedUnix) && progressUpdatedUnix > 0) {
+        return progressUpdatedUnix;
+    }
+    const statusUpdatedUnix = Number(data?.updated_unix);
+    if (Number.isFinite(statusUpdatedUnix) && statusUpdatedUnix > 0) {
+        return statusUpdatedUnix;
+    }
+    return null;
+}
+
+function schedulerUpdatedText(data) {
+    const updatedUnix = schedulerSnapshotUpdatedUnix(data);
+    if (!updatedUnix) {
+        return "Update time unavailable";
+    }
+    return schedulerRelativeTime(updatedUnix);
+}
+
+function schedulerTransportWarningText(message, data) {
+    const updatedText = schedulerUpdatedText(data);
+    if (updatedText === "Update time unavailable") {
+        return `${message} Retrying in the background.`;
+    }
+    return `${message} Showing cached scheduler data. ${updatedText}.`;
+}
+
+function schedulerStaleStatusLabel(data) {
+    const updatedText = schedulerUpdatedText(data);
+    if (updatedText === "Update time unavailable") {
+        return "Scheduler status is stale";
+    }
+    return `Scheduler status is stale. ${updatedText}.`;
+}
+
 function schedulerLooksRecovered(data) {
     const progress = data?.progress || null;
     if (!data?.available || !progress || progress.active) {
@@ -168,6 +206,17 @@ function schedulerStateDescriptor(data) {
             subtitle: data?.setup_message || "LibreQoS needs subscriber data before the scheduler can run",
             ringTone: "tone-warning",
             icon: "fa-list-check",
+        };
+    }
+    if (data?.stale) {
+        return {
+            tone: "warning",
+            badgeClass: "text-bg-warning",
+            label: "Stale",
+            title: "Scheduler status is stale",
+            subtitle: "Showing the last scheduler snapshot older than five minutes",
+            ringTone: "tone-warning",
+            icon: "fa-clock",
         };
     }
     if (active) {
@@ -250,7 +299,7 @@ function schedulerActivityItems(output, error, data) {
         .reverse();
 }
 
-function renderSchedulerDetails(data) {
+function renderSchedulerDetails(data, options = {}) {
     const progress = data?.progress || null;
     const descriptor = schedulerStateDescriptor(data);
     const liveError = schedulerHasLiveError(data) ? schedulerErrorText(data) : "";
@@ -262,21 +311,29 @@ function renderSchedulerDetails(data) {
     const stepText = Number.isFinite(stepIndex) && Number.isFinite(stepCount) && stepCount > 0
         ? `Step ${stepIndex} of ${stepCount}`
         : "No active step reported";
-    const updatedText = progress?.updated_unix
-        ? schedulerRelativeTime(progress.updated_unix)
-        : "Update time unavailable";
-    const availabilityText = data?.setup_required ? "Setup Required" : (data?.available ? "Healthy" : "Unavailable");
+    const updatedText = schedulerUpdatedText(data);
+    const availabilityText = data?.setup_required
+        ? "Setup Required"
+        : data?.stale
+            ? "Stale"
+            : (data?.available ? "Healthy" : "Unavailable");
     const recentResult = schedulerSetupMessage(data) || summarizeSchedulerOutput(data?.output, historicalError || liveError);
     const activity = schedulerActivityItems(data?.output, historicalError || liveError, data);
-    const progressMeta = data?.setup_required
-        ? "Complete runtime setup to enable scheduler work"
-        : progress?.active
-            ? `${percent}% complete`
-            : descriptor.label === "Idle"
-                ? "Last run complete"
-                : "Waiting for activity";
+    let progressMeta = "Waiting for activity";
+    if (options.transportWarning) {
+        progressMeta = "Showing cached scheduler details while the UI reconnects";
+    } else if (data?.setup_required) {
+        progressMeta = "Complete runtime setup to enable scheduler work";
+    } else if (progress?.active) {
+        progressMeta = `${percent}% complete`;
+    } else if (descriptor.label === "Idle") {
+        progressMeta = "Last run complete";
+    }
     const setupAlert = data?.setup_required
         ? `<div class="alert alert-warning mt-3 mb-0" role="alert"><i class="fa fa-list-check me-2"></i>${escapeHtml(schedulerSetupMessage(data) || "Choose a topology source in Complete Setup before expecting scheduler activity.")}</div>`
+        : "";
+    const transportWarningMarkup = options.transportWarning
+        ? `<div class="alert alert-warning mt-3 mb-0" role="alert"><i class="fa fa-wifi me-2"></i>${escapeHtml(options.transportWarning)}</div>`
         : "";
     const alertMarkup = liveError
         ? `<div class="alert alert-danger mt-3 mb-0" role="alert"><i class="fa fa-triangle-exclamation me-2"></i>${escapeHtml(liveError)}</div>`
@@ -304,6 +361,7 @@ function renderSchedulerDetails(data) {
             </div>
         </div>
         ${setupAlert}
+        ${transportWarningMarkup}
         ${alertMarkup}
         <div class="lqos-scheduler-progress-card">
             <div class="lqos-scheduler-progress-topline">
@@ -360,7 +418,7 @@ function updateSchedulerModalBody(contentHtml) {
     }
 }
 
-function renderSchedulerStatus(container, state, progress) {
+function renderSchedulerStatus(container, state, progress, labelOverride = null) {
     if (!container) return;
 
     let color = "text-secondary";
@@ -388,10 +446,17 @@ function renderSchedulerStatus(container, state, progress) {
         color = "text-danger";
         label = "Scheduler has an internal error";
         indicator = schedulerRingMarkup(100, "tone-danger", "fa-triangle-exclamation");
+    } else if (state === "stale") {
+        color = "text-warning";
+        label = "Scheduler status is stale";
+        indicator = schedulerRingMarkup(100, "tone-warning", "fa-clock");
     } else if (state === "setup") {
         color = "text-warning";
         label = "Scheduler needs topology setup";
         indicator = schedulerRingMarkup(100, "tone-warning", "fa-list-check");
+    }
+    if (labelOverride) {
+        label = labelOverride;
     }
 
     container.innerHTML = `
@@ -432,16 +497,27 @@ function loadSchedulerStatus(force = false) {
     listenOnceWithTimeout("SchedulerStatus", SCHEDULER_STATUS_TIMEOUT_MS, (msg) => {
         schedulerStatusRequestInFlight = false;
         if (!msg || !msg.data) {
-            renderSchedulerStatus(container, "unavailable", null);
+            if (cachedSchedulerStatusData) {
+                renderSchedulerStatus(
+                    container,
+                    "stale",
+                    cachedSchedulerStatusData.progress || null,
+                    schedulerTransportWarningText("Scheduler status response was empty.", cachedSchedulerStatusData)
+                );
+            } else {
+                renderSchedulerStatus(container, "unavailable", null);
+            }
             scheduleNextSchedulerStatusPoll();
             return;
         }
         const data = msg.data;
+        cachedSchedulerStatusData = data;
         const hasError = schedulerHasLiveError(data);
         const isHealthy = !!data.available && !hasError;
         const progress = data.progress || null;
         const progressActive = !!(progress && progress.active);
         const setupRequired = !!data.setup_required;
+        const stale = !!data.stale;
         const elapsed = schedulerStatusFirstRequestedAt === null ? 0 : (Date.now() - schedulerStatusFirstRequestedAt);
 
         if (hasError) {
@@ -452,6 +528,12 @@ function loadSchedulerStatus(force = false) {
 
         if (setupRequired) {
             renderSchedulerStatus(container, "setup", progress);
+            scheduleNextSchedulerStatusPoll();
+            return;
+        }
+
+        if (stale) {
+            renderSchedulerStatus(container, "stale", progress, schedulerStaleStatusLabel(data));
             scheduleNextSchedulerStatusPoll();
             return;
         }
@@ -475,7 +557,14 @@ function loadSchedulerStatus(force = false) {
     }, () => {
         schedulerStatusRequestInFlight = false;
         const elapsed = schedulerStatusFirstRequestedAt === null ? 0 : (Date.now() - schedulerStatusFirstRequestedAt);
-        if (elapsed < SCHEDULER_STATUS_STARTING_GRACE_MS) {
+        if (cachedSchedulerStatusData) {
+            renderSchedulerStatus(
+                container,
+                "stale",
+                cachedSchedulerStatusData.progress || null,
+                schedulerTransportWarningText("Scheduler status refresh timed out.", cachedSchedulerStatusData)
+            );
+        } else if (elapsed < SCHEDULER_STATUS_STARTING_GRACE_MS) {
             renderSchedulerStatus(container, "loading", null);
         } else {
             renderSchedulerStatus(container, "unavailable", null);
@@ -534,13 +623,6 @@ function renderSchedulerModalLoading() {
         </div>`);
 }
 
-function renderSchedulerModalError(message) {
-    updateSchedulerModalBody(`
-        <div class="alert alert-danger mb-0" role="alert">
-            <i class="fa fa-triangle-exclamation me-2"></i>${escapeHtml(message)}
-        </div>`);
-}
-
 function ensureSchedulerModalLifecycle() {
     const modalEl = document.getElementById('schedulerModal');
     if (!modalEl || modalEl.dataset.schedulerLiveBound === "1") {
@@ -567,10 +649,24 @@ function refreshSchedulerModalDetails(showLoading = false) {
             return;
         }
         if (!msg || !msg.data) {
-            renderSchedulerModalError("Failed to load scheduler details");
+            if (cachedSchedulerDetailsData) {
+                updateSchedulerModalBody(renderSchedulerDetails(cachedSchedulerDetailsData, {
+                    transportWarning: schedulerTransportWarningText(
+                        "Scheduler details response was empty.",
+                        cachedSchedulerDetailsData
+                    ),
+                }));
+            } else {
+                updateSchedulerModalBody(`
+                    <div class="alert alert-warning mb-0" role="alert">
+                        <i class="fa fa-wifi me-2"></i>${escapeHtml("Failed to load scheduler details. Retrying in the background.")}
+                    </div>`);
+            }
             scheduleNextSchedulerModalPoll(SCHEDULER_MODAL_IDLE_POLL_MS);
             return;
         }
+        cachedSchedulerDetailsData = msg.data;
+        cachedSchedulerStatusData = msg.data;
         updateSchedulerModalBody(renderSchedulerDetails(msg.data));
         scheduleNextSchedulerModalPoll(schedulerModalPollDelay(msg.data));
     }, () => {
@@ -579,7 +675,19 @@ function refreshSchedulerModalDetails(showLoading = false) {
             stopSchedulerModalPolling();
             return;
         }
-        renderSchedulerModalError("Timed out while loading scheduler details");
+        if (cachedSchedulerDetailsData) {
+            updateSchedulerModalBody(renderSchedulerDetails(cachedSchedulerDetailsData, {
+                transportWarning: schedulerTransportWarningText(
+                    "Scheduler details refresh timed out.",
+                    cachedSchedulerDetailsData
+                ),
+            }));
+        } else {
+            updateSchedulerModalBody(`
+                <div class="alert alert-warning mb-0" role="alert">
+                    <i class="fa fa-wifi me-2"></i>${escapeHtml("Timed out while loading scheduler details. Retrying in the background.")}
+                </div>`);
+        }
         scheduleNextSchedulerModalPoll(SCHEDULER_MODAL_IDLE_POLL_MS);
     });
     wsClient.send({ SchedulerDetails: {} });

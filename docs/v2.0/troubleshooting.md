@@ -184,6 +184,7 @@ If an integration subprocess fails, current builds keep the scheduler alive, pub
 Recent builds expose scheduler readiness/state in the WebUI (Node Manager).
 If the scheduler is still starting, the sidebar now reports the current startup phase and a coarse progress ring rather than only a spinner.
 Current builds also treat scheduler progress, output, and error bus messages as proof that the scheduler is alive, so the sidebar should not stay stuck on `Scheduler available: false` while the scheduler is actively reporting work.
+If the scheduler modal says scheduler details timed out, current builds keep showing the last good scheduler snapshot with its age instead of turning that transport problem into a scheduler error. Treat that warning as a WebUI or `lqosd` communication issue first, then confirm scheduler health in the service logs before assuming shaping failed.
 
 If scheduler status appears down/stale:
 1. Verify both services:

@@ -117,6 +117,7 @@ Si el scheduler falla inmediatamente después de un reinicio con un mensaje como
 ### El estado del scheduler en WebUI aparece no saludable
 
 Versiones recientes muestran estado/readiness del scheduler en WebUI.
+Si el modal del scheduler indica que se agotó el tiempo al cargar detalles, las versiones actuales mantienen visible la última instantánea buena del scheduler con su antigüedad en lugar de convertir ese problema de transporte en un error del scheduler. Trate primero esa advertencia como un problema de comunicación entre WebUI y `lqosd`, y confirme la salud real del scheduler en los logs antes de asumir que falló el shaping.
 
 Si aparece caído/desactualizado:
 
