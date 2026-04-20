@@ -4,7 +4,7 @@ import csv
 import io
 import json
 import chardet
-from LibreQoS import ValidationFailure, refreshShapers, refreshShapersUpdateOnly
+from LibreQoS import RefreshFailure, ValidationFailure, refreshShapers, refreshShapersUpdateOnly
 import subprocess
 import sys
 import tempfile
@@ -1026,7 +1026,12 @@ def importAndShapeFullReload():
         return False
     publish_scheduler_progress(True, "initial_shaping_reload", "Refreshing shaper state", 5, SCHEDULER_STARTUP_STEP_COUNT)
     if not enable_insight_topology():
-        refreshShapers()
+        try:
+            refreshShapers()
+        except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=True):
+                return False
+            raise
         shaping_runtime_hash = calculate_shaping_runtime_hash()
     else:
         shaping_runtime_hash = calculate_shaping_runtime_hash()
@@ -1072,6 +1077,8 @@ def importAndShapePartialReload():
             report_scheduler_validation_failure("Scheduled shaping refresh blocked by validation", e)
             return
         except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=False):
+                return
             report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
             return
         shaping_runtime_hash = calculate_shaping_runtime_hash()
@@ -1223,6 +1230,29 @@ def _topology_runtime_not_ready_is_transient(detail: str) -> bool:
     return True
 
 
+def _is_transient_stale_shaping_inputs_failure(exc: Exception) -> bool:
+    if not isinstance(exc, RefreshFailure):
+        return False
+    detail = str(exc or "").strip()
+    return detail.startswith("Missing or stale shaping_inputs.json.")
+
+
+def _defer_stale_shaping_inputs_failure(exc: Exception, *, startup: bool) -> bool:
+    if not _is_transient_stale_shaping_inputs_failure(exc):
+        return False
+
+    ready, detail, generation = topology_runtime_readiness_detail()
+    if detail and not _topology_runtime_not_ready_is_transient(detail):
+        return False
+
+    clear_scheduler_error()
+    if startup:
+        _begin_startup_topology_runtime_wait(generation if not ready else current_topology_source_generation())
+    else:
+        _begin_partial_topology_runtime_wait(generation if not ready else current_topology_source_generation())
+    return True
+
+
 def _publish_startup_topology_runtime_wait(generation: str | None):
     global startup_topology_runtime_last_report_state
 
@@ -1349,6 +1379,8 @@ def _continue_startup_topology_runtime_wait():
             shaping_runtime_hash = 0
             return
         except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=True):
+                return
             _reset_startup_topology_runtime_wait()
             report_scheduler_runtime_failure(
                 "Scheduler startup shaping refresh failed",
@@ -1453,6 +1485,8 @@ def _continue_partial_topology_runtime_wait():
                 )
                 return
             except Exception as e:
+                if _defer_stale_shaping_inputs_failure(e, startup=False):
+                    return
                 _reset_partial_topology_runtime_wait()
                 report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
                 return
@@ -1546,6 +1580,8 @@ def topology_runtime_refresh_tick():
         report_scheduler_validation_failure("Topology runtime refresh blocked by validation", e)
         return
     except Exception as e:
+        if _defer_stale_shaping_inputs_failure(e, startup=False):
+            return
         report_scheduler_runtime_failure("Topology runtime refresh failed", e)
         return
     shaping_runtime_hash = calculate_shaping_runtime_hash()
