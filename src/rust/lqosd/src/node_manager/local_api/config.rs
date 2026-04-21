@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::http::header;
 use default_net::get_interfaces;
-use lqos_bus::{BusRequest, bus_request};
+use lqos_bus::{BusRequest, BusResponse, bus_request};
 use lqos_config::{Config, ConfigShapedDevices, ShapedDevice, UserRole, WebUser, WebUsers};
 use lqos_utils::hash_to_i64;
 use serde::{Deserialize, Serialize};
@@ -793,16 +793,23 @@ pub async fn update_lqosd_config_data(
     login: LoginResult,
     mut config: Config,
     clear_secrets: ConfigSecretClearRequest,
-) -> Result<(), StatusCode> {
+) -> Result<(), String> {
     if login != LoginResult::Admin {
-        return Err(StatusCode::FORBIDDEN);
+        return Err("Unauthorized".to_string());
     }
-    let existing = lqos_config::load_config().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing =
+        lqos_config::load_config().map_err(|_| "Unable to load the current config".to_string())?;
     apply_secret_updates(existing.as_ref(), &mut config, &clear_secrets);
-    bus_request(vec![BusRequest::UpdateLqosdConfig(Box::new(config))])
+    let mut responses = bus_request(vec![BusRequest::UpdateLqosdConfig(Box::new(config))])
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(())
+        .map_err(|err| format!("Unable to update config: {err}"))?;
+
+    match responses.pop() {
+        Some(BusResponse::Ack) => Ok(()),
+        Some(BusResponse::Fail(message)) => Err(message),
+        Some(other) => Err(format!("Unexpected config update response: {other:?}")),
+        None => Err("No response received for config update".to_string()),
+    }
 }
 
 /// Persists both `network.json` and `ShapedDevices.csv` for administrative
