@@ -1021,6 +1021,7 @@ def importAndShapeFullReload():
         report_topology_runtime_not_ready(
             "Scheduler startup shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
+            step_index=4,
             step_count=SCHEDULER_STARTUP_STEP_COUNT,
         )
         return False
@@ -1062,6 +1063,7 @@ def importAndShapePartialReload():
         report_topology_runtime_not_ready(
             "Scheduled shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
+            step_index=3,
             step_count=SCHEDULER_REFRESH_STEP_COUNT,
         )
         return
@@ -1180,7 +1182,13 @@ def topology_runtime_readiness_detail():
     return (True, "", current_generation)
 
 
-def report_topology_runtime_not_ready(context: str, *, phase_label: str, step_count: int):
+def report_topology_runtime_not_ready(
+    context: str,
+    *,
+    phase_label: str,
+    step_index: int,
+    step_count: int,
+):
     ready, detail, generation = topology_runtime_readiness_detail()
     if ready:
         return
@@ -1188,7 +1196,19 @@ def report_topology_runtime_not_ready(context: str, *, phase_label: str, step_co
     if generation:
         message += f" Generation {generation[:12]}."
     print(message)
+    if _topology_runtime_not_ready_is_transient(detail):
+        clear_scheduler_error()
+        scheduler_output(message)
+        publish_scheduler_progress(
+            False,
+            "waiting_for_topology_runtime",
+            phase_label,
+            step_index,
+            step_count,
+        )
+        return
     scheduler_error(message)
+    scheduler_output(message)
     publish_scheduler_progress(
         False,
         "degraded",
@@ -1430,6 +1450,7 @@ def _continue_startup_topology_runtime_wait():
     report_topology_runtime_not_ready(
         "Scheduler startup shaping refresh deferred",
         phase_label="Scheduler waiting for topology runtime",
+        step_index=4,
         step_count=SCHEDULER_STARTUP_STEP_COUNT,
     )
 
@@ -1532,6 +1553,7 @@ def _continue_partial_topology_runtime_wait():
     report_topology_runtime_not_ready(
         "Scheduled shaping refresh deferred",
         phase_label="Scheduler waiting for topology runtime",
+        step_index=3,
         step_count=SCHEDULER_REFRESH_STEP_COUNT,
     )
 

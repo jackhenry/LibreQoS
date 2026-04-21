@@ -179,12 +179,21 @@ function schedulerHasLiveError(data) {
     return !schedulerLooksRecovered(data);
 }
 
+function schedulerWaitsForTopologyRuntime(data) {
+    const progress = data?.progress || null;
+    if (!progress) {
+        return false;
+    }
+    return String(progress.phase || "").trim() === "waiting_for_topology_runtime";
+}
+
 function schedulerStateDescriptor(data) {
     const progress = data?.progress || null;
     const hasError = schedulerHasLiveError(data);
     const available = !!data?.available;
     const active = !!progress?.active;
     const setupRequired = !!data?.setup_required;
+    const topologyRuntimeWait = schedulerWaitsForTopologyRuntime(data);
 
     if (hasError) {
         return {
@@ -217,6 +226,17 @@ function schedulerStateDescriptor(data) {
             subtitle: "Showing the last scheduler snapshot older than five minutes",
             ringTone: "tone-warning",
             icon: "fa-clock",
+        };
+    }
+    if (topologyRuntimeWait) {
+        return {
+            tone: "warning",
+            badgeClass: "text-bg-warning",
+            label: "Deferred",
+            title: progress?.phase_label || "Waiting for topology runtime",
+            subtitle: "Scheduler is waiting for topology runtime outputs",
+            ringTone: "tone-warning",
+            icon: "fa-hourglass-half",
         };
     }
     if (active) {
@@ -316,6 +336,8 @@ function renderSchedulerDetails(data, options = {}) {
         ? "Setup Required"
         : data?.stale
             ? "Stale"
+            : schedulerWaitsForTopologyRuntime(data)
+                ? "Deferred"
             : (data?.available ? "Healthy" : "Unavailable");
     const recentResult = schedulerSetupMessage(data) || summarizeSchedulerOutput(data?.output, historicalError || liveError);
     const activity = schedulerActivityItems(data?.output, historicalError || liveError, data);
@@ -324,6 +346,8 @@ function renderSchedulerDetails(data, options = {}) {
         progressMeta = "Showing cached scheduler details while the UI reconnects";
     } else if (data?.setup_required) {
         progressMeta = "Complete runtime setup to enable scheduler work";
+    } else if (schedulerWaitsForTopologyRuntime(data)) {
+        progressMeta = "The next shaping update is waiting for topology runtime outputs";
     } else if (progress?.active) {
         progressMeta = `${percent}% complete`;
     } else if (descriptor.label === "Idle") {
@@ -450,6 +474,14 @@ function renderSchedulerStatus(container, state, progress, labelOverride = null)
         color = "text-warning";
         label = "Scheduler status is stale";
         indicator = schedulerRingMarkup(100, "tone-warning", "fa-clock");
+    } else if (state === "deferred") {
+        color = "text-warning";
+        label = labelOverride || "Scheduler is waiting for topology runtime";
+        indicator = schedulerRingMarkup(
+            schedulerProgressPercent(progress),
+            "tone-warning",
+            "fa-hourglass-half"
+        );
     } else if (state === "setup") {
         color = "text-warning";
         label = "Scheduler needs topology setup";
@@ -534,6 +566,17 @@ function loadSchedulerStatus(force = false) {
 
         if (stale) {
             renderSchedulerStatus(container, "stale", progress, schedulerStaleStatusLabel(data));
+            scheduleNextSchedulerStatusPoll();
+            return;
+        }
+
+        if (schedulerWaitsForTopologyRuntime(data)) {
+            renderSchedulerStatus(
+                container,
+                "deferred",
+                progress,
+                progress?.phase_label || "Scheduler is waiting for topology runtime"
+            );
             scheduleNextSchedulerStatusPoll();
             return;
         }

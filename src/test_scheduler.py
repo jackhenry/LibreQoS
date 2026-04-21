@@ -511,6 +511,83 @@ class TestSchedulerLogging(unittest.TestCase):
             )
         )
 
+    def test_transient_topology_runtime_deferred_wait_does_not_raise_scheduler_error(self):
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime is still building outputs for the current source generation.",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                    with patch.object(scheduler, "scheduler_output") as mock_scheduler_output:
+                        with patch.object(
+                            scheduler,
+                            "publish_scheduler_progress",
+                        ) as mock_progress:
+                            with patch("builtins.print"):
+                                scheduler.report_topology_runtime_not_ready(
+                                    "Scheduled shaping refresh deferred",
+                                    phase_label="Scheduler waiting for topology runtime",
+                                    step_index=3,
+                                    step_count=scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                                )
+
+        mock_clear_error.assert_called_once()
+        mock_scheduler_error.assert_not_called()
+        mock_scheduler_output.assert_called_once()
+        mock_progress.assert_called_once_with(
+            False,
+            "waiting_for_topology_runtime",
+            "Scheduler waiting for topology runtime",
+            3,
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+        )
+
+    def test_failed_topology_runtime_deferred_wait_reports_scheduler_error(self):
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime failed for the current source generation: publish failed",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                    with patch.object(scheduler, "scheduler_output") as mock_scheduler_output:
+                        with patch.object(
+                            scheduler,
+                            "publish_scheduler_progress",
+                        ) as mock_progress:
+                            with patch("builtins.print"):
+                                scheduler.report_topology_runtime_not_ready(
+                                    "Scheduled shaping refresh deferred",
+                                    phase_label="Scheduler waiting for topology runtime",
+                                    step_index=3,
+                                    step_count=scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                                )
+
+        mock_clear_error.assert_not_called()
+        mock_scheduler_error.assert_called_once_with(
+            "Scheduled shaping refresh deferred: Topology runtime failed for the current source generation: publish failed Generation generation-1."
+        )
+        mock_scheduler_output.assert_called_once_with(
+            "Scheduled shaping refresh deferred: Topology runtime failed for the current source generation: publish failed Generation generation-1."
+        )
+        mock_progress.assert_called_once_with(
+            False,
+            "degraded",
+            "Scheduler waiting for topology runtime",
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+            percent=100,
+        )
+
     def test_topology_runtime_refresh_tick_waits_for_partial_runtime_outputs(self):
         scheduler.partial_topology_runtime_pending = True
         scheduler.partial_topology_runtime_generation = "generation-1"
