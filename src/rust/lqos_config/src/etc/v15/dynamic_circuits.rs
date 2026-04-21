@@ -207,4 +207,50 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn config_roundtrips_with_multiple_dynamic_circuit_ranges() {
+        let mut config = Config::default();
+
+        let ipv4_rule = DynamicCircuitRangeRule {
+            name: "IPv4 default".to_string(),
+            ip_range: "0.0.0.0/0"
+                .parse()
+                .expect("default ipv4 network should parse"),
+            download_min_mbps: 10.0,
+            upload_min_mbps: 10.0,
+            download_max_mbps: 100.0,
+            upload_max_mbps: 100.0,
+            attach_to: "Tower-A".to_string(),
+        };
+        let ipv6_rule = DynamicCircuitRangeRule {
+            name: "IPv6 subscribers".to_string(),
+            ip_range: "2001:db8::/48"
+                .parse()
+                .expect("default ipv6 network should parse"),
+            download_min_mbps: 25.0,
+            upload_min_mbps: 5.0,
+            download_max_mbps: 250.0,
+            upload_max_mbps: 50.0,
+            attach_to: String::new(),
+        };
+
+        config.dynamic_circuits = Some(DynamicCircuitsConfig {
+            enabled: true,
+            ttl_seconds: 300,
+            enable_unknown_ip_promotion: true,
+            ranges: vec![ipv4_rule.clone(), ipv6_rule.clone()],
+        });
+
+        let raw = toml::to_string_pretty(&config).expect("config should serialize to TOML");
+        let parsed = Config::load_from_string(&raw).expect("config should deserialize");
+        let ranges = &parsed
+            .dynamic_circuits
+            .as_ref()
+            .expect("dynamic circuits should deserialize")
+            .ranges;
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], ipv4_rule);
+        assert_eq!(ranges[1], ipv6_rule);
+    }
 }
