@@ -180,6 +180,17 @@ class TestIntegrationSonarDevices(unittest.TestCase):
         self.assertEqual(devices[1]["mac"], "")
         self.assertEqual(devices[1]["source"], "account_ip_assignments")
 
+    def test_split_ip_versions_preserves_ipv6_prefixes(self):
+        ipv4, ipv6, invalid = integrationSonar.splitIpVersions([
+            "100.64.8.80",
+            "2605:40c1:300::/56",
+            "not an ip",
+        ])
+
+        self.assertEqual(ipv4, ["100.64.8.80"])
+        self.assertEqual(ipv6, ["2605:40c1:300::/56"])
+        self.assertEqual(invalid, ["not an ip"])
+
     def test_account_level_ips_are_deduped_against_inventory_and_radius_ips(self):
         devices = integrationSonar.buildAccountDevices(
             sonar_account(
@@ -429,7 +440,7 @@ class TestIntegrationSonarDevices(unittest.TestCase):
                 },
                 {
                     "id": "sonar:account-ip-assignments:1",
-                    "ips": ["100.64.11.11"],
+                    "ips": ["100.64.11.11", "2605:40c1:300::/56"],
                     "source": "account_ip_assignments",
                 },
             ],
@@ -447,6 +458,8 @@ class TestIntegrationSonarDevices(unittest.TestCase):
         self.assertIn("accounts_with_ap_parent=1", summary)
         self.assertIn("devices=2", summary)
         self.assertIn("devices_with_ips=1", summary)
+        self.assertIn("ipv4_assignments=1", summary)
+        self.assertIn("ipv6_assignments=1", summary)
         self.assertIn("account_level_ip_devices=1", summary)
 
 

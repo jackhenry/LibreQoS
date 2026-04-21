@@ -8,6 +8,7 @@ Current behavior notes:
 - Paginated Sonar GraphQL requests now use a split connect/read timeout and retry transient read timeouts before failing the import.
 - Emitted Sonar identities are namespaced (for example `sonar:account:<id>` and `sonar:device:<id>`) so they remain stable across overrides and downstream tooling.
 - Account device discovery now preserves inventory-item IP handling and also imports Radius account and account-level IP assignments when they exist. Inventory-backed MACs are still used for AP mapping; Radius-only and account-level IPs are added as supplemental shaping devices and overlapping subnets are de-duplicated.
+- IPv4 and IPv6 assignments are split into the correct LibreQoS fields. Sonar IPv6 prefixes such as delegated `/56` networks are imported as IPv6 assignments, not IPv4 device entries.
 - Sonar `child_accounts` are also imported when they expose their own service and usable IP data. If a child account lacks its own address, LibreQoS falls back to the parent account address so the child can still be emitted as its own circuit.
 - Sonar settings now support ISP-specific recurring-service fallback rates plus a recurring-service exclusion list. LibreQoS still prefers active `DATA` services first; recurring mappings are only used when an account has no usable `DATA` service.
 - If Sonar returns non-JSON content or GraphQL errors, the integration now raises a more specific error message showing the endpoint and a short response preview.
