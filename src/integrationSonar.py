@@ -65,6 +65,10 @@ def sonarRadiusAccountDeviceNodeId(radius_account_id):
   return f"sonar:radius-account:{radius_account_id}"
 
 
+def sonarAccountIpAssignmentDeviceNodeId(account_id):
+  return f"sonar:account-ip-assignments:{account_id}"
+
+
 def sonarSession():
   global _SONAR_SESSION
   if _SONAR_SESSION is None:
@@ -230,6 +234,15 @@ def normalizeServiceName(name):
 def findRadiusAccountIPs(radius_account):
   ips = []
   for ip in radius_account.get('ip_assignments', {}).get('entities', []):
+    subnet = ip.get('subnet')
+    if subnet:
+      ips.append(subnet)
+  return dedupeSubnets(ips)
+
+
+def findAccountIPs(account):
+  ips = []
+  for ip in account.get('ip_assignments', {}).get('entities', []):
     subnet = ip.get('subnet')
     if subnet:
       ips.append(subnet)
@@ -413,7 +426,8 @@ def buildAccountDevices(account):
         'raw_id': item['id'],
         'name': item['inventory_model']['name'],
         'ips': ips,
-        'mac': findPrimaryMac(item)
+        'mac': findPrimaryMac(item),
+        'source': 'inventory_item',
       })
 
   for radius_account in account.get('radius_accounts', {}).get('entities', []):
@@ -429,7 +443,23 @@ def buildAccountDevices(account):
       'raw_id': radius_account['id'],
       'name': f"Radius Account {radius_account['id']}",
       'ips': radius_ips,
-      'mac': ''
+      'mac': '',
+      'source': 'radius_account',
+    })
+
+  account_ips = [
+    subnet for subnet in findAccountIPs(account)
+    if subnet not in known_ip_subnets
+  ]
+  if account_ips:
+    known_ip_subnets.update(account_ips)
+    devices.append({
+      'id': sonarAccountIpAssignmentDeviceNodeId(account['id']),
+      'raw_id': account['id'],
+      'name': 'Account IP Assignments',
+      'ips': account_ips,
+      'mac': '',
+      'source': 'account_ip_assignments',
     })
 
   return devices
@@ -520,6 +550,11 @@ def getAccounts(sonar_active_status_ids):
                     account_status_id
                     id
                     name
+                    ip_assignments {
+                      entities {
+                        subnet
+                      }
+                    }
                     account_services (reverse_relation_filters: [$data]) {
                       entities {
                         service {
@@ -580,6 +615,11 @@ def getAccounts(sonar_active_status_ids):
                       entities {
                         id
                         name
+                        ip_assignments {
+                          entities {
+                            subnet
+                          }
+                        }
                         account_services (reverse_relation_filters: [$data]) {
                           entities {
                             service {
@@ -729,6 +769,28 @@ def buildMacToApMap(aps):
       mac_to_ap[cpe_mac] = ap['id']
   return mac_to_ap
 
+
+def sonarImportSummary(sites, aps, accounts):
+  total_devices = 0
+  devices_with_ips = 0
+  account_level_ip_devices = 0
+  accounts_with_parent = 0
+  for account in accounts:
+    if account.get('parent'):
+      accounts_with_parent += 1
+    for device in account.get('devices', []):
+      total_devices += 1
+      if len(device.get('ips') or []) > 0:
+        devices_with_ips += 1
+      if device.get('source') == 'account_ip_assignments':
+        account_level_ip_devices += 1
+  return (
+    f"Sonar import summary: sites={len(sites)} aps={len(aps)} "
+    f"accounts={len(accounts)} accounts_with_ap_parent={accounts_with_parent} "
+    f"devices={total_devices} devices_with_ips={devices_with_ips} "
+    f"account_level_ip_devices={account_level_ip_devices}"
+  )
+
 def createShaper():
   net = NetworkGraph()
 
@@ -756,6 +818,8 @@ def createShaper():
         account['parent'] = mac_to_ap.get(device['mac'])
         if account['parent']:
           break
+
+  print(sonarImportSummary(sites, aps, accounts))
 
   for site in sites:
       net.addRawNode(NetworkNode(id=site['id'], displayName=site['name'], parentId="", type=NodeType.site, networkJsonId=f"sonar:site:{site['raw_id']}"))

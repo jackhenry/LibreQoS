@@ -29,6 +29,9 @@ def install_sonar_stubs():
     lqlib.sonar_active_status_ids = lambda: []
     lqlib.sonar_recurring_service_rates = lambda: []
     lqlib.sonar_recurring_excluded_service_names = lambda: []
+    lqlib.sonar_strategy = lambda: "full"
+    lqlib.write_compiled_topology_from_python_graph_payload = lambda *_args, **_kwargs: None
+    lqlib.get_libreqos_directory = lambda: ""
     sys.modules["liblqos_python"] = lqlib
 
 
@@ -59,8 +62,13 @@ def inventory_item(item_id, name, ips=None, mac=""):
     }
 
 
-def sonar_account(address_items=None, radius_accounts=None):
+def sonar_account(address_items=None, radius_accounts=None, account_ips=None):
     return {
+        "id": 1,
+        "name": "Account 1",
+        "ip_assignments": {
+            "entities": [{"subnet": subnet} for subnet in (account_ips or [])]
+        },
         "addresses": {
             "entities": [
                 {
@@ -147,6 +155,53 @@ class TestIntegrationSonarDevices(unittest.TestCase):
         self.assertEqual(devices[1]["id"], "sonar:radius-account:88")
         self.assertEqual(devices[1]["ips"], ["100.64.3.31/32"])
 
+    def test_account_level_ips_emit_stable_account_ip_device(self):
+        devices = integrationSonar.buildAccountDevices(
+            sonar_account(
+                address_items=[
+                    inventory_item(
+                        42,
+                        "ONU",
+                        ips=[],
+                        mac="AA:BB:CC:DD:EE:03",
+                    )
+                ],
+                account_ips=["100.64.8.80", "100.64.8.81"],
+            )
+        )
+
+        self.assertEqual(len(devices), 2)
+        self.assertEqual(devices[0]["id"], "sonar:device:42")
+        self.assertEqual(devices[0]["mac"], "AA:BB:CC:DD:EE:03")
+        self.assertEqual(devices[0]["ips"], [])
+        self.assertEqual(devices[1]["id"], "sonar:account-ip-assignments:1")
+        self.assertEqual(devices[1]["name"], "Account IP Assignments")
+        self.assertEqual(devices[1]["ips"], ["100.64.8.80", "100.64.8.81"])
+        self.assertEqual(devices[1]["mac"], "")
+        self.assertEqual(devices[1]["source"], "account_ip_assignments")
+
+    def test_account_level_ips_are_deduped_against_inventory_and_radius_ips(self):
+        devices = integrationSonar.buildAccountDevices(
+            sonar_account(
+                address_items=[
+                    inventory_item(
+                        42,
+                        "ONU",
+                        ips=["100.64.9.90"],
+                        mac="AA:BB:CC:DD:EE:09",
+                    )
+                ],
+                radius_accounts=[
+                    radius_account(99, ["100.64.9.91"])
+                ],
+                account_ips=["100.64.9.90", "100.64.9.91", "100.64.9.92"],
+            )
+        )
+
+        self.assertEqual(len(devices), 3)
+        self.assertEqual(devices[2]["id"], "sonar:account-ip-assignments:1")
+        self.assertEqual(devices[2]["ips"], ["100.64.9.92"])
+
     def test_inventory_mac_devices_are_preserved_when_radius_supplies_ips(self):
         devices = integrationSonar.buildAccountDevices(
             sonar_account(
@@ -194,6 +249,31 @@ class TestIntegrationSonarDevices(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record["address"], "Parent Address")
         self.assertEqual(record["id"], "sonar:account:500")
+
+    def test_child_account_imports_account_level_ips(self):
+        child = sonar_account(
+            address_items=[],
+            account_ips=["100.64.10.10"],
+        )
+        child["addresses"] = {"entities": []}
+        child["id"] = 501
+        child["name"] = "Suite 501"
+        child["account_services"] = {
+            "entities": [{
+                "service": {
+                    "data_service_detail": {
+                        "download_speed_kilobits_per_second": 100000,
+                        "upload_speed_kilobits_per_second": 20000,
+                    }
+                }
+            }]
+        }
+
+        record = integrationSonar.buildAccountRecord(child, fallback_address="Parent Address")
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["devices"][0]["id"], "sonar:account-ip-assignments:501")
+        self.assertEqual(record["devices"][0]["ips"], ["100.64.10.10"])
 
     def test_child_accounts_are_added_without_duplicate_top_level_records(self):
         top_level = sonar_account(
@@ -337,6 +417,37 @@ class TestIntegrationSonarDevices(unittest.TestCase):
         record = integrationSonar.buildAccountRecord(account)
 
         self.assertIsNone(record)
+
+    def test_import_summary_counts_account_level_ip_devices(self):
+        account = {
+            "parent": "ap_1",
+            "devices": [
+                {
+                    "id": "sonar:device:42",
+                    "ips": [],
+                    "source": "inventory_item",
+                },
+                {
+                    "id": "sonar:account-ip-assignments:1",
+                    "ips": ["100.64.11.11"],
+                    "source": "account_ip_assignments",
+                },
+            ],
+        }
+
+        summary = integrationSonar.sonarImportSummary(
+            sites=[{"id": "site_1"}],
+            aps=[{"id": "ap_1"}],
+            accounts=[account],
+        )
+
+        self.assertIn("sites=1", summary)
+        self.assertIn("aps=1", summary)
+        self.assertIn("accounts=1", summary)
+        self.assertIn("accounts_with_ap_parent=1", summary)
+        self.assertIn("devices=2", summary)
+        self.assertIn("devices_with_ips=1", summary)
+        self.assertIn("account_level_ip_devices=1", summary)
 
 
 class FakeResponse:

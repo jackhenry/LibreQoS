@@ -118,6 +118,7 @@ Si el scheduler falla inmediatamente después de un reinicio con un mensaje como
 
 Versiones recientes muestran estado/readiness del scheduler en WebUI.
 Si el modal del scheduler indica que se agotó el tiempo al cargar detalles, las versiones actuales mantienen visible la última instantánea buena del scheduler con su antigüedad en lugar de convertir ese problema de transporte en un error del scheduler. Trate primero esa advertencia como un problema de comunicación entre WebUI y `lqosd`, y confirme la salud real del scheduler en los logs antes de asumir que falló el shaping.
+Si falla un subproceso de integración pero el shaping puede continuar con la última topología válida, el scheduler puede seguir mostrando estado ready, pero el último error de integración permanece visible en el estado del scheduler hasta la siguiente integración exitosa.
 
 Si aparece caído/desactualizado:
 

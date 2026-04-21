@@ -46,6 +46,7 @@ partial_topology_runtime_pending = False
 partial_topology_runtime_generation = None
 partial_topology_runtime_started_monotonic = None
 partial_topology_runtime_last_report_state = None
+last_integration_failure_message = ""
 
 
 def configure_scheduler_stdio():
@@ -126,6 +127,37 @@ def clear_scheduler_error():
 def clear_scheduler_output():
     """Clear the scheduler output shown in the Web UI."""
     scheduler_output("")
+
+
+def remember_integration_failure(message: str):
+    global last_integration_failure_message
+    last_integration_failure_message = str(message or "").strip()
+
+
+def clear_integration_failure():
+    global last_integration_failure_message
+    last_integration_failure_message = ""
+
+
+def clear_scheduler_error_unless_integration_failed():
+    if not last_integration_failure_message:
+        clear_scheduler_error()
+
+
+def publish_ready_progress(active: bool, phase: str, phase_label: str, step_index: int, step_count: int, *, percent=None):
+    publish_scheduler_progress(
+        active,
+        phase,
+        phase_label,
+        step_index,
+        step_count,
+        percent=percent,
+    )
+    if last_integration_failure_message:
+        scheduler_error(
+            "Scheduler ready using last-known-good topology; latest integration import failed.\n"
+            + last_integration_failure_message
+        )
 
 
 def _scheduler_progress_percent(step_index: int, step_count: int, *, active: bool) -> int:
@@ -242,6 +274,7 @@ def _write_integration_output_artifact(label, output):
 def _publish_integration_result(label, result):
     output = ((result.stdout or "") + (result.stderr or "")).replace("\r\n", "\n").strip()
     if result.returncode == 0:
+        clear_integration_failure()
         line_count = len(_integration_output_lines(output))
         summary = (
             f"{label} completed successfully."
@@ -264,6 +297,7 @@ def _publish_integration_result(label, result):
     if artifact is not None:
         message += f"\nFull output saved to {artifact}"
     print(message)
+    remember_integration_failure(message)
     scheduler_error(message)
 
 
@@ -385,6 +419,7 @@ def run_python_integration(module_name: str, func_name: str, label: str = ""):
     except Exception as e:
         err = f"Failed to invoke integration {label or (module_name + '.' + func_name)}: {e}"
         print(err)
+        remember_integration_failure(err)
         scheduler_error(err)
 
 def importFromCRM(
@@ -397,6 +432,7 @@ def importFromCRM(
     overrides_label="Applying overrides",
     overrides_step=3,
 ):
+    clear_integration_failure()
     clear_scheduler_error()
     clear_scheduler_output()
     publish_scheduler_progress(
@@ -422,6 +458,7 @@ def importFromCRM(
         except Exception as e:
             error_msg = f"Failed to run UISP integration: {str(e)}"
             print(error_msg)
+            remember_integration_failure(error_msg)
             scheduler_error(error_msg)
     elif automatic_import_splynx():
         run_python_integration("integrationSplynx", "importFromSplynx", label="Splynx")
@@ -1086,7 +1123,7 @@ def importAndShapePartialReload():
         shaping_runtime_hash = calculate_shaping_runtime_hash()
         if shaping_runtime_hash != 0:
             set_scheduler_status_bus_enabled(True)
-    publish_scheduler_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
+    publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
 
 
 def topology_runtime_status_path():
@@ -1197,7 +1234,7 @@ def report_topology_runtime_not_ready(
         message += f" Generation {generation[:12]}."
     print(message)
     if _topology_runtime_not_ready_is_transient(detail):
-        clear_scheduler_error()
+        clear_scheduler_error_unless_integration_failed()
         scheduler_output(message)
         publish_scheduler_progress(
             False,
@@ -1265,7 +1302,7 @@ def _defer_stale_shaping_inputs_failure(exc: Exception, *, startup: bool) -> boo
     if detail and not _topology_runtime_not_ready_is_transient(detail):
         return False
 
-    clear_scheduler_error()
+    clear_scheduler_error_unless_integration_failed()
     if startup:
         _begin_startup_topology_runtime_wait(generation if not ready else current_topology_source_generation())
     else:
@@ -1412,8 +1449,8 @@ def _continue_startup_topology_runtime_wait():
 
         _reset_startup_topology_runtime_wait()
         if shaping_runtime_hash != 0:
-            clear_scheduler_error()
-            publish_scheduler_progress(
+            clear_scheduler_error_unless_integration_failed()
+            publish_ready_progress(
                 False,
                 "ready",
                 "Scheduler ready",
@@ -1522,8 +1559,8 @@ def _continue_partial_topology_runtime_wait():
                 )
                 return
         _reset_partial_topology_runtime_wait()
-        clear_scheduler_error()
-        publish_scheduler_progress(
+        clear_scheduler_error_unless_integration_failed()
+        publish_ready_progress(
             False,
             "ready",
             "Scheduler ready",
@@ -1629,7 +1666,7 @@ def run_scheduler_main():
     try:
         startup_ready = importAndShapeFullReload()
         if startup_ready:
-            publish_scheduler_progress(False, "ready", "Scheduler ready", SCHEDULER_STARTUP_STEP_COUNT, SCHEDULER_STARTUP_STEP_COUNT, percent=100)
+            publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_STARTUP_STEP_COUNT, SCHEDULER_STARTUP_STEP_COUNT, percent=100)
     except ValidationFailure as e:
         report_scheduler_validation_failure(
             "Scheduler startup shaping refresh blocked by validation",

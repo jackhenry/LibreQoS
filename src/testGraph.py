@@ -493,6 +493,45 @@ class TestGraph(unittest.TestCase):
         net.prepareTree()
         self.assertEqual(net.nodes[2].parentIndex, 1)
 
+    def test_empty_exception_cpes_list_does_not_crash(self):
+        import integrationCommon
+        from integrationCommon import NetworkGraph, NetworkNode, NodeType
+
+        original_exception_cpes = integrationCommon.exception_cpes
+        try:
+            integrationCommon.exception_cpes = lambda: []
+            net = NetworkGraph()
+            net.addRawNode(NetworkNode("Site_1", "Site_1", "", NodeType.site, 1000, 1000))
+        finally:
+            integrationCommon.exception_cpes = original_exception_cpes
+
+        self.assertEqual(net.nodes[1].displayName, "Site_1")
+
+    def test_exception_cpes_list_entries_are_normalized(self):
+        from integrationCommon import NetworkGraph, NetworkNode, NodeType, _normalize_exception_cpes
+
+        class ExceptionCpe:
+            cpe = "Site_3"
+            parent = "Site_1"
+
+        normalized, errors = _normalize_exception_cpes([
+            "Site_2:Site_1",
+            {"cpe": "Site_4", "parent": "Site_1"},
+            ExceptionCpe(),
+        ])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(normalized["Site_2"], "Site_1")
+        self.assertEqual(normalized["Site_3"], "Site_1")
+        self.assertEqual(normalized["Site_4"], "Site_1")
+
+        net = NetworkGraph()
+        net.exceptionCPEs = normalized
+        net.addRawNode(NetworkNode("Site_1", "Site_1", "", NodeType.site, 1000, 1000))
+        net.addRawNode(NetworkNode("Site_2", "Site_2", "", NodeType.site, 500, 500))
+
+        self.assertEqual(net.nodes[2].parentId, "Site_1")
+
     def test_native_topology_editor_uses_nearest_real_infrastructure_parent(self):
         from integrationCommon import NetworkGraph, NetworkNode, NodeType
 

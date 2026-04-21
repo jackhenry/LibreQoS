@@ -199,6 +199,7 @@ class TestSchedulerErrorReporting(unittest.TestCase):
         scheduler.set_scheduler_status_bus_enabled(True)
         scheduler._reset_startup_topology_runtime_wait()
         scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
         scheduler.shaping_runtime_hash = 0
 
     def test_python_integration_output_does_not_set_scheduler_error(self):
@@ -296,12 +297,38 @@ class TestSchedulerErrorReporting(unittest.TestCase):
         )
         self.assertEqual(mock_scheduler_output.call_args_list, [(( "",),)])
 
+    def test_ready_progress_keeps_latest_integration_failure_visible(self):
+        scheduler.remember_integration_failure("Sonar exited with code 1. Continuing.")
+
+        with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+            with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                scheduler.publish_ready_progress(
+                    False,
+                    "ready",
+                    "Scheduler ready",
+                    scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                    scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                    percent=100,
+                )
+
+        mock_progress.assert_called_once()
+        mock_scheduler_error.assert_called_once()
+        self.assertIn(
+            "Scheduler ready using last-known-good topology; latest integration import failed.",
+            mock_scheduler_error.call_args.args[0],
+        )
+        self.assertIn(
+            "Sonar exited with code 1. Continuing.",
+            mock_scheduler_error.call_args.args[0],
+        )
+
 
 class TestSchedulerLogging(unittest.TestCase):
     def setUp(self):
         scheduler.set_scheduler_status_bus_enabled(True)
         scheduler._reset_startup_topology_runtime_wait()
         scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
         scheduler.shaping_runtime_hash = 0
 
     def test_configure_scheduler_stdio_enables_line_buffering_when_supported(self):
@@ -1025,6 +1052,7 @@ class TestTopologyRuntimeGating(unittest.TestCase):
     def setUp(self):
         scheduler._reset_startup_topology_runtime_wait()
         scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
         scheduler.shaping_runtime_hash = 0
 
     def test_full_reload_skips_refresh_when_topology_runtime_not_ready(self):

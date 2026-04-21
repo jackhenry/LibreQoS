@@ -14,6 +14,7 @@ Use esta integración cuando Sonar sea su fuente de verdad CRM/NMS.
 
 - La integración refresca automáticamente los datos importados y de shaping que LibreQoS usa con Sonar.
 - `network.json` queda para despliegues DIY o manuales.
+- La integración importa IPs desde equipos de inventario, cuentas Radius e IPs asignadas directamente a la cuenta Sonar. Las IPs de Radius y de cuenta se agregan como dispositivos suplementarios de shaping y se deduplican contra las IPs de inventario.
 - Use la WebUI para confirmar que la importación terminó correctamente.
 
 ## Referencia completa
