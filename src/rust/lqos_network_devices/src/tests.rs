@@ -5,7 +5,7 @@ use crate::{
 use lqos_config::{
     CircuitAnchorsFile, Config, ConfigShapedDevices, NetworkJsonNode, ShapedDevice,
     TOPOLOGY_RUNTIME_STATUS_FILENAME, TopologyShapingCircuitInput, TopologyShapingDeviceInput,
-    TopologyShapingInputsFile,
+    TopologyShapingInputsFile, TopologyShapingResolutionSource,
 };
 use lqos_topology_compile::{ImportedTopologyBundle, TopologyImportFile};
 use lqos_utils::rtt::RttBuffer;
@@ -334,6 +334,35 @@ fn runtime_inputs_build_shaped_devices_from_effective_parent_data() {
         Some("anchor-1")
     );
     assert_eq!(shaped.devices[0].comment, "device-comment");
+    assert_eq!(shaped.devices[0].circuit_id, "circuit-1");
+}
+
+#[test]
+fn runtime_inputs_leave_runtime_fallback_circuits_unparented() {
+    let _guard = TEST_LOCK.lock();
+
+    let shaping_inputs = TopologyShapingInputsFile {
+        circuits: vec![TopologyShapingCircuitInput {
+            circuit_id: "circuit-1".to_string(),
+            circuit_name: "Circuit Alpha".to_string(),
+            logical_parent_node_name: Some("LibreQoS Unattached [Site]".to_string()),
+            logical_parent_node_id: Some("libreqos:generated:splynx:site:unattached".to_string()),
+            resolution_source: TopologyShapingResolutionSource::RuntimeFallback,
+            devices: vec![TopologyShapingDeviceInput {
+                device_id: "device-1".to_string(),
+                device_name: "Device Alpha".to_string(),
+                ipv4: vec!["192.168.1.10/32".to_string()],
+                ..TopologyShapingDeviceInput::default()
+            }],
+            ..TopologyShapingCircuitInput::default()
+        }],
+        ..TopologyShapingInputsFile::default()
+    };
+
+    let shaped = runtime_inputs::shaped_devices_from_runtime_inputs(&shaping_inputs);
+    assert_eq!(shaped.devices.len(), 1);
+    assert_eq!(shaped.devices[0].parent_node, "");
+    assert_eq!(shaped.devices[0].parent_node_id, None);
     assert_eq!(shaped.devices[0].circuit_id, "circuit-1");
 }
 

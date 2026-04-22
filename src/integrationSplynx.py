@@ -90,36 +90,6 @@ def normalize_splynx_graph_id(value):
 	return str(value)
 
 
-def splynx_generated_unattached_site_id():
-	"""
-	Stable raw graph ID for Splynx full-mode circuits with no inferred parent.
-	"""
-	return "splynx_generated_unattached_site"
-
-
-def splynx_generated_unattached_site_network_id():
-	"""
-	Stable exported topology ID for Splynx full-mode fallback grouping.
-	"""
-	return "libreqos:generated:splynx:site:unattached"
-
-
-def splynx_generated_unattached_site_name():
-	"""
-	Display name for the explicit Splynx full-mode fallback site.
-	"""
-	return "LibreQoS Unattached [Site]"
-
-
-def splynx_generated_unattached_parent_id(strategy_name: str):
-	"""
-	Only full mode should materialize a stable generated site for unresolved parents.
-	Other modes handle unresolved circuits through their own compiler/runtime fallbacks.
-	"""
-	if strategy_name == "full":
-		return splynx_generated_unattached_site_id()
-	return None
-
 def supplement_existing_devices_with_online_ips(net, allServices, service_ids_handled, customersOnline, cust_id_to_name, allocated_ipv4s, allocated_ipv6s, device_by_service_id=None):
 	"""
 	For services already handled (devices created from static IPs), supplement missing
@@ -424,19 +394,6 @@ def run_splynx_pipeline(strategy_name: str):
 		# ap_site and full
 		print("Creating site and AP infrastructure")
 		createInfrastructureNodes(net, monitoring, hardware_name, hardware_parent, hardware_type, siteBandwidth, hardware_name_extended)
-		if strategy_name == 'full':
-			net.addRawNode(
-				NetworkNode(
-					id=splynx_generated_unattached_site_id(),
-					displayName=splynx_generated_unattached_site_name(),
-					type=NodeType.site,
-					parentId=None,
-					download=10000,
-					upload=10000,
-					address=splynx_generated_unattached_site_name(),
-					networkJsonId=splynx_generated_unattached_site_network_id(),
-				)
-			)
 
 	# Parent selector per strategy
 	def select_parent(serviceItem):
@@ -450,7 +407,7 @@ def run_splynx_pipeline(strategy_name: str):
 			return None
 		if strategy_name == 'ap_only':
 			return parent_node_id if (parent_node_id in ap_nodes) else None
-		return parent_node_id or splynx_generated_unattached_parent_id(strategy_name)
+		return parent_node_id
 
 	# Run pipeline
 	build_infrastructure()

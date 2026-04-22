@@ -13,10 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::{
-    AttachmentProbeSpec, build_effective_topology_artifacts_from_canonical, is_health_state_fresh,
-    load_canonical_topology_state, prepare_runtime_topology_editor_state_from_canonical,
-    probe_specs_from_state, publish_effective_topology_artifacts,
-    publish_topology_runtime_error_status,
+    AttachmentProbeSpec,
+    build_effective_topology_artifacts_from_canonical_with_runtime_queue_context,
+    is_health_state_fresh, load_canonical_topology_state,
+    prepare_runtime_topology_editor_state_from_canonical, probe_specs_from_state,
+    publish_effective_topology_artifacts, publish_topology_runtime_error_status,
 };
 
 const TOPOLOGY_PROBE_MAX_AGE_MS: u64 = 250;
@@ -343,7 +344,7 @@ async fn run_round(
         refresh_health_state(config.as_ref(), health_state, &specs, &HashMap::new())?;
     }
 
-    let artifacts = build_effective_topology_artifacts_from_canonical(
+    let artifacts = build_effective_topology_artifacts_from_canonical_with_runtime_queue_context(
         config.as_ref(),
         &canonical,
         &overrides,

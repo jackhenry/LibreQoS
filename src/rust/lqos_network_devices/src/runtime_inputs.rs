@@ -5,7 +5,10 @@
 //! into the shaped-device snapshot used by `lqosd`.
 
 use anyhow::Result;
-use lqos_config::{Config, ConfigShapedDevices, ShapedDevice, TopologyShapingInputsFile};
+use lqos_config::{
+    Config, ConfigShapedDevices, ShapedDevice, TopologyShapingInputsFile,
+    TopologyShapingResolutionSource,
+};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::debug;
 
@@ -58,6 +61,22 @@ fn parse_ipv6_list(values: &[String]) -> Vec<(Ipv6Addr, u32)> {
         .collect()
 }
 
+fn runtime_parent_for_circuit(
+    circuit: &lqos_config::TopologyShapingCircuitInput,
+) -> (String, Option<String>) {
+    if circuit.resolution_source == TopologyShapingResolutionSource::RuntimeFallback {
+        return (String::new(), None);
+    }
+
+    let parent_node = optional_trimmed_string(&circuit.effective_parent_node_name)
+        .or_else(|| circuit.logical_parent_node_name.clone())
+        .unwrap_or_default();
+    let parent_node_id = optional_trimmed_string(&circuit.effective_parent_node_id)
+        .or_else(|| circuit.logical_parent_node_id.clone());
+
+    (parent_node, parent_node_id)
+}
+
 /// Loads the currently active runtime shaping inputs when available.
 pub(crate) fn load_ready_runtime_shaping_inputs(
     config: &Config,
@@ -80,11 +99,7 @@ pub(crate) fn shaped_devices_from_runtime_inputs(
 ) -> ConfigShapedDevices {
     let mut devices = Vec::new();
     for circuit in &shaping_inputs.circuits {
-        let parent_node = optional_trimmed_string(&circuit.effective_parent_node_name)
-            .or_else(|| circuit.logical_parent_node_name.clone())
-            .unwrap_or_default();
-        let parent_node_id = optional_trimmed_string(&circuit.effective_parent_node_id)
-            .or_else(|| circuit.logical_parent_node_id.clone());
+        let (parent_node, parent_node_id) = runtime_parent_for_circuit(circuit);
         for device in &circuit.devices {
             devices.push(ShapedDevice {
                 circuit_id: circuit.circuit_id.clone(),

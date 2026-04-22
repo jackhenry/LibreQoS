@@ -24,7 +24,9 @@ LibreQoS supports multiple topology strategies for Splynx integration to balance
 | `ap_site` | Two layers: Site → AP → Clients | Medium | **Default**. Best balance of structure and operator clarity |
 | `full` | Complete monitoring-parent topology mapping | Highest | Preserves the richer Splynx monitoring hierarchy instead of flattening to Network Sites |
 
-When Splynx `full` cannot infer a circuit parent from `access_device` or router metadata, LibreQoS now groups those circuits under a single generated `LibreQoS Unattached [Site]` node instead of leaving them fully unresolved at runtime.
+When Splynx cannot infer a circuit parent from `access_device` or router metadata, LibreQoS leaves the circuit unparented for shaping instead of attaching it to a synthetic site or AP. Fix the parent in Splynx or Topology Manager if the circuit should appear under a real site or AP.
+
+In `ap_site` mode, LibreQoS treats Splynx Network Sites as site containers and monitoring rows with `access_device = 1` as AP/access nodes. Large site containers can be virtualized automatically when they exceed `queue_auto_virtualize_threshold_mbps`, have child queue branches, and have no circuits directly attached to the site node ID. Set a node virtual override to `false` when a specific site must remain as a physical queue.
 
 Configure the shared topology mode in `/etc/lqos.conf` under the `[topology]` section:
 

@@ -19,7 +19,8 @@ use lqos_config::{
     topology_runtime_status_path, topology_shaping_inputs_path,
 };
 use lqos_overrides::{
-    CircuitAdjustment, OverrideStore, TopologyAttachmentMode, TopologyOverridesFile,
+    CircuitAdjustment, NetworkAdjustment, OverrideStore, TopologyAttachmentMode,
+    TopologyOverridesFile,
 };
 use lqos_topology_compile::{TopologyCompiledShapingFile, TopologyImportFile};
 use serde_json::{Map, Value};
@@ -985,6 +986,88 @@ fn load_runtime_shaping_overrides(config: &Config) -> Result<lqos_overrides::Ove
         .with_context(|| "Unable to load effective override layers")
 }
 
+#[derive(Default)]
+struct QueueVirtualizationContext {
+    direct_circuit_node_ids: HashSet<String>,
+    forced_visible_node_names: HashSet<String>,
+}
+
+fn insert_optional_node_id(target: &mut HashSet<String>, value: Option<&str>) {
+    if let Some(node_id) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        target.insert(node_id.to_string());
+    }
+}
+
+fn collect_direct_circuit_node_ids(
+    shaped_devices: &ConfigShapedDevices,
+    circuit_anchors: &[CircuitAnchor],
+) -> HashSet<String> {
+    let mut direct_node_ids = HashSet::new();
+    for device in &shaped_devices.devices {
+        insert_optional_node_id(&mut direct_node_ids, device.parent_node_id.as_deref());
+        insert_optional_node_id(&mut direct_node_ids, device.anchor_node_id.as_deref());
+    }
+    for anchor in circuit_anchors {
+        insert_optional_node_id(&mut direct_node_ids, Some(anchor.anchor_node_id.as_str()));
+    }
+    direct_node_ids
+}
+
+fn forced_visible_node_names(overrides: &lqos_overrides::OverrideFile) -> HashSet<String> {
+    overrides
+        .network_adjustments()
+        .iter()
+        .filter_map(|adjustment| match adjustment {
+            NetworkAdjustment::SetNodeVirtual {
+                node_name,
+                virtual_node: false,
+            } => Some(node_name.trim()),
+            _ => None,
+        })
+        .filter(|node_name| !node_name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn load_queue_virtualization_context(config: &Config) -> Result<QueueVirtualizationContext> {
+    let runtime_overrides = load_runtime_shaping_overrides(config)?;
+    let direct_circuit_node_ids = if topology_import_ingress_enabled(config) {
+        let Some((mut shaped_devices, circuit_anchors)) =
+            load_integration_shaping_artifacts(config)?
+        else {
+            return Ok(QueueVirtualizationContext {
+                forced_visible_node_names: forced_visible_node_names(&runtime_overrides),
+                ..QueueVirtualizationContext::default()
+            });
+        };
+        let runtime_devices = apply_runtime_shaped_device_overrides(
+            std::mem::take(&mut shaped_devices.devices),
+            &runtime_overrides,
+        );
+        shaped_devices.replace_with_new_data(runtime_devices);
+        collect_direct_circuit_node_ids(&shaped_devices, &circuit_anchors)
+    } else {
+        let shaped_devices_path = ConfigShapedDevices::path_for_config(config);
+        if !shaped_devices_path.exists() {
+            HashSet::new()
+        } else {
+            let shaped_devices_mtime = std::fs::metadata(&shaped_devices_path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+            let shaped_devices = ConfigShapedDevices::load_for_config(config).with_context(
+                || "Unable to load ShapedDevices.csv while preparing queue virtualization",
+            )?;
+            let circuit_anchors = load_circuit_anchors(config, shaped_devices_mtime);
+            collect_direct_circuit_node_ids(&shaped_devices, &circuit_anchors)
+        }
+    };
+
+    Ok(QueueVirtualizationContext {
+        direct_circuit_node_ids,
+        forced_visible_node_names: forced_visible_node_names(&runtime_overrides),
+    })
+}
+
 fn apply_runtime_shaped_device_overrides(
     base_devices: Vec<lqos_config::ShapedDevice>,
     overrides: &lqos_overrides::OverrideFile,
@@ -1161,8 +1244,41 @@ pub fn build_effective_topology_artifacts_from_canonical(
     health: &TopologyAttachmentHealthStateFile,
 ) -> std::result::Result<EffectiveTopologyArtifacts, Vec<String>> {
     let prepared = prepared_runtime_topology_editor_state(&canonical.to_editor_state(), overrides);
+    let virtualization = QueueVirtualizationContext::default();
     build_effective_topology_artifacts_from_prepared(
-        config, canonical, &prepared, overrides, health,
+        config,
+        canonical,
+        &prepared,
+        overrides,
+        health,
+        &virtualization,
+    )
+}
+
+/// Builds validated effective-topology artifacts with runtime queue-virtualization guards.
+///
+/// Side effects: reads shaping artifacts and effective override layers so automatic
+/// virtualization can avoid nodes that have direct circuit attachments or explicit
+/// visible overrides.
+pub fn build_effective_topology_artifacts_from_canonical_with_runtime_queue_context(
+    config: &Config,
+    canonical: &TopologyCanonicalStateFile,
+    overrides: &TopologyOverridesFile,
+    health: &TopologyAttachmentHealthStateFile,
+) -> std::result::Result<EffectiveTopologyArtifacts, Vec<String>> {
+    let prepared = prepared_runtime_topology_editor_state(&canonical.to_editor_state(), overrides);
+    let virtualization = load_queue_virtualization_context(config).map_err(|err| {
+        vec![format!(
+            "Unable to load queue virtualization context: {err:#}"
+        )]
+    })?;
+    build_effective_topology_artifacts_from_prepared(
+        config,
+        canonical,
+        &prepared,
+        overrides,
+        health,
+        &virtualization,
     )
 }
 
@@ -1192,6 +1308,7 @@ fn build_effective_topology_artifacts_from_prepared(
     prepared: &TopologyEditorStateFile,
     overrides: &TopologyOverridesFile,
     health: &TopologyAttachmentHealthStateFile,
+    virtualization: &QueueVirtualizationContext,
 ) -> std::result::Result<EffectiveTopologyArtifacts, Vec<String>> {
     let effective = compute_effective_state_from_prepared(config, prepared, overrides, health);
     let ui_state =
@@ -1206,7 +1323,13 @@ fn build_effective_topology_artifacts_from_prepared(
         Some(runtime_flat_bucket_network(config))
     } else {
         canonical_network.as_object().map(|_| {
-            apply_effective_topology_to_canonical_state(config, canonical, &ui_state, &effective)
+            apply_effective_topology_to_canonical_state(
+                config,
+                canonical,
+                &ui_state,
+                &effective,
+                virtualization,
+            )
         })
     };
 
@@ -1217,6 +1340,7 @@ fn build_effective_topology_artifacts_from_prepared(
             &ui_state,
             &effective,
             effective_network,
+            virtualization,
         )?;
     }
 
@@ -2401,41 +2525,74 @@ fn resolved_queue_visibility_policy(
     ui_node: &TopologyEditorNode,
     tree_node: Option<&Value>,
     child_branch_counts: &HashMap<String, usize>,
+    virtualization: &QueueVirtualizationContext,
 ) -> TopologyQueueVisibilityPolicy {
     match ui_node.queue_visibility_policy {
-        TopologyQueueVisibilityPolicy::QueueVisible => TopologyQueueVisibilityPolicy::QueueVisible,
+        TopologyQueueVisibilityPolicy::QueueVisible => resolved_auto_queue_visibility_policy(
+            config,
+            ui_node,
+            tree_node,
+            child_branch_counts,
+            virtualization,
+        ),
         TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren => {
             TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren
         }
-        TopologyQueueVisibilityPolicy::QueueAuto => {
-            let Some(tree_node) = tree_node.and_then(Value::as_object) else {
-                return TopologyQueueVisibilityPolicy::QueueVisible;
-            };
-            let is_site = tree_node
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("site"));
-            if !is_site {
-                return TopologyQueueVisibilityPolicy::QueueVisible;
-            }
-            if child_branch_counts
-                .get(ui_node.node_id.as_str())
-                .copied()
-                .unwrap_or_default()
-                == 0
-            {
-                return TopologyQueueVisibilityPolicy::QueueVisible;
-            }
-            let threshold = config.topology.queue_auto_virtualize_threshold_mbps;
-            if threshold == 0 {
-                return TopologyQueueVisibilityPolicy::QueueVisible;
-            }
-            if node_capacity_mbps(tree_node) >= threshold {
-                TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren
-            } else {
-                TopologyQueueVisibilityPolicy::QueueVisible
-            }
-        }
+        TopologyQueueVisibilityPolicy::QueueAuto => resolved_auto_queue_visibility_policy(
+            config,
+            ui_node,
+            tree_node,
+            child_branch_counts,
+            virtualization,
+        ),
+    }
+}
+
+fn resolved_auto_queue_visibility_policy(
+    config: &Config,
+    ui_node: &TopologyEditorNode,
+    tree_node: Option<&Value>,
+    child_branch_counts: &HashMap<String, usize>,
+    virtualization: &QueueVirtualizationContext,
+) -> TopologyQueueVisibilityPolicy {
+    if virtualization
+        .forced_visible_node_names
+        .contains(ui_node.node_name.as_str())
+    {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    if virtualization
+        .direct_circuit_node_ids
+        .contains(ui_node.node_id.as_str())
+    {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    let Some(tree_node) = tree_node.and_then(Value::as_object) else {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    };
+    let is_site = tree_node
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("site"));
+    if !is_site {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    if child_branch_counts
+        .get(ui_node.node_id.as_str())
+        .copied()
+        .unwrap_or_default()
+        == 0
+    {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    let threshold = config.topology.queue_auto_virtualize_threshold_mbps;
+    if threshold == 0 {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    if node_capacity_mbps(tree_node) >= threshold {
+        TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren
+    } else {
+        TopologyQueueVisibilityPolicy::QueueVisible
     }
 }
 
@@ -2638,6 +2795,7 @@ fn apply_queue_hidden_node_virtualization(
     config: &Config,
     ui_state: &TopologyEditorStateFile,
     root: &mut Map<String, Value>,
+    virtualization: &QueueVirtualizationContext,
 ) {
     let ui_by_id = ui_state
         .nodes
@@ -2655,6 +2813,7 @@ fn apply_queue_hidden_node_virtualization(
             ui_node,
             find_node_by_id(root, &hidden_node_id),
             &child_branch_counts,
+            virtualization,
         );
         if resolved_policy != TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren {
             continue;
@@ -3870,6 +4029,7 @@ fn validate_effective_topology_network_from_canonical(
     ui_state: &TopologyEditorStateFile,
     effective: &TopologyEffectiveStateFile,
     effective_network: &Value,
+    virtualization: &QueueVirtualizationContext,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     validate_effective_node_identity_consistency(ui_state, effective, &mut errors);
@@ -3897,6 +4057,7 @@ fn validate_effective_topology_network_from_canonical(
             node,
             queue_policy_root.and_then(|root| find_node_by_id(root, &node.node_id)),
             &child_branch_counts,
+            virtualization,
         ) == TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren
         {
             continue;
@@ -3944,6 +4105,7 @@ pub fn validate_effective_topology_network(
         ui_state,
         effective,
         effective_network,
+        &QueueVirtualizationContext::default(),
     )
 }
 
@@ -3955,11 +4117,12 @@ fn apply_effective_topology_to_network_json_from_canonical(
     canonical: &TopologyCanonicalStateFile,
     ui_state: &TopologyEditorStateFile,
     effective: &TopologyEffectiveStateFile,
+    virtualization: &QueueVirtualizationContext,
 ) -> Value {
     let mut out = apply_effective_topology_reparenting_only(canonical_network, ui_state, effective);
     if let Some(root) = out.as_object_mut() {
         recompile_effective_network_bandwidths(root, canonical, ui_state, effective);
-        apply_queue_hidden_node_virtualization(config, ui_state, root);
+        apply_queue_hidden_node_virtualization(config, ui_state, root, virtualization);
         apply_runtime_squashing(config, ui_state, effective, root);
     }
     out
@@ -3988,6 +4151,7 @@ pub fn apply_effective_topology_to_network_json(
         &canonical_state,
         ui_state,
         effective,
+        &QueueVirtualizationContext::default(),
     )
 }
 
@@ -3996,6 +4160,7 @@ fn apply_effective_topology_to_canonical_state(
     canonical: &TopologyCanonicalStateFile,
     ui_state: &TopologyEditorStateFile,
     effective: &TopologyEffectiveStateFile,
+    virtualization: &QueueVirtualizationContext,
 ) -> Value {
     let canonical_network =
         if canonical.ingress_kind == TopologyCanonicalIngressKind::NativeIntegration {
@@ -4009,14 +4174,16 @@ fn apply_effective_topology_to_canonical_state(
         canonical,
         ui_state,
         effective,
+        virtualization,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectiveTopologyArtifacts, apply_effective_topology_to_canonical_state,
-        apply_effective_topology_to_network_json, auto_attachment_option,
+        EffectiveTopologyArtifacts, QueueVirtualizationContext,
+        apply_effective_topology_to_canonical_state, apply_effective_topology_to_network_json,
+        apply_effective_topology_to_network_json_from_canonical, auto_attachment_option,
         build_effective_topology_artifacts, build_effective_topology_artifacts_from_canonical,
         build_shaping_inputs, compute_effective_state, publish_effective_topology_artifacts,
         publish_topology_runtime_error_status, validate_effective_topology_network,
@@ -4033,6 +4200,7 @@ mod tests {
     };
     use lqos_overrides::{TopologyAttachmentMode, TopologyOverridesFile};
     use serde_json::{Value, json};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4057,6 +4225,81 @@ mod tests {
             serde_json::to_string_pretty(value).expect("runtime fixture should serialize"),
         )
         .unwrap_or_else(|_| panic!("{label} should write"));
+    }
+
+    fn site_with_ap_fixture() -> (
+        Config,
+        TopologyCanonicalStateFile,
+        TopologyEditorStateFile,
+        TopologyEffectiveStateFile,
+    ) {
+        let mut config = Config::default();
+        config.topology.queue_auto_virtualize_threshold_mbps = 5_000;
+        let editor_state = TopologyEditorStateFile {
+            schema_version: 1,
+            source: "splynx/ap_site".to_string(),
+            generated_unix: None,
+            ingress_identity: None,
+            nodes: vec![
+                TopologyEditorNode {
+                    node_id: "site-agg".to_string(),
+                    node_name: "Aggregation".to_string(),
+                    queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+                    ..TopologyEditorNode::default()
+                },
+                TopologyEditorNode {
+                    node_id: "ap-1".to_string(),
+                    node_name: "AP One".to_string(),
+                    current_parent_node_id: Some("site-agg".to_string()),
+                    current_parent_node_name: Some("Aggregation".to_string()),
+                    queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+                    ..TopologyEditorNode::default()
+                },
+            ],
+        };
+        let network = json!({
+            "Aggregation": {
+                "children": {
+                    "AP One": {
+                        "children": {},
+                        "downloadBandwidthMbps": 1000,
+                        "id": "ap-1",
+                        "name": "AP One",
+                        "type": "AP",
+                        "uploadBandwidthMbps": 1000
+                    }
+                },
+                "downloadBandwidthMbps": 7000,
+                "id": "site-agg",
+                "name": "Aggregation",
+                "type": "Site",
+                "uploadBandwidthMbps": 7000
+            }
+        });
+        let canonical = TopologyCanonicalStateFile::from_editor_and_network(
+            &editor_state,
+            &network,
+            TopologyCanonicalIngressKind::NativeIntegration,
+        );
+        let effective = TopologyEffectiveStateFile {
+            schema_version: 1,
+            generated_unix: None,
+            canonical_generated_unix: None,
+            health_generated_unix: None,
+            nodes: vec![
+                TopologyEffectiveNodeState {
+                    node_id: "site-agg".to_string(),
+                    logical_parent_node_id: String::new(),
+                    ..TopologyEffectiveNodeState::default()
+                },
+                TopologyEffectiveNodeState {
+                    node_id: "ap-1".to_string(),
+                    logical_parent_node_id: "site-agg".to_string(),
+                    ..TopologyEffectiveNodeState::default()
+                },
+            ],
+        };
+        (config, canonical, editor_state, effective)
     }
 
     fn runtime_tree_max_depth(value: &Value) -> usize {
@@ -5571,6 +5814,7 @@ mod tests {
                     }],
                 }],
             },
+            &QueueVirtualizationContext::default(),
         );
 
         let root_children = squashed
@@ -5740,6 +5984,7 @@ mod tests {
             &canonical,
             &editor_state,
             &effective,
+            &QueueVirtualizationContext::default(),
         );
         let root = effective_network
             .as_object()
@@ -5754,6 +5999,81 @@ mod tests {
             .expect("WestRedd should retain its logical children");
         assert!(west_children.get("AVIAT_WestRedd").is_none());
         assert!(west_children.get("Tuscany Ridge").is_some());
+    }
+
+    #[test]
+    fn large_visible_site_without_direct_circuits_auto_virtualizes() {
+        let (config, canonical, editor_state, effective) = site_with_ap_fixture();
+
+        let effective_network = apply_effective_topology_to_canonical_state(
+            &config,
+            &canonical,
+            &editor_state,
+            &effective,
+            &QueueVirtualizationContext::default(),
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let site = root["Aggregation"]
+            .as_object()
+            .expect("Aggregation should remain exported");
+
+        assert_eq!(site.get("virtual").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn large_site_with_direct_circuit_stays_visible() {
+        let (config, canonical, editor_state, effective) = site_with_ap_fixture();
+        let virtualization = QueueVirtualizationContext {
+            direct_circuit_node_ids: HashSet::from(["site-agg".to_string()]),
+            forced_visible_node_names: HashSet::new(),
+        };
+
+        let canonical_network = canonical.insight_topology_network_json();
+        let effective_network = apply_effective_topology_to_network_json_from_canonical(
+            &config,
+            &canonical_network,
+            &canonical,
+            &editor_state,
+            &effective,
+            &virtualization,
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let site = root["Aggregation"]
+            .as_object()
+            .expect("Aggregation should remain exported");
+
+        assert_eq!(site.get("virtual").and_then(Value::as_bool), None);
+    }
+
+    #[test]
+    fn large_site_with_force_visible_override_stays_visible() {
+        let (config, canonical, editor_state, effective) = site_with_ap_fixture();
+        let virtualization = QueueVirtualizationContext {
+            direct_circuit_node_ids: HashSet::new(),
+            forced_visible_node_names: HashSet::from(["Aggregation".to_string()]),
+        };
+
+        let canonical_network = canonical.insight_topology_network_json();
+        let effective_network = apply_effective_topology_to_network_json_from_canonical(
+            &config,
+            &canonical_network,
+            &canonical,
+            &editor_state,
+            &effective,
+            &virtualization,
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let site = root["Aggregation"]
+            .as_object()
+            .expect("Aggregation should remain exported");
+
+        assert_eq!(site.get("virtual").and_then(Value::as_bool), None);
     }
 
     #[test]

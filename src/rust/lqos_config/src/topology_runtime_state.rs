@@ -694,7 +694,7 @@ fn normalized_json_value_for_generation(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             let mut normalized = serde_json::Map::with_capacity(entries.len());
             for (key, child) in entries {
                 normalized.insert(key.clone(), normalized_json_value_for_generation(child));

@@ -776,8 +776,8 @@ class NetworkGraph:
 					device["mac"],
 					ipv4,
 					ipv6,
-					int(1),
-					int(1),
+					max(1.0, round(float(circuit["download"]*0.98), 2)),
+					max(1.0, round(float(circuit["upload"])*0.98, 2)),
 					max(1.0, round(float(circuit["download"]), 2)),
 					max(1.0, round(float(circuit["upload"]), 2)),
 					""
