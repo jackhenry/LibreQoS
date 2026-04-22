@@ -238,6 +238,6 @@ pub(crate) fn calculate_tree_weights() -> Result<Vec<NetworkNodeWeight>> {
             });
         });
 
-    result.sort_by(|a, b| b.weight.cmp(&a.weight));
+    result.sort_by_key(|entry| std::cmp::Reverse(entry.weight));
     Ok(result)
 }

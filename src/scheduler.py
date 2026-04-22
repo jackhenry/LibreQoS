@@ -4,7 +4,7 @@ import csv
 import io
 import json
 import chardet
-from LibreQoS import ValidationFailure, refreshShapers, refreshShapersUpdateOnly
+from LibreQoS import RefreshFailure, ValidationFailure, refreshShapers, refreshShapersUpdateOnly
 import subprocess
 import sys
 import tempfile
@@ -46,6 +46,7 @@ partial_topology_runtime_pending = False
 partial_topology_runtime_generation = None
 partial_topology_runtime_started_monotonic = None
 partial_topology_runtime_last_report_state = None
+last_integration_failure_message = ""
 
 
 def configure_scheduler_stdio():
@@ -128,6 +129,37 @@ def clear_scheduler_output():
     scheduler_output("")
 
 
+def remember_integration_failure(message: str):
+    global last_integration_failure_message
+    last_integration_failure_message = str(message or "").strip()
+
+
+def clear_integration_failure():
+    global last_integration_failure_message
+    last_integration_failure_message = ""
+
+
+def clear_scheduler_error_unless_integration_failed():
+    if not last_integration_failure_message:
+        clear_scheduler_error()
+
+
+def publish_ready_progress(active: bool, phase: str, phase_label: str, step_index: int, step_count: int, *, percent=None):
+    publish_scheduler_progress(
+        active,
+        phase,
+        phase_label,
+        step_index,
+        step_count,
+        percent=percent,
+    )
+    if last_integration_failure_message:
+        scheduler_error(
+            "Scheduler ready using last-known-good topology; latest integration import failed.\n"
+            + last_integration_failure_message
+        )
+
+
 def _scheduler_progress_percent(step_index: int, step_count: int, *, active: bool) -> int:
     if step_count <= 0:
         return 0
@@ -150,17 +182,6 @@ def publish_scheduler_progress(active: bool, phase: str, phase_label: str, step_
         )
     except Exception as e:
         print(f"Failed to publish scheduler progress: {e}")
-
-
-def publish_scheduler_ready(step_count: int):
-    publish_scheduler_progress(
-        False,
-        "ready",
-        "Scheduler ready",
-        step_count,
-        step_count,
-        percent=100,
-    )
 
 
 def report_scheduler_runtime_failure(context: str, exc: Exception, *, startup: bool = False):
@@ -253,6 +274,7 @@ def _write_integration_output_artifact(label, output):
 def _publish_integration_result(label, result):
     output = ((result.stdout or "") + (result.stderr or "")).replace("\r\n", "\n").strip()
     if result.returncode == 0:
+        clear_integration_failure()
         line_count = len(_integration_output_lines(output))
         summary = (
             f"{label} completed successfully."
@@ -275,6 +297,7 @@ def _publish_integration_result(label, result):
     if artifact is not None:
         message += f"\nFull output saved to {artifact}"
     print(message)
+    remember_integration_failure(message)
     scheduler_error(message)
 
 
@@ -396,6 +419,7 @@ def run_python_integration(module_name: str, func_name: str, label: str = ""):
     except Exception as e:
         err = f"Failed to invoke integration {label or (module_name + '.' + func_name)}: {e}"
         print(err)
+        remember_integration_failure(err)
         scheduler_error(err)
 
 def importFromCRM(
@@ -408,6 +432,7 @@ def importFromCRM(
     overrides_label="Applying overrides",
     overrides_step=3,
 ):
+    clear_integration_failure()
     clear_scheduler_error()
     clear_scheduler_output()
     publish_scheduler_progress(
@@ -433,6 +458,7 @@ def importFromCRM(
         except Exception as e:
             error_msg = f"Failed to run UISP integration: {str(e)}"
             print(error_msg)
+            remember_integration_failure(error_msg)
             scheduler_error(error_msg)
     elif automatic_import_splynx():
         run_python_integration("integrationSplynx", "importFromSplynx", label="Splynx")
@@ -1032,12 +1058,18 @@ def importAndShapeFullReload():
         report_topology_runtime_not_ready(
             "Scheduler startup shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
+            step_index=4,
             step_count=SCHEDULER_STARTUP_STEP_COUNT,
         )
         return False
     publish_scheduler_progress(True, "initial_shaping_reload", "Refreshing shaper state", 5, SCHEDULER_STARTUP_STEP_COUNT)
     if not enable_insight_topology():
-        refreshShapers()
+        try:
+            refreshShapers()
+        except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=True):
+                return False
+            raise
         shaping_runtime_hash = calculate_shaping_runtime_hash()
     else:
         shaping_runtime_hash = calculate_shaping_runtime_hash()
@@ -1068,6 +1100,7 @@ def importAndShapePartialReload():
         report_topology_runtime_not_ready(
             "Scheduled shaping refresh deferred",
             phase_label="Scheduler waiting for topology runtime",
+            step_index=3,
             step_count=SCHEDULER_REFRESH_STEP_COUNT,
         )
         return
@@ -1083,12 +1116,14 @@ def importAndShapePartialReload():
             report_scheduler_validation_failure("Scheduled shaping refresh blocked by validation", e)
             return
         except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=False):
+                return
             report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
             return
         shaping_runtime_hash = calculate_shaping_runtime_hash()
         if shaping_runtime_hash != 0:
             set_scheduler_status_bus_enabled(True)
-    publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
+    publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
 
 
 def topology_runtime_status_path():
@@ -1184,7 +1219,13 @@ def topology_runtime_readiness_detail():
     return (True, "", current_generation)
 
 
-def report_topology_runtime_not_ready(context: str, *, phase_label: str, step_count: int):
+def report_topology_runtime_not_ready(
+    context: str,
+    *,
+    phase_label: str,
+    step_index: int,
+    step_count: int,
+):
     ready, detail, generation = topology_runtime_readiness_detail()
     if ready:
         return
@@ -1192,7 +1233,19 @@ def report_topology_runtime_not_ready(context: str, *, phase_label: str, step_co
     if generation:
         message += f" Generation {generation[:12]}."
     print(message)
+    if _topology_runtime_not_ready_is_transient(detail):
+        clear_scheduler_error_unless_integration_failed()
+        scheduler_output(message)
+        publish_scheduler_progress(
+            False,
+            "waiting_for_topology_runtime",
+            phase_label,
+            step_index,
+            step_count,
+        )
+        return
     scheduler_error(message)
+    scheduler_output(message)
     publish_scheduler_progress(
         False,
         "degraded",
@@ -1231,6 +1284,29 @@ def _topology_runtime_not_ready_is_transient(detail: str) -> bool:
     detail_text = str(detail or "").strip()
     if detail_text.startswith("Topology runtime failed for the current source generation:"):
         return False
+    return True
+
+
+def _is_transient_stale_shaping_inputs_failure(exc: Exception) -> bool:
+    if not isinstance(exc, RefreshFailure):
+        return False
+    detail = str(exc or "").strip()
+    return detail.startswith("Missing or stale shaping_inputs.json.")
+
+
+def _defer_stale_shaping_inputs_failure(exc: Exception, *, startup: bool) -> bool:
+    if not _is_transient_stale_shaping_inputs_failure(exc):
+        return False
+
+    ready, detail, generation = topology_runtime_readiness_detail()
+    if detail and not _topology_runtime_not_ready_is_transient(detail):
+        return False
+
+    clear_scheduler_error_unless_integration_failed()
+    if startup:
+        _begin_startup_topology_runtime_wait(generation if not ready else current_topology_source_generation())
+    else:
+        _begin_partial_topology_runtime_wait(generation if not ready else current_topology_source_generation())
     return True
 
 
@@ -1360,6 +1436,8 @@ def _continue_startup_topology_runtime_wait():
             shaping_runtime_hash = 0
             return
         except Exception as e:
+            if _defer_stale_shaping_inputs_failure(e, startup=True):
+                return
             _reset_startup_topology_runtime_wait()
             report_scheduler_runtime_failure(
                 "Scheduler startup shaping refresh failed",
@@ -1371,8 +1449,15 @@ def _continue_startup_topology_runtime_wait():
 
         _reset_startup_topology_runtime_wait()
         if shaping_runtime_hash != 0:
-            clear_scheduler_error()
-            publish_scheduler_ready(SCHEDULER_STARTUP_STEP_COUNT)
+            clear_scheduler_error_unless_integration_failed()
+            publish_ready_progress(
+                False,
+                "ready",
+                "Scheduler ready",
+                SCHEDULER_STARTUP_STEP_COUNT,
+                SCHEDULER_STARTUP_STEP_COUNT,
+                percent=100,
+            )
             return
 
         report_scheduler_runtime_failure(
@@ -1402,6 +1487,7 @@ def _continue_startup_topology_runtime_wait():
     report_topology_runtime_not_ready(
         "Scheduler startup shaping refresh deferred",
         phase_label="Scheduler waiting for topology runtime",
+        step_index=4,
         step_count=SCHEDULER_STARTUP_STEP_COUNT,
     )
 
@@ -1457,6 +1543,8 @@ def _continue_partial_topology_runtime_wait():
                 )
                 return
             except Exception as e:
+                if _defer_stale_shaping_inputs_failure(e, startup=False):
+                    return
                 _reset_partial_topology_runtime_wait()
                 report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
                 return
@@ -1471,8 +1559,15 @@ def _continue_partial_topology_runtime_wait():
                 )
                 return
         _reset_partial_topology_runtime_wait()
-        clear_scheduler_error()
-        publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
+        clear_scheduler_error_unless_integration_failed()
+        publish_ready_progress(
+            False,
+            "ready",
+            "Scheduler ready",
+            SCHEDULER_REFRESH_STEP_COUNT,
+            SCHEDULER_REFRESH_STEP_COUNT,
+            percent=100,
+        )
         return
 
     started = partial_topology_runtime_started_monotonic
@@ -1495,6 +1590,7 @@ def _continue_partial_topology_runtime_wait():
     report_topology_runtime_not_ready(
         "Scheduled shaping refresh deferred",
         phase_label="Scheduler waiting for topology runtime",
+        step_index=3,
         step_count=SCHEDULER_REFRESH_STEP_COUNT,
     )
 
@@ -1543,6 +1639,8 @@ def topology_runtime_refresh_tick():
         report_scheduler_validation_failure("Topology runtime refresh blocked by validation", e)
         return
     except Exception as e:
+        if _defer_stale_shaping_inputs_failure(e, startup=False):
+            return
         report_scheduler_runtime_failure("Topology runtime refresh failed", e)
         return
     shaping_runtime_hash = calculate_shaping_runtime_hash()
@@ -1552,8 +1650,8 @@ def topology_runtime_refresh_tick():
             RuntimeError("Shaping runtime hash was not published after topology runtime refresh."),
         )
         return
-    clear_scheduler_error()
-    publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
+    clear_scheduler_error_unless_integration_failed()
+    publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
 
 
 def not_dead_yet():
@@ -1576,7 +1674,7 @@ def run_scheduler_main():
     try:
         startup_ready = importAndShapeFullReload()
         if startup_ready:
-            publish_scheduler_ready(SCHEDULER_STARTUP_STEP_COUNT)
+            publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_STARTUP_STEP_COUNT, SCHEDULER_STARTUP_STEP_COUNT, percent=100)
     except ValidationFailure as e:
         report_scheduler_validation_failure(
             "Scheduler startup shaping refresh blocked by validation",

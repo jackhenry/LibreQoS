@@ -616,16 +616,18 @@ fn handle_bus_requests(requests: &[BusRequest], responses: &mut Vec<BusResponse>
                 lqos_bus::BusResponse::Ack
             }
             BusRequest::UpdateLqosDTuning(..) => tuning::tune_lqosd_from_bus(req),
-            BusRequest::UpdateLqosdConfig(config) => {
-                let result = lqos_config::update_config(config);
-                if result.is_err() {
-                    error!("Error updating config: {:?}", result);
+            BusRequest::UpdateLqosdConfig(config) => match lqos_config::update_config(config) {
+                Ok(()) => {
+                    if let Ok(cfg) = lqos_config::load_config() {
+                        let _ = stick::recompute_stick_offset(&cfg);
+                    }
+                    BusResponse::Ack
                 }
-                if let Ok(cfg) = lqos_config::load_config() {
-                    let _ = stick::recompute_stick_offset(&cfg);
+                Err(err) => {
+                    error!("Error updating config: {err:?}");
+                    BusResponse::Fail(err.to_string())
                 }
-                BusResponse::Ack
-            }
+            },
             BusRequest::CreateDynamicCircuit { shaped_device } => {
                 crate::dynamic_circuits::create_dynamic_circuit((**shaped_device).clone())
             }

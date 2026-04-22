@@ -181,7 +181,7 @@ If `journalctl -u lqosd` shows repeated `BeginIngest queue full`, `IngestChunk q
 
 If specific APs or switches appear multiple times with suffixed names such as `... [AP deadbeef]`, check whether UISP is returning duplicate rows for the same device ID. Current builds defensively deduplicate raw UISP devices by `identification.id` before topology graph construction, and skip any residual duplicate device IDs during graph assembly.
 
-If an integration subprocess fails, current builds keep the scheduler alive, publish a shortened output preview to the scheduler status/error surfaces, and save the full captured output to a timestamped file under `/tmp` such as `lqos_scheduler_uisp_integration_YYYYMMDD_HHMMSS.log`.
+If an integration subprocess fails, current builds keep the scheduler alive, publish a shortened output preview to the scheduler status/error surfaces, and save the full captured output to a timestamped file under `/tmp` such as `lqos_scheduler_uisp_integration_YYYYMMDD_HHMMSS.log`. If shaping can continue from the last-known-good topology, the scheduler may still report ready, but the latest integration failure remains visible in scheduler status until the next successful integration run.
 
 ### Scheduler status in WebUI looks unhealthy
 

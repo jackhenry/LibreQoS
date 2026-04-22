@@ -2240,8 +2240,10 @@ fn committed_bandwidth_multiplier() -> PyResult<f32> {
 /// A UISP exception CPE entry paired with its forced parent.
 pub struct PyExceptionCpe {
     /// Child CPE site or device identifier.
+    #[pyo3(get)]
     pub cpe: String,
     /// Parent identifier assigned to the exception CPE.
+    #[pyo3(get)]
     pub parent: String,
 }
 

@@ -1579,8 +1579,7 @@ async fn receive_channel_message(
                 config::update_lqosd_config_data(*request_state.login, cfg, clear_secrets).await;
             let (ok, message) = match result {
                 Ok(()) => (true, "Ok".to_string()),
-                Err(StatusCode::FORBIDDEN) => (false, "Unauthorized".to_string()),
-                Err(_) => (false, "Error".to_string()),
+                Err(message) => (false, message),
             };
             let response = WsResponse::UpdateConfigResult { ok, message };
             if send_ws_response(&tx, response).await {
