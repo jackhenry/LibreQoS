@@ -152,6 +152,17 @@ def publish_scheduler_progress(active: bool, phase: str, phase_label: str, step_
         print(f"Failed to publish scheduler progress: {e}")
 
 
+def publish_scheduler_ready(step_count: int):
+    publish_scheduler_progress(
+        False,
+        "ready",
+        "Scheduler ready",
+        step_count,
+        step_count,
+        percent=100,
+    )
+
+
 def report_scheduler_runtime_failure(context: str, exc: Exception, *, startup: bool = False):
     message = f"{context}: {exc}"
     print(message)
@@ -1077,7 +1088,7 @@ def importAndShapePartialReload():
         shaping_runtime_hash = calculate_shaping_runtime_hash()
         if shaping_runtime_hash != 0:
             set_scheduler_status_bus_enabled(True)
-    publish_scheduler_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
+    publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
 
 
 def topology_runtime_status_path():
@@ -1361,14 +1372,7 @@ def _continue_startup_topology_runtime_wait():
         _reset_startup_topology_runtime_wait()
         if shaping_runtime_hash != 0:
             clear_scheduler_error()
-            publish_scheduler_progress(
-                False,
-                "ready",
-                "Scheduler ready",
-                SCHEDULER_STARTUP_STEP_COUNT,
-                SCHEDULER_STARTUP_STEP_COUNT,
-                percent=100,
-            )
+            publish_scheduler_ready(SCHEDULER_STARTUP_STEP_COUNT)
             return
 
         report_scheduler_runtime_failure(
@@ -1468,14 +1472,7 @@ def _continue_partial_topology_runtime_wait():
                 return
         _reset_partial_topology_runtime_wait()
         clear_scheduler_error()
-        publish_scheduler_progress(
-            False,
-            "ready",
-            "Scheduler ready",
-            SCHEDULER_REFRESH_STEP_COUNT,
-            SCHEDULER_REFRESH_STEP_COUNT,
-            percent=100,
-        )
+        publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
         return
 
     started = partial_topology_runtime_started_monotonic
@@ -1549,6 +1546,14 @@ def topology_runtime_refresh_tick():
         report_scheduler_runtime_failure("Topology runtime refresh failed", e)
         return
     shaping_runtime_hash = calculate_shaping_runtime_hash()
+    if shaping_runtime_hash == 0:
+        report_scheduler_runtime_failure(
+            "Topology runtime refresh failed",
+            RuntimeError("Shaping runtime hash was not published after topology runtime refresh."),
+        )
+        return
+    clear_scheduler_error()
+    publish_scheduler_ready(SCHEDULER_REFRESH_STEP_COUNT)
 
 
 def not_dead_yet():
@@ -1571,7 +1576,7 @@ def run_scheduler_main():
     try:
         startup_ready = importAndShapeFullReload()
         if startup_ready:
-            publish_scheduler_progress(False, "ready", "Scheduler ready", SCHEDULER_STARTUP_STEP_COUNT, SCHEDULER_STARTUP_STEP_COUNT, percent=100)
+            publish_scheduler_ready(SCHEDULER_STARTUP_STEP_COUNT)
     except ValidationFailure as e:
         report_scheduler_validation_failure(
             "Scheduler startup shaping refresh blocked by validation",

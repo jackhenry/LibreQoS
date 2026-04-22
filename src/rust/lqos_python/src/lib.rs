@@ -3565,12 +3565,26 @@ impl Bakery {
                 estimated_memory_bytes: detail.estimated_memory_bytes,
             })
             .collect::<Vec<_>>();
+        let qdisc_counts_fit = estimate
+            .interfaces
+            .values()
+            .all(|count| *count <= estimate.safe_budget);
+        let preflight_status = match (qdisc_counts_fit, estimate.memory_ok) {
+            (true, true) => "fits preflight",
+            (false, true) => "exceeds qdisc-count preflight",
+            (true, false) => "passed qdisc-count preflight but failed memory preflight",
+            (false, false) => "exceeds qdisc-count preflight and failed memory preflight",
+        };
         let memory_summary = if let Some(snapshot) = estimate.memory_snapshot.as_ref() {
+            let memory_floor = lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES;
+            let required_available_bytes =
+                memory_floor.saturating_add(estimate.estimated_total_memory_bytes);
             format!(
-                "estimated qdisc memory {} bytes with {} bytes currently available and safety floor {} bytes",
+                "estimated qdisc memory {} bytes; available memory {} bytes; required minimum {} bytes (safety floor {} bytes plus estimate)",
                 estimate.estimated_total_memory_bytes,
                 snapshot.available_bytes,
-                lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES
+                required_available_bytes,
+                memory_floor
             )
         } else {
             format!(
@@ -3580,8 +3594,7 @@ impl Bakery {
         };
         let summary = if interface_reports.is_empty() {
             format!(
-                "Planned queue model {} preflight. No shaping interfaces were queued; {memory_summary}.",
-                if is_ok { "fits" } else { "exceeds" },
+                "Planned queue model {preflight_status}. No shaping interfaces were queued; {memory_summary}.",
             )
         } else {
             let interface_summary = interface_reports
@@ -3603,10 +3616,8 @@ impl Bakery {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "Planned queue model {} preflight. {interface_summary}; safe budget {}, kernel limit {}; {memory_summary}.",
-                if is_ok { "fits" } else { "exceeds" },
-                estimate.safe_budget,
-                estimate.hard_limit,
+                "Planned queue model {preflight_status}. {interface_summary}; safe budget {}, kernel limit {}; {memory_summary}.",
+                estimate.safe_budget, estimate.hard_limit,
             )
         };
         let _ = run_query(vec![BusRequest::BakeryReportPreflight {
