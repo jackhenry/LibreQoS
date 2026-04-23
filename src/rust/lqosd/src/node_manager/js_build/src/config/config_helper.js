@@ -84,15 +84,6 @@ function ensureOptionalConfigSections(config) {
         splynx.strategy = "ap_site";
     }
 
-    const integration = config.integration_common;
-    if (typeof integration.always_overwrite_network_json !== "boolean") {
-        integration.always_overwrite_network_json = true;
-    }
-    const uisp = config.uisp_integration;
-    if (typeof uisp.use_ptmp_as_parent !== "boolean") {
-        uisp.use_ptmp_as_parent = false;
-    }
-
     const topology = config.topology;
     const normalizeMode = (mode) => {
         if (typeof mode !== "string") {

@@ -344,7 +344,7 @@ impl ProbeManagerState {
 
         results
             .into_iter()
-            .zip(requests.into_iter())
+            .zip(requests)
             .map(|(result, request)| {
                 result.unwrap_or_else(|| {
                     failed_observation(

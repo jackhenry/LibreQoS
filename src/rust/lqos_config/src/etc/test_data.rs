@@ -123,9 +123,6 @@ influxDBtoken = \"\"
 # Use Customer Name or Address as Circuit Name
 circuitNameUseAddress = True
 
-# Legacy network.json overwrite flag from older configs. Modern integration mode ignores it.
-overwriteNetworkJSONalways = False
-
 # If a device shows a WAN IP within these subnets, assume they are behind NAT / un-shapable, and ignore them
 ignoreSubnets = ['192.168.0.0/16']
 allowedSubnets = ['100.64.0.0/10']

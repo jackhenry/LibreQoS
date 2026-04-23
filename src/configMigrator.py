@@ -36,7 +36,6 @@ oldConfig = {
 
     # Common
     'circuitNameUseAddress': getIspConfigValue('circuitNameUseAddress', True),
-    'overwriteNetworkJSONalways': getIspConfigValue('overwriteNetworkJSONalways', False),
     'ignoreSubnets': getIspConfigValue('ignoreSubnets', ["192.168.0.0/16"]),
     'allowedSubnets': getIspConfigValue('allowedSubnets', ["100.64.0.0/10"]),
     'excludeSites': getIspConfigValue('excludeSites', []),

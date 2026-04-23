@@ -43,12 +43,6 @@ cd /opt/libreqos/src
 ./update_api.sh
 ```
 
-Git-installed LibreQoS upgrades preserve deprecated compatibility keys such as
-`integration_common.always_overwrite_network_json` and
-`uisp_integration.use_ptmp_as_parent` in `/etc/lqos.conf` for older
-`lqos_api` binaries. LibreQoS ignores these values, but older API builds may
-require the keys to parse the config file.
-
 Verify service state:
 
 ```bash

@@ -107,7 +107,6 @@ function updateConfig() {
     // Update the config object
     window.config.uisp_integration = {
         ...existingUisp,
-        use_ptmp_as_parent: existingUisp.use_ptmp_as_parent ?? false,
         enable_uisp: document.getElementById("enableUisp").checked,
         token: document.getElementById("uispToken").value.trim(),
         url: document.getElementById("uispUrl").value.trim(),

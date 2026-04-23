@@ -987,7 +987,6 @@ fn liblqos_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(uisp_suspended_strategy, m)?)?;
     m.add_function(wrap_pyfunction!(airmax_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(ltu_capacity, m)?)?;
-    m.add_function(wrap_pyfunction!(use_ptmp_as_parent, m)?)?;
     m.add_function(wrap_pyfunction!(uisp_base_url, m)?)?;
     m.add_function(wrap_pyfunction!(uisp_auth_token, m)?)?;
     m.add_function(wrap_pyfunction!(splynx_api_key, m)?)?;
@@ -2290,12 +2289,6 @@ fn airmax_capacity() -> PyResult<f32> {
 fn ltu_capacity() -> PyResult<f32> {
     let config = lqos_config::load_config().unwrap();
     Ok(config.uisp_integration.ltu_capacity)
-}
-
-#[pyfunction]
-fn use_ptmp_as_parent() -> PyResult<bool> {
-    let config = lqos_config::load_config().unwrap();
-    Ok(config.uisp_integration.use_ptmp_as_parent)
 }
 
 #[pyfunction]
