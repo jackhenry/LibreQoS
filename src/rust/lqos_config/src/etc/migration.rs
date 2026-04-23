@@ -255,6 +255,8 @@ fn migrate_integration_common(
     new_config: &mut Config,
 ) -> Result<(), MigrationError> {
     new_config.integration_common.circuit_name_as_address = python_config.circuit_name_use_address;
+    new_config.integration_common.always_overwrite_network_json =
+        python_config.overwrite_network_jsonalways;
     new_config.integration_common.queue_refresh_interval_mins =
         python_config.queue_refresh_interval_mins as u32;
     new_config.integration_common.use_mikrotik_ipv6 = python_config.find_ipv6using_mikrotik_api;

@@ -7,6 +7,10 @@ fn default_ethernet_port_limits_enabled() -> bool {
     true
 }
 
+fn default_always_overwrite_network_json() -> bool {
+    true
+}
+
 fn default_attachment_health_enabled() -> bool {
     true
 }
@@ -78,6 +82,14 @@ pub struct IntegrationConfig {
     /// Replace names with addresses?
     pub circuit_name_as_address: bool,
 
+    /// Deprecated compatibility field for older sidecar services.
+    ///
+    /// LibreQoS no longer uses this value to decide whether integrations may
+    /// replace `network.json`, but older `lqos_api` binaries still require the
+    /// key to exist when parsing `/etc/lqos.conf`.
+    #[serde(default = "default_always_overwrite_network_json")]
+    pub always_overwrite_network_json: bool,
+
     /// Queue refresh interval in minutes
     pub queue_refresh_interval_mins: u32,
 
@@ -110,6 +122,7 @@ impl Default for IntegrationConfig {
     fn default() -> Self {
         Self {
             circuit_name_as_address: false,
+            always_overwrite_network_json: true,
             queue_refresh_interval_mins: 30,
             use_mikrotik_ipv6: false,
             promote_to_root: None,
@@ -118,5 +131,34 @@ impl Default for IntegrationConfig {
             ethernet_port_limit_multiplier: None,
             topology_attachment_health: TopologyAttachmentHealthConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IntegrationConfig;
+
+    #[test]
+    fn missing_legacy_overwrite_key_defaults_to_true() {
+        let config: IntegrationConfig = toml::from_str(
+            r#"
+circuit_name_as_address = false
+queue_refresh_interval_mins = 30
+"#,
+        )
+        .expect("integration config without legacy key should deserialize");
+
+        assert!(config.always_overwrite_network_json);
+    }
+
+    #[test]
+    fn serialized_config_includes_legacy_overwrite_key() {
+        let serialized =
+            toml::to_string(&IntegrationConfig::default()).expect("config should serialize");
+
+        assert!(
+            serialized.contains("always_overwrite_network_json = true"),
+            "serialized config should keep legacy key for older lqos_api binaries"
+        );
     }
 }

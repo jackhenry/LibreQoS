@@ -46,6 +46,9 @@ function ensureOptionalConfigSections(config) {
     if (!config.splynx_integration || typeof config.splynx_integration !== "object") {
         config.splynx_integration = {};
     }
+    if (!config.integration_common || typeof config.integration_common !== "object") {
+        config.integration_common = {};
+    }
     if (!config.topology || typeof config.topology !== "object") {
         config.topology = {};
     }
@@ -76,6 +79,11 @@ function ensureOptionalConfigSections(config) {
     if (typeof splynx.url !== "string") splynx.url = "";
     if (typeof splynx.strategy !== "string" || splynx.strategy.length === 0) {
         splynx.strategy = "ap_site";
+    }
+
+    const integration = config.integration_common;
+    if (typeof integration.always_overwrite_network_json !== "boolean") {
+        integration.always_overwrite_network_json = true;
     }
 
     const topology = config.topology;
