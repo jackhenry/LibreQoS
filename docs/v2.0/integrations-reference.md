@@ -338,7 +338,7 @@ Built-in integrations do not overwrite an existing `network.json`; keep DIY `net
 
 ShapedDevices.csv will be overwritten every time the UISP integration is run.
 
-If UISP exposes a site and an AP with the same visible name in the same topology, current builds keep the site name stable in `network.json` and disambiguate the AP name during export so the site branch is not dropped from the tree.
+If UISP exposes duplicate visible node names, current builds keep the stable UISP IDs and disambiguate exported duplicate device/AP names with a short ID suffix such as `Nanoswitch [7c57e383]`. For site/AP name collisions, the site keeps the plain name and the AP side is suffixed so one branch does not hide another in the legacy network tree.
 
 Built-in integrations do not overwrite `network.json`; keep DIY `network.json` operator-owned.
 

@@ -44,7 +44,7 @@ pub async fn tree_summary_l2(channels: Arc<PubSub>) {
             }
 
             // Sort by total throughput descending and cap to N
-            candidates.sort_by(|a, b| b.3.cmp(&a.3));
+            candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.3));
             let n: usize = 10;
             if candidates.len() > n {
                 candidates.truncate(n);

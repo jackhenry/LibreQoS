@@ -8,7 +8,9 @@ use axum::http::StatusCode;
 use axum::http::header;
 use default_net::get_interfaces;
 use lqos_bus::{BusRequest, BusResponse, bus_request};
-use lqos_config::{Config, ConfigShapedDevices, ShapedDevice, UserRole, WebUser, WebUsers};
+use lqos_config::{
+    Config, ConfigShapedDevices, NetworkJson, ShapedDevice, UserRole, WebUser, WebUsers,
+};
 use lqos_utils::hash_to_i64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -524,10 +526,10 @@ pub fn list_nics_data(login: LoginResult) -> Result<Vec<(String, String, String)
 
 pub fn network_json_data() -> Value {
     if let Ok(config) = lqos_config::load_config() {
-        let path = std::path::Path::new(&config.lqos_directory).join("network.json");
-        if path.exists() {
-            let raw = std::fs::read_to_string(path).expect("Unable to read network json");
-            let json: Value = serde_json::from_str(&raw).expect("Unable to read network json");
+        let path = NetworkJson::path_for_config(config.as_ref());
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(json) = serde_json::from_str(&raw)
+        {
             return json;
         }
     }

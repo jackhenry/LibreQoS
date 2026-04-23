@@ -72,7 +72,7 @@ pub async fn asn_top(
             },
         })
         .collect();
-    down_rows.sort_by(|a, b| b.value.cmp(&a.value));
+    down_rows.sort_by_key(|row| std::cmp::Reverse(row.value));
     down_rows.truncate(9);
 
     let mut up_rows: Vec<TopAsnRow> = map
@@ -88,7 +88,7 @@ pub async fn asn_top(
             },
         })
         .collect();
-    up_rows.sort_by(|a, b| b.value.cmp(&a.value));
+    up_rows.sort_by_key(|row| std::cmp::Reverse(row.value));
     up_rows.truncate(9);
 
     // Publish to channels as needed

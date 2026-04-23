@@ -32,7 +32,7 @@ pub(super) async fn ping_monitor(
             }
         };
 
-        for ((ip, label), observation) in ip_addresses.iter().zip(observations.into_iter()) {
+        for ((ip, label), observation) in ip_addresses.iter().zip(observations) {
             if observation.reachable {
                 let ping_time = observation
                     .rtt_ms

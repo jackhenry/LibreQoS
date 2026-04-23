@@ -1353,7 +1353,7 @@ fn tree_summary_l2_data() -> Vec<(usize, Vec<(usize, lqos_config::NetworkJsonTra
             }
         }
 
-        candidates.sort_by(|a, b| b.3.cmp(&a.3));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.3));
         let n: usize = 10;
         if candidates.len() > n {
             candidates.truncate(n);

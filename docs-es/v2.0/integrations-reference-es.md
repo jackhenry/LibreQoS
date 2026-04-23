@@ -338,7 +338,7 @@ Las integraciones incluidas no sobrescriben `network.json`; conserve `network.js
 
 ShapedDevices.csv será sobrescrito cada vez que se ejecute la integración de UISP.
 
-Si UISP expone un sitio y un AP con el mismo nombre visible dentro de la misma topología, las compilaciones actuales conservan el nombre del sitio en `network.json` y diferencian el nombre exportado del AP para que la rama del sitio no desaparezca del árbol.
+Si UISP expone nombres visibles duplicados, las compilaciones actuales conservan los IDs estables de UISP y diferencian los nombres duplicados exportados de dispositivos/AP con un sufijo de ID corto, como `Nanoswitch [7c57e383]`. En colisiones de nombre entre sitio y AP, el sitio conserva el nombre simple y el lado AP recibe el sufijo para que una rama no oculte otra en el árbol heredado.
 
 Las integraciones incluidas no sobrescriben `network.json`; conserve `network.json` como entrada DIY/manual operada por el usuario.
 

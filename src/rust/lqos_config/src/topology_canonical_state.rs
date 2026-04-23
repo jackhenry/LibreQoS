@@ -439,9 +439,9 @@ fn normalized_insight_node_kind(kind: &str) -> String {
     }
 }
 
-fn short_node_suffix(node_id: &str) -> &str {
+fn short_node_suffix(node_id: &str) -> String {
     let short = node_id.rsplit(':').next().unwrap_or(node_id);
-    &short[..short.len().min(8)]
+    short.chars().take(8).collect()
 }
 
 fn unique_export_name(name: &str, node_id: &str, used_names: &mut HashSet<String>) -> String {
@@ -457,6 +457,87 @@ fn unique_export_name(name: &str, node_id: &str, used_names: &mut HashSet<String
     let fallback = format!("{name} [{node_id}]");
     used_names.insert(fallback.clone());
     fallback
+}
+
+fn duplicate_export_name(name: &str, node_id: &str, used_names: &mut HashSet<String>) -> String {
+    let short = format!("{name} [{}]", short_node_suffix(node_id));
+    if used_names.insert(short.clone()) {
+        return short;
+    }
+
+    let fallback = format!("{name} [{node_id}]");
+    used_names.insert(fallback.clone());
+    fallback
+}
+
+fn globally_unique_export_names(
+    nodes: &[TopologyCanonicalNode],
+    base_names_by_id: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut node_ids_by_name = HashMap::<&str, HashSet<&str>>::new();
+    let mut site_name_owner_by_base = HashMap::<&str, Option<&str>>::new();
+    for node in nodes {
+        let Some(base_name) = base_names_by_id.get(&node.node_id) else {
+            continue;
+        };
+        node_ids_by_name
+            .entry(base_name.as_str())
+            .or_default()
+            .insert(node.node_id.as_str());
+        if normalized_insight_node_kind(&node.node_kind) == "Site" {
+            match site_name_owner_by_base.entry(base_name.as_str()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(node.node_id.as_str()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if *entry.get() != Some(node.node_id.as_str()) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ordered_nodes = nodes.iter().collect::<Vec<_>>();
+    ordered_nodes.sort_unstable_by(|left, right| {
+        let left_name = base_names_by_id
+            .get(&left.node_id)
+            .map(String::as_str)
+            .unwrap_or(left.node_name.as_str());
+        let right_name = base_names_by_id
+            .get(&right.node_id)
+            .map(String::as_str)
+            .unwrap_or(right.node_name.as_str());
+        left_name
+            .cmp(right_name)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+
+    let mut used_names = HashSet::new();
+    let mut assigned_node_ids = HashSet::new();
+    let mut export_names = HashMap::new();
+    for node in ordered_nodes {
+        if !assigned_node_ids.insert(node.node_id.as_str()) {
+            continue;
+        }
+        let base_name = base_names_by_id
+            .get(&node.node_id)
+            .map(String::as_str)
+            .unwrap_or(node.node_name.as_str());
+        let duplicate_count = node_ids_by_name
+            .get(base_name)
+            .map(HashSet::len)
+            .unwrap_or_default();
+        let plain_site_owner = site_name_owner_by_base.get(base_name).copied().flatten();
+        let export_name = if duplicate_count > 1 && plain_site_owner != Some(node.node_id.as_str())
+        {
+            duplicate_export_name(base_name, &node.node_id, &mut used_names)
+        } else {
+            unique_export_name(base_name, &node.node_id, &mut used_names)
+        };
+        export_names.insert(node.node_id.clone(), export_name);
+    }
+    export_names
 }
 
 fn build_insight_logical_entry_json(
@@ -980,13 +1061,23 @@ impl TopologyCanonicalStateFile {
             build_network_node_index(network_map, &mut by_id, &mut by_name);
         }
 
-        let mut entries = HashMap::<String, InsightLogicalNodeEntry>::new();
+        let mut base_names_by_id = HashMap::<String, String>::new();
         for node in &self.nodes {
-            let (download_mbps, upload_mbps) = canonical_node_rates(node);
             let export_name = by_id
                 .get(&node.node_id)
                 .or_else(|| by_name.get(&node.node_name))
                 .map(|snapshot| snapshot.export_name.clone())
+                .unwrap_or_else(|| node.node_name.clone());
+            base_names_by_id.insert(node.node_id.clone(), export_name);
+        }
+        let export_names_by_id = globally_unique_export_names(&self.nodes, &base_names_by_id);
+
+        let mut entries = HashMap::<String, InsightLogicalNodeEntry>::new();
+        for node in &self.nodes {
+            let (download_mbps, upload_mbps) = canonical_node_rates(node);
+            let export_name = export_names_by_id
+                .get(&node.node_id)
+                .cloned()
                 .unwrap_or_else(|| node.node_name.clone());
             entries.insert(
                 node.node_id.clone(),
@@ -1335,6 +1426,89 @@ mod tests {
         assert_eq!(
             site.get("longitude").and_then(Value::as_f64),
             Some(-106.5494613647461_f64)
+        );
+    }
+
+    #[test]
+    fn native_integration_export_suffixes_duplicate_node_names() {
+        let canonical = TopologyCanonicalStateFile {
+            schema_version: 1,
+            source: "uisp/ap_site".to_string(),
+            generated_unix: Some(123),
+            ingress_identity: None,
+            ingress_kind: TopologyCanonicalIngressKind::NativeIntegration,
+            nodes: vec![
+                TopologyCanonicalNode {
+                    node_id: "uisp:site:site-a".to_string(),
+                    node_name: "Site A".to_string(),
+                    node_kind: "Site".to_string(),
+                    rate_input: super::TopologyCanonicalRateInput {
+                        intrinsic_download_mbps: Some(1000),
+                        intrinsic_upload_mbps: Some(1000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                TopologyCanonicalNode {
+                    node_id: "uisp:site:site-b".to_string(),
+                    node_name: "Site B".to_string(),
+                    node_kind: "Site".to_string(),
+                    rate_input: super::TopologyCanonicalRateInput {
+                        intrinsic_download_mbps: Some(1000),
+                        intrinsic_upload_mbps: Some(1000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                TopologyCanonicalNode {
+                    node_id: "uisp:device:7c57e383-d0c4-47ac-af78-7b626a20d0a3".to_string(),
+                    node_name: "Nanoswitch".to_string(),
+                    node_kind: "AP".to_string(),
+                    current_parent_node_id: Some("uisp:site:site-a".to_string()),
+                    current_parent_node_name: Some("Site A".to_string()),
+                    rate_input: super::TopologyCanonicalRateInput {
+                        intrinsic_download_mbps: Some(95),
+                        intrinsic_upload_mbps: Some(33),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                TopologyCanonicalNode {
+                    node_id: "uisp:device:01557d07-8a17-4263-98fb-80606c7dc613".to_string(),
+                    node_name: "Nanoswitch".to_string(),
+                    node_kind: "AP".to_string(),
+                    current_parent_node_id: Some("uisp:site:site-b".to_string()),
+                    current_parent_node_name: Some("Site B".to_string()),
+                    rate_input: super::TopologyCanonicalRateInput {
+                        intrinsic_download_mbps: Some(47),
+                        intrinsic_upload_mbps: Some(28),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            compatibility_network_json: json!({}),
+        };
+
+        let logical = canonical.insight_topology_network_json();
+        let site_a_children = logical["Site A"]["children"]
+            .as_object()
+            .expect("Site A should have child map");
+        let site_b_children = logical["Site B"]["children"]
+            .as_object()
+            .expect("Site B should have child map");
+
+        assert!(site_a_children.get("Nanoswitch").is_none());
+        assert!(site_b_children.get("Nanoswitch").is_none());
+        assert!(site_a_children.get("Nanoswitch [7c57e383]").is_some());
+        assert!(site_b_children.get("Nanoswitch [01557d07]").is_some());
+        assert_eq!(
+            site_a_children["Nanoswitch [7c57e383]"]["name"].as_str(),
+            Some("Nanoswitch [7c57e383]")
+        );
+        assert_eq!(
+            site_b_children["Nanoswitch [01557d07]"]["name"].as_str(),
+            Some("Nanoswitch [01557d07]")
         );
     }
 
