@@ -266,6 +266,9 @@ int tc_iphash_to_cpu(struct __sk_buff *skb)
         bpf_debug("(TC) Error: interface direction unspecified, aborting.");
         return TC_ACT_OK;
     }
+    if (tc_classify_bypass_enabled()) {
+        return TC_ACT_OK;
+    }
 #ifdef VERBOSE
     bpf_debug("(TC) SKB VLAN TCI: %u", skb->vlan_tci);    
 #endif

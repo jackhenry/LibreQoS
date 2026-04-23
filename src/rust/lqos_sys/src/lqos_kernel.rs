@@ -153,6 +153,11 @@ fn ensure_ip_mapping_maps_abi() -> Result<()> {
         std::mem::size_of::<u32>() as u32,
     )?;
     remove_incompatible_pinned_map(
+        "/sys/fs/bpf/tc_classify_control",
+        std::mem::size_of::<u32>() as u32,
+        std::mem::size_of::<crate::tc_classify_control::TcClassifyControl>() as u32,
+    )?;
+    remove_incompatible_pinned_map(
         "/sys/fs/bpf/map_traffic",
         std::mem::size_of::<XdpIpAddress>() as u32,
         std::mem::size_of::<crate::HostCounter>() as u32,
@@ -339,6 +344,7 @@ pub fn attach_xdp_and_tc_to_interface(
         // Ensure no lingering XDP programs before loading/attaching
         let _ = unload_xdp_from_interface(interface_name);
         load_kernel(skeleton)?;
+        crate::initialize_tc_classify_bypass()?;
         let prog_fd = bpf::bpf_program__fd((*skeleton).progs.xdp_prog);
         attach_xdp_best_available(interface_index, prog_fd, interface_name)?;
         skeleton

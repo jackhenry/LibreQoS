@@ -1936,6 +1936,91 @@ impl Drop for FullReloadScope {
     }
 }
 
+struct TcClassifyBypassGuard {
+    cleanup_on_drop: bool,
+    setter: fn(bool) -> anyhow::Result<()>,
+}
+
+struct BakeryFullReloadBatchResult {
+    result: ExecuteResult,
+    summary: String,
+    build_duration_ms: u64,
+    total_tc_commands: usize,
+    class_commands: usize,
+    qdisc_commands: usize,
+}
+
+impl BakeryFullReloadBatchResult {
+    fn metrics<'a>(&self, summary: &'a str, ok: bool) -> BakeryApplyMetrics<'a> {
+        BakeryApplyMetrics {
+            apply_type: BakeryApplyType::FullReload,
+            summary,
+            build_duration_ms: self.build_duration_ms,
+            apply_duration_ms: self.result.duration_ms,
+            total_tc_commands: self.total_tc_commands,
+            class_commands: self.class_commands,
+            qdisc_commands: self.qdisc_commands,
+            ok,
+        }
+    }
+}
+
+impl TcClassifyBypassGuard {
+    fn new() -> anyhow::Result<Self> {
+        Self::with_setter(lqos_sys::set_tc_classify_bypass)
+    }
+
+    fn with_setter(setter: fn(bool) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        setter(true).map_err(|error| {
+            error!(
+                "Bakery full reload failed to enable TC classify bypass via tc_classify_control: {error}"
+            );
+            error
+        })?;
+        info!("Bakery full reload enabled TC classify bypass");
+        Ok(Self {
+            cleanup_on_drop: true,
+            setter,
+        })
+    }
+
+    fn disable(&mut self) -> anyhow::Result<()> {
+        if !self.cleanup_on_drop {
+            return Ok(());
+        }
+        self.cleanup_on_drop = false;
+        (self.setter)(false).map_err(|error| {
+            error!(
+                "Bakery full reload failed to disable TC classify bypass via tc_classify_control: {error}"
+            );
+            error
+        })?;
+        info!("Bakery full reload disabled TC classify bypass");
+        Ok(())
+    }
+
+    fn keep_bypass_enabled_after_failure(&mut self, summary: &str) {
+        self.cleanup_on_drop = false;
+        error!(
+            "Bakery full reload keeping TC classify bypass enabled after failure: {}",
+            summary
+        );
+    }
+}
+
+impl Drop for TcClassifyBypassGuard {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        if let Err(error) = self.disable() {
+            mark_reload_required(format!(
+                "Bakery full reload could not disable TC classify bypass after reload: {error}. Operator intervention may be required because traffic may remain unshaped."
+            ));
+        }
+    }
+}
+
 fn telemetry_state() -> &'static RwLock<BakeryTelemetryState> {
     BAKERY_TELEMETRY.get_or_init(|| RwLock::new(BakeryTelemetryState::default()))
 }
@@ -10447,6 +10532,29 @@ fn full_reload(
         trigger_summary,
     );
     let _reload_scope = FullReloadScope;
+    let mut tc_bypass_guard = match TcClassifyBypassGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let summary =
+                format!("Failed to enable TC classify bypass before full reload: {error}");
+            error!("{summary}");
+            mark_reload_required(format!(
+                "{summary}. Full reload was not attempted because TC classify could not be safely bypassed."
+            ));
+            mark_bakery_action_finished(BakeryApplyMetrics {
+                apply_type: BakeryApplyType::FullReload,
+                summary: &summary,
+                build_duration_ms: 0,
+                apply_duration_ms: 0,
+                total_tc_commands: 0,
+                class_commands: 0,
+                qdisc_commands: 0,
+                ok: false,
+            });
+            *batch = None;
+            return;
+        }
+    };
     let previous_sites = sites.clone();
     let previous_circuits = circuits.clone();
     let previous_live_circuits = live_circuits.clone();
@@ -10457,6 +10565,10 @@ fn full_reload(
     if let Err(error) = prepare_root_mq_for_full_reload(config) {
         let summary = format!("Failed to prepare root mq state before full reload: {error}");
         error!("{summary}");
+        tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+        mark_reload_required(format!(
+            "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+        ));
         mark_bakery_action_finished(BakeryApplyMetrics {
             apply_type: BakeryApplyType::FullReload,
             summary: &summary,
@@ -10479,6 +10591,10 @@ fn full_reload(
             let summary =
                 format!("Failed to snapshot live qdisc handles before full reload: {error}");
             error!("{summary}");
+            tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+            mark_reload_required(format!(
+                "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+            ));
             mark_bakery_action_finished(BakeryApplyMetrics {
                 apply_type: BakeryApplyType::FullReload,
                 summary: &summary,
@@ -10502,7 +10618,7 @@ fn full_reload(
         warn!("Bakery: full reload skipped MQ layout restore because layout is unknown");
     }
 
-    let result = process_batch(
+    let batch_result = process_batch(
         new_batch,
         config,
         &mut working_sites,
@@ -10512,7 +10628,7 @@ fn full_reload(
         &live_reserved_handles,
     );
 
-    if result.ok {
+    if batch_result.result.ok {
         *sites = working_sites;
         *circuits = working_circuits;
         live_circuits.clear();
@@ -10538,11 +10654,28 @@ fn full_reload(
         *mq_layout = previous_mq_layout;
         MQ_CREATED.store(previous_mq_created, Ordering::Relaxed);
         SHAPING_TREE_ACTIVE.store(previous_shaping_tree_active, Ordering::Relaxed);
+        let summary = "Bakery full reload failed while applying TC command batch";
+        tc_bypass_guard.keep_bypass_enabled_after_failure(summary);
+        mark_reload_required(format!(
+            "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+        ));
     }
-    if result.ok {
+    if batch_result.result.ok {
         refresh_live_capacity_snapshot(config, true);
+        update_queue_distribution_snapshot(sites, circuits);
+        if let Err(error) = tc_bypass_guard.disable() {
+            let summary = format!(
+                "Bakery full reload applied TC commands but could not disable TC classify bypass: {error}. Operator intervention may be required because traffic may remain unshaped."
+            );
+            mark_reload_required(summary.clone());
+            mark_bakery_action_finished(batch_result.metrics(&summary, false));
+        } else {
+            mark_bakery_action_finished(batch_result.metrics(&batch_result.summary, true));
+        }
+    } else {
+        update_queue_distribution_snapshot(sites, circuits);
+        mark_bakery_action_finished(batch_result.metrics(&batch_result.summary, false));
     }
-    update_queue_distribution_snapshot(sites, circuits);
     *batch = None;
 }
 
@@ -10554,7 +10687,7 @@ fn process_batch(
     mq_layout: &MqDeviceLayout,
     qdisc_handles: &mut QdiscHandleState,
     extra_reserved_handles: &HashMap<String, HashSet<u16>>,
-) -> ExecuteResult {
+) -> BakeryFullReloadBatchResult {
     info!("Bakery: Processing batch of {} commands", batch.len());
     update_bakery_apply_progress(Some("Building tc command batch"), 0, 0, 0, 0);
     let build_started = std::time::Instant::now();
@@ -10620,18 +10753,14 @@ fn process_batch(
     );
     let summary = summarize_apply_result("processing batch", &result);
     maybe_emit_memory_guard_urgent(&summary);
-    mark_bakery_action_finished(BakeryApplyMetrics {
-        apply_type: BakeryApplyType::FullReload,
-        summary: &summary,
+    BakeryFullReloadBatchResult {
+        result,
+        summary,
         build_duration_ms,
-        apply_duration_ms: result.duration_ms,
         total_tc_commands,
         class_commands,
         qdisc_commands,
-        ok: result.ok,
-    });
-
-    result
+    }
 }
 
 fn apply_stormguard_overrides(
@@ -10679,7 +10808,33 @@ fn apply_stormguard_overrides(
 mod tests {
     use super::*;
     use lqos_config::Config;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TC_BYPASS_SETTER_CALLS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+    fn recording_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS.lock().expect("record setter call").push(enabled);
+        Ok(())
+    }
+
+    fn failing_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS.lock().expect("record setter call").push(enabled);
+        Err(anyhow::anyhow!("synthetic TC classify bypass setter failure"))
+    }
+
+    fn disable_failing_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS.lock().expect("record setter call").push(enabled);
+        if enabled {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("synthetic TC classify bypass disable failure"))
+        }
+    }
+
+    fn take_tc_bypass_setter_calls() -> Vec<bool> {
+        std::mem::take(&mut *TC_BYPASS_SETTER_CALLS.lock().expect("take setter calls"))
+    }
 
     fn bakery_test_lock() -> &'static std::sync::Mutex<()> {
         crate::test_state_lock()
@@ -10725,7 +10880,80 @@ mod tests {
         SHAPING_TREE_ACTIVE.store(false, Ordering::Relaxed);
         FIRST_COMMIT_APPLIED.store(false, Ordering::Relaxed);
         FULL_RELOAD_IN_PROGRESS.store(false, Ordering::Relaxed);
+        take_tc_bypass_setter_calls();
         install_bakery_test_config();
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_disables_on_scope_exit() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let _bypass_guard =
+                TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter)
+                    .expect("enable bypass guard");
+            assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![false]);
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_disables_on_early_return() {
+        fn early_return() -> Result<(), ()> {
+            let _bypass_guard =
+                TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter)
+                    .map_err(|_| ())?;
+            Err(())
+        }
+
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        assert_eq!(early_return(), Err(()));
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true, false]);
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_does_not_disable_when_enable_fails() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        assert!(TcClassifyBypassGuard::with_setter(failing_tc_bypass_setter).is_err());
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_reports_disable_failure_once() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let mut bypass_guard =
+                TcClassifyBypassGuard::with_setter(disable_failing_tc_bypass_setter)
+                    .expect("enable bypass guard");
+            assert!(bypass_guard.disable().is_err());
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true, false]);
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_keeps_bypass_enabled_after_failure() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let mut bypass_guard =
+                TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter)
+                    .expect("enable bypass guard");
+            bypass_guard.keep_bypass_enabled_after_failure("test failure after TC mutation");
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
     }
 
     fn mk_add_circuit(hash: i64, ip_addresses: &str) -> Arc<BakeryCommands> {
