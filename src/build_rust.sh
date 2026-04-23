@@ -138,7 +138,7 @@ mv liblqos_python.so.new liblqos_python.so
 
 # Update the lqos_api binary
 echo "Updating lqos_api binary..."
-bash ./update_api.sh || echo "Warning: Failed to update lqos_api (continuing)."
+bash ./update_api.sh --no-restart || echo "Warning: Failed to update lqos_api (continuing)."
 
 set_libreqos_operator_permissions() {
     local runtime_paths=()
@@ -171,6 +171,16 @@ service_unit_exists() {
 service_is_active() {
     local n=$1
     systemctl is-active --quiet "$n.service"
+}
+
+service_is_enabled() {
+    local n=$1
+    systemctl is-enabled --quiet "$n.service" 2>/dev/null
+}
+
+service_is_failed() {
+    local n=$1
+    systemctl is-failed --quiet "$n.service" 2>/dev/null
 }
 
 refresh_service_unit() {
@@ -244,8 +254,8 @@ else
         echo "lqos_scheduler is active as a service. Restarting it. You may need to enter your sudo password."
         sudo systemctl restart lqos_scheduler
     fi
-    if service_is_active lqos_api; then
-        echo "lqos_api is active as a service. Restarting it. You may need to enter your sudo password."
+    if service_is_active lqos_api || service_is_failed lqos_api || service_is_enabled lqos_api; then
+        echo "lqos_api is installed as an active, failed, or enabled service. Restarting it. You may need to enter your sudo password."
         sudo systemctl restart lqos_api
     fi
     if service_is_active lqos_setup; then

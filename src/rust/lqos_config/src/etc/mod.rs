@@ -370,6 +370,55 @@ fn maybe_migrate_uisp_capacity_defaults(
     Ok(migrated)
 }
 
+fn maybe_migrate_lqos_api_legacy_overwrite_key(
+    config_location: &str,
+    raw: String,
+) -> Result<String, LibreQoSConfigError> {
+    let mut doc: DocumentMut = raw.parse().map_err(|e| LibreQoSConfigError::ParseError {
+        path: config_location.to_string(),
+        details: format!("Error parsing config: {e}"),
+    })?;
+
+    if doc
+        .get("integration_common")
+        .and_then(|section| section.as_table_like())
+        .and_then(|section| section.get("always_overwrite_network_json"))
+        .is_some()
+    {
+        return Ok(raw);
+    }
+
+    if let Some(section) = doc.get("integration_common") {
+        if section.as_table_like().is_none() {
+            return Ok(raw);
+        }
+    } else {
+        doc["integration_common"] = Item::Table(Table::new());
+    }
+
+    doc["integration_common"]["always_overwrite_network_json"] = value(true);
+    let migrated = doc.to_string();
+
+    let config_path = Path::new(config_location);
+    if config_path.exists() {
+        let backup_path = format!("{config_location}.lqos_api_legacy_overwrite_backup");
+        std::fs::copy(config_path, &backup_path).map_err(|e| LibreQoSConfigError::CannotWrite {
+            path: backup_path,
+            source: e,
+        })?;
+    }
+
+    std::fs::write(config_path, &migrated).map_err(|e| LibreQoSConfigError::CannotWrite {
+        path: config_location.to_string(),
+        source: e,
+    })?;
+
+    info!(
+        "Added deprecated integration_common.always_overwrite_network_json compatibility key for older lqos_api binaries."
+    );
+    Ok(migrated)
+}
+
 fn actually_load_from_disk() -> Result<Arc<Config>, LibreQoSConfigError> {
     let config_location = if let Ok(lqos_config) = std::env::var("LQOS_CONFIG") {
         info!("Overriding lqos.conf location from environment variable.");
@@ -414,6 +463,7 @@ fn actually_load_from_disk() -> Result<Arc<Config>, LibreQoSConfigError> {
     let raw = maybe_migrate_treeguard_link_virtualization_defaults(&config_location, raw)?;
     let raw = maybe_migrate_uisp_capacity_defaults(&config_location, raw)?;
     let raw = maybe_migrate_topology_compile_mode(&config_location, raw)?;
+    let raw = maybe_migrate_lqos_api_legacy_overwrite_key(&config_location, raw)?;
 
     let mut final_config = Config::load_from_string(&raw).map_err(|e| {
         error!("Unable to parse {config_location}");
@@ -553,8 +603,9 @@ pub enum LibreQoSConfigError {
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_migrate_topology_compile_mode, maybe_migrate_treeguard_link_virtualization_defaults,
-        maybe_migrate_uisp_capacity_defaults, topology_compile_mode_migration_stamp_path,
+        maybe_migrate_lqos_api_legacy_overwrite_key, maybe_migrate_topology_compile_mode,
+        maybe_migrate_treeguard_link_virtualization_defaults, maybe_migrate_uisp_capacity_defaults,
+        topology_compile_mode_migration_stamp_path,
         treeguard_links_virtualization_migration_stamp_path,
         uisp_capacity_defaults_migration_stamp_path,
     };
@@ -583,6 +634,73 @@ mod tests {
 
     fn path_string(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn lqos_api_legacy_overwrite_key_migration_rewrites_missing_key() {
+        let test_dir = unique_test_dir();
+        let raw = "[integration_common]\ncircuit_name_as_address = false\nqueue_refresh_interval_mins = 30\n";
+        let config_path = write_test_config(&test_dir, raw);
+
+        let config_path_str = path_string(&config_path);
+        let migrated =
+            maybe_migrate_lqos_api_legacy_overwrite_key(&config_path_str, raw.to_string())
+                .expect("migration should succeed");
+
+        assert!(migrated.contains("always_overwrite_network_json = true"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("config should be rewritten"),
+            migrated
+        );
+        assert_eq!(
+            fs::read_to_string(config_path.with_extension("conf.lqos_api_legacy_overwrite_backup"))
+                .expect("backup should exist"),
+            raw
+        );
+
+        fs::remove_dir_all(&test_dir).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn lqos_api_legacy_overwrite_key_migration_leaves_existing_key() {
+        let test_dir = unique_test_dir();
+        let raw = "[integration_common]\nalways_overwrite_network_json = false\nqueue_refresh_interval_mins = 30\n";
+        let config_path = write_test_config(&test_dir, raw);
+
+        let config_path_str = path_string(&config_path);
+        let migrated =
+            maybe_migrate_lqos_api_legacy_overwrite_key(&config_path_str, raw.to_string())
+                .expect("migration should succeed");
+
+        assert_eq!(migrated, raw);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("config should remain unchanged"),
+            raw
+        );
+        assert!(
+            !config_path
+                .with_extension("conf.lqos_api_legacy_overwrite_backup")
+                .exists()
+        );
+
+        fs::remove_dir_all(&test_dir).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn lqos_api_legacy_overwrite_key_migration_creates_missing_section() {
+        let test_dir = unique_test_dir();
+        let raw = "version = \"1.5\"\n";
+        let config_path = write_test_config(&test_dir, raw);
+
+        let config_path_str = path_string(&config_path);
+        let migrated =
+            maybe_migrate_lqos_api_legacy_overwrite_key(&config_path_str, raw.to_string())
+                .expect("migration should succeed");
+
+        assert!(migrated.contains("[integration_common]"));
+        assert!(migrated.contains("always_overwrite_network_json = true"));
+
+        fs::remove_dir_all(&test_dir).expect("should clean up temp dir");
     }
 
     #[test]
