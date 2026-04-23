@@ -52,6 +52,9 @@ function ensureOptionalConfigSections(config) {
     if (!config.topology || typeof config.topology !== "object") {
         config.topology = {};
     }
+    if (!config.uisp_integration || typeof config.uisp_integration !== "object") {
+        config.uisp_integration = {};
+    }
 
     if (!config.sonar_integration || typeof config.sonar_integration !== "object") {
         config.sonar_integration = {};
@@ -84,6 +87,10 @@ function ensureOptionalConfigSections(config) {
     const integration = config.integration_common;
     if (typeof integration.always_overwrite_network_json !== "boolean") {
         integration.always_overwrite_network_json = true;
+    }
+    const uisp = config.uisp_integration;
+    if (typeof uisp.use_ptmp_as_parent !== "boolean") {
+        uisp.use_ptmp_as_parent = false;
     }
 
     const topology = config.topology;

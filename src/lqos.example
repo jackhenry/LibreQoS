@@ -111,6 +111,8 @@ ipv6_with_mikrotik = false
 bandwidth_overhead_factor = 1.0
 commit_bandwidth_multiplier = 0.98
 exception_cpes = []
+# Deprecated compatibility key for older lqos_api binaries. LibreQoS ignores the value.
+use_ptmp_as_parent = false
 ignore_calculated_capacity = false
 
 [powercode_integration]

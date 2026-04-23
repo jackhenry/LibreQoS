@@ -43,10 +43,12 @@ cd /opt/libreqos/src
 ./update_api.sh
 ```
 
-Las actualizaciones de LibreQoS instaladas desde Git conservan la clave obsoleta
-`integration_common.always_overwrite_network_json` en `/etc/lqos.conf` para
-binarios antiguos de `lqos_api`. LibreQoS ignora el valor, pero las versiones
-antiguas de la API pueden requerir la clave para leer el archivo de configuración.
+Las actualizaciones de LibreQoS instaladas desde Git conservan claves obsoletas
+de compatibilidad, como `integration_common.always_overwrite_network_json` y
+`uisp_integration.use_ptmp_as_parent`, en `/etc/lqos.conf` para binarios
+antiguos de `lqos_api`. LibreQoS ignora estos valores, pero las versiones
+antiguas de la API pueden requerir las claves para leer el archivo de
+configuración.
 
 Verificar estado del servicio:
 

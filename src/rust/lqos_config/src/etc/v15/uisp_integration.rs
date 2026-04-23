@@ -27,8 +27,11 @@ pub struct UispIntegration {
     pub bandwidth_overhead_factor: f32,
     pub commit_bandwidth_multiplier: f32,
     pub exception_cpes: Vec<ExceptionCpe>,
-    /// Deprecated legacy importer-side PtMP-parent toggle. Existing values are ignored.
-    #[serde(default, skip_serializing)]
+    /// Deprecated legacy importer-side PtMP-parent toggle.
+    ///
+    /// LibreQoS ignores this value, but older `lqos_api` binaries require the
+    /// key to exist when parsing `/etc/lqos.conf`.
+    #[serde(default)]
     pub use_ptmp_as_parent: bool,
     #[serde(default = "default_ignore_calculated_capacity")]
     pub ignore_calculated_capacity: bool,
@@ -93,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_ptmp_parent_flag_loads_but_does_not_serialize() {
+    fn deprecated_ptmp_parent_flag_loads_and_serializes_for_api_compatibility() {
         let config: UispIntegration = toml::from_str(
             r#"
 enable_uisp = true
@@ -118,6 +121,6 @@ use_ptmp_as_parent = true
 
         let serialized =
             toml::to_string(&config).expect("uisp integration config should serialize");
-        assert!(!serialized.contains("use_ptmp_as_parent"));
+        assert!(serialized.contains("use_ptmp_as_parent = true"));
     }
 }

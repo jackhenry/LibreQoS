@@ -88,7 +88,6 @@ function updateConfig() {
     // Parse comma-separated strings into arrays
     const existingUisp = { ...(window.config.uisp_integration || {}) };
     delete existingUisp.enable_squashing;
-    delete existingUisp.use_ptmp_as_parent;
 
     const excludeSites = document.getElementById("uispExcludeSites").value.trim();
     const excludeSitesArray = excludeSites ? excludeSites.split(',').map(s => s.trim()) : [];
@@ -108,6 +107,7 @@ function updateConfig() {
     // Update the config object
     window.config.uisp_integration = {
         ...existingUisp,
+        use_ptmp_as_parent: existingUisp.use_ptmp_as_parent ?? false,
         enable_uisp: document.getElementById("enableUisp").checked,
         token: document.getElementById("uispToken").value.trim(),
         url: document.getElementById("uispUrl").value.trim(),
