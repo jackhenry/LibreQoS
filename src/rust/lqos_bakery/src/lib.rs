@@ -2847,6 +2847,9 @@ fn root_infra_class_entry(entry: &LiveTcClassEntry, root_child_majors: &HashSet<
 }
 
 fn root_infra_qdisc_entry(entry: &LiveTcQdiscEntry, root_child_majors: &HashSet<u16>) -> bool {
+    if entry.kind == "clsact" {
+        return true;
+    }
     if entry.is_root {
         return true;
     }
@@ -2985,6 +2988,46 @@ fn qdisc_delete_commands(
             ]
         })
         .collect()
+}
+
+fn tc_classify_attached(interface: &str) -> Result<bool, String> {
+    let output = std::process::Command::new("/sbin/tc")
+        .args(["filter", "show", "dev", interface, "egress"])
+        .output()
+        .map_err(|error| {
+            format!("Failed to inspect TC classify attachment on {interface}: {error}")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "Failed to inspect TC classify attachment on {interface}: tc exited with {:?}",
+                output.status.code()
+            )
+        } else {
+            format!("Failed to inspect TC classify attachment on {interface}: {stderr}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains("tc_iphash_to_cp"))
+}
+
+fn verify_tc_classify_attached(config: &Arc<Config>) -> Result<(), String> {
+    let mut missing = Vec::new();
+    for interface in managed_interfaces_for_config(config) {
+        match tc_classify_attached(&interface) {
+            Ok(true) => {}
+            Ok(false) => missing.push(interface),
+            Err(error) => return Err(error),
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "TC classify egress attachment missing on interface(s): {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 fn drain_managed_tree_to_defaults(
@@ -10920,6 +10963,18 @@ fn full_reload(
     if batch_result.result.ok {
         refresh_live_capacity_snapshot(config, true);
         update_queue_distribution_snapshot(sites, circuits);
+        if let Err(error) = verify_tc_classify_attached(config) {
+            let summary = format!(
+                "Bakery full reload applied TC commands but TC classify is not attached: {error}. Operator intervention may be required because traffic would otherwise remain unshaped."
+            );
+            tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+            mark_reload_required(format!(
+                "{summary}. TC classify bypass remains enabled until a successful reload or lqosd restart restores classifier attachment."
+            ));
+            mark_bakery_action_finished(batch_result.metrics(&summary, false));
+            *batch = None;
+            return;
+        }
         if let Err(error) = tc_bypass_guard.disable() {
             let summary = format!(
                 "Bakery full reload applied TC commands but could not disable TC classify bypass: {error}. Operator intervention may be required because traffic may remain unshaped."
@@ -13483,6 +13538,34 @@ mod tests {
         assert_eq!(
             managed_root_child_parent_handles(&managed_snapshot),
             HashSet::from([TcHandle::from_u32(0x7fff0001)])
+        );
+    }
+
+    #[test]
+    fn root_infra_qdisc_entry_preserves_clsact() {
+        let root_child_majors = HashSet::from([0x1]);
+        assert!(root_infra_qdisc_entry(
+            &live_qdisc_entry("clsact", Some(0xffff0000), Some(0xfffffff1), false),
+            &root_child_majors,
+        ));
+    }
+
+    #[test]
+    fn qdisc_delete_commands_skip_clsact() {
+        let qdisc_snapshot = vec![
+            live_qdisc_entry("clsact", Some(0xffff0000), Some(0xfffffff1), false),
+            live_qdisc_entry("fq_codel", Some(0x95000000), Some(0x10020), false),
+        ];
+        assert_eq!(
+            qdisc_delete_commands("eth0", &qdisc_snapshot, &HashSet::from([0x1])),
+            vec![vec![
+                "qdisc".to_string(),
+                "del".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "0x1:0x20".to_string(),
+            ]]
         );
     }
 
