@@ -447,6 +447,8 @@ pub struct BakeryStatusState {
     pub preflight: Option<BakeryPreflightData>,
     pub reload_required: bool,
     pub reload_required_reason: Option<String>,
+    pub passthrough_degraded: bool,
+    pub passthrough_degraded_reason: Option<String>,
     pub dirty_subtree_count: usize,
 }
 

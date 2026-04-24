@@ -1169,38 +1169,6 @@ async fn persistent_connection(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encode_ws_binary_round_trips_begin_ingest() {
-        let encoded = encode_ws_binary(
-            &messages::WsMessage::BeginIngest {
-                unique_id: 42,
-                n_chunks: 7,
-            },
-            "BeginIngest",
-        )
-        .expect("BeginIngest should encode");
-
-        let Message::Binary(bytes) = encoded else {
-            panic!("BeginIngest should encode to a binary websocket frame");
-        };
-
-        match messages::WsMessage::from_bytes(&bytes).expect("BeginIngest should decode") {
-            messages::WsMessage::BeginIngest {
-                unique_id,
-                n_chunks,
-            } => {
-                assert_eq!(unique_id, 42);
-                assert_eq!(n_chunks, 7);
-            }
-            other => panic!("unexpected decoded message: {other:?}"),
-        }
-    }
-}
-
 async fn connect() -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let remote_host = crate::lts2_sys::lts2_client::get_remote_host();
     let target = format!("wss://{}:443/shaper_gateway/ws", &remote_host);
@@ -1788,4 +1756,36 @@ async fn tree_snapshot_streaming(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_ws_binary_round_trips_begin_ingest() {
+        let encoded = encode_ws_binary(
+            &messages::WsMessage::BeginIngest {
+                unique_id: 42,
+                n_chunks: 7,
+            },
+            "BeginIngest",
+        )
+        .expect("BeginIngest should encode");
+
+        let Message::Binary(bytes) = encoded else {
+            panic!("BeginIngest should encode to a binary websocket frame");
+        };
+
+        match messages::WsMessage::from_bytes(&bytes).expect("BeginIngest should decode") {
+            messages::WsMessage::BeginIngest {
+                unique_id,
+                n_chunks,
+            } => {
+                assert_eq!(unique_id, 42);
+                assert_eq!(n_chunks, 7);
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
 }

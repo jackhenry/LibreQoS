@@ -27,6 +27,7 @@ mod utils;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use parking_lot::RwLock;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1742,6 +1743,10 @@ pub struct BakeryStatusSnapshot {
     pub reload_required: bool,
     /// Operator-facing reason for why a full reload is now required, if any.
     pub reload_required_reason: Option<String>,
+    /// True when Bakery has put traffic into pass-through mode to avoid stale TC classification.
+    pub passthrough_degraded: bool,
+    /// Operator-facing reason for pass-through mode, if active.
+    pub passthrough_degraded_reason: Option<String>,
     /// Number of runtime node operations currently marked dirty.
     pub dirty_subtree_count: usize,
 }
@@ -1789,6 +1794,8 @@ struct BakeryTelemetryState {
     preflight: Option<BakeryPreflightSnapshot>,
     reload_required: bool,
     reload_required_reason: Option<String>,
+    passthrough_degraded: bool,
+    passthrough_degraded_reason: Option<String>,
     dirty_subtree_count: usize,
     runtime_operations_by_site: HashMap<i64, RuntimeNodeOperationSnapshot>,
     runtime_branch_states_by_site: HashMap<i64, BakeryRuntimeNodeBranchSnapshot>,
@@ -1904,6 +1911,8 @@ impl Default for BakeryTelemetryState {
             preflight: None,
             reload_required: false,
             reload_required_reason: None,
+            passthrough_degraded: false,
+            passthrough_degraded_reason: None,
             dirty_subtree_count: 0,
             runtime_operations_by_site: HashMap::new(),
             runtime_branch_states_by_site: HashMap::new(),
@@ -1932,6 +1941,112 @@ impl Drop for FullReloadScope {
         if state.mode == BakeryMode::ApplyingFullReload {
             state.mode = BakeryMode::Idle;
             state.current_action_started_unix = None;
+        }
+    }
+}
+
+struct TcClassifyBypassGuard {
+    cleanup_on_drop: bool,
+    setter: fn(bool) -> anyhow::Result<()>,
+}
+
+struct BakeryFullReloadBatchResult {
+    result: ExecuteResult,
+    summary: String,
+    build_duration_ms: u64,
+    total_tc_commands: usize,
+    class_commands: usize,
+    qdisc_commands: usize,
+}
+
+struct ProcessBatchOptions<'a> {
+    extra_reserved_handles: &'a HashMap<String, HashSet<u16>>,
+    preserved_root_child_majors: &'a HashMap<String, HashSet<u16>>,
+}
+
+impl BakeryFullReloadBatchResult {
+    fn metrics<'a>(&self, summary: &'a str, ok: bool) -> BakeryApplyMetrics<'a> {
+        BakeryApplyMetrics {
+            apply_type: BakeryApplyType::FullReload,
+            summary,
+            build_duration_ms: self.build_duration_ms,
+            apply_duration_ms: self.result.duration_ms,
+            total_tc_commands: self.total_tc_commands,
+            class_commands: self.class_commands,
+            qdisc_commands: self.qdisc_commands,
+            ok,
+        }
+    }
+}
+
+impl TcClassifyBypassGuard {
+    fn new() -> anyhow::Result<Self> {
+        Self::with_setter(lqos_sys::set_tc_classify_bypass)
+    }
+
+    fn with_setter(setter: fn(bool) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        setter(true).map_err(|error| {
+            error!(
+                "Bakery full reload failed to enable TC classify bypass via tc_classify_control: {error}"
+            );
+            error
+        })?;
+        info!("Bakery full reload enabled TC classify bypass");
+        mark_passthrough_degraded(
+            "Bakery full reload is rebuilding TC. Traffic is temporarily passing without shaping to avoid stale class-handle classification.",
+            false,
+        );
+        Ok(Self {
+            cleanup_on_drop: true,
+            setter,
+        })
+    }
+
+    fn disable(&mut self) -> anyhow::Result<()> {
+        if !self.cleanup_on_drop {
+            return Ok(());
+        }
+        self.cleanup_on_drop = false;
+        (self.setter)(false).map_err(|error| {
+            error!(
+                "Bakery full reload failed to disable TC classify bypass via tc_classify_control: {error}"
+            );
+            mark_passthrough_degraded(format!(
+                "Bakery full reload applied TC commands but could not disable pass-through mode: {error}. Traffic may remain unshaped until operator intervention or a later successful reload."
+            ), true);
+            error
+        })?;
+        info!("Bakery full reload disabled TC classify bypass");
+        clear_passthrough_degraded(
+            "Bakery full reload disabled pass-through mode; normal shaping is active.",
+        );
+        Ok(())
+    }
+
+    fn keep_bypass_enabled_after_failure(&mut self, summary: &str) {
+        self.cleanup_on_drop = false;
+        error!(
+            "Bakery full reload keeping TC classify bypass enabled after failure: {}",
+            summary
+        );
+        mark_passthrough_degraded(
+            format!(
+                "{summary}. Traffic is passing without shaping until a successful full reload clears TC classify bypass."
+            ),
+            true,
+        );
+    }
+}
+
+impl Drop for TcClassifyBypassGuard {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        if let Err(error) = self.disable() {
+            mark_reload_required(format!(
+                "Bakery full reload could not disable TC classify bypass after reload: {error}. Operator intervention may be required because traffic may remain unshaped."
+            ));
         }
     }
 }
@@ -2013,6 +2128,39 @@ fn mark_reload_required(summary: String) {
     }
     if should_emit {
         push_bakery_event("reload_required", "error", summary);
+    }
+}
+
+fn mark_passthrough_degraded(summary: impl Into<String>, emit_activity: bool) {
+    let summary = summary.into();
+    let mut should_emit = false;
+    {
+        let mut state = telemetry_state().write();
+        if !state.passthrough_degraded
+            || state.passthrough_degraded_reason.as_deref() != Some(summary.as_str())
+        {
+            state.passthrough_degraded = true;
+            state.passthrough_degraded_reason = Some(summary.clone());
+            should_emit = true;
+        }
+    }
+    if should_emit && emit_activity {
+        push_bakery_event("passthrough_degraded", "warning", summary);
+    }
+}
+
+fn clear_passthrough_degraded(summary: &str) {
+    let mut should_emit = false;
+    {
+        let mut state = telemetry_state().write();
+        if state.passthrough_degraded || state.passthrough_degraded_reason.is_some() {
+            state.passthrough_degraded = false;
+            state.passthrough_degraded_reason = None;
+            should_emit = true;
+        }
+    }
+    if should_emit {
+        push_bakery_event("passthrough_degraded_cleared", "info", summary.to_string());
     }
 }
 
@@ -2154,6 +2302,8 @@ pub fn bakery_status_snapshot() -> BakeryStatusSnapshot {
         preflight: state.preflight,
         reload_required: state.reload_required,
         reload_required_reason: state.reload_required_reason,
+        passthrough_degraded: state.passthrough_degraded,
+        passthrough_degraded_reason: state.passthrough_degraded_reason,
         dirty_subtree_count: state.dirty_subtree_count,
     }
 }
@@ -2664,42 +2814,271 @@ fn root_mq_add_command(interface_name: &str) -> Vec<String> {
     ]
 }
 
-fn prepare_root_mq_for_full_reload(config: &Arc<Config>) -> Result<(), String> {
+fn command_token_after<'a>(command: &'a [String], needle: &str) -> Option<&'a str> {
+    command
+        .windows(2)
+        .find(|tokens| tokens[0] == needle)
+        .map(|tokens| tokens[1].as_str())
+}
+
+fn command_handle_after(command: &[String], needle: &str) -> Option<TcHandle> {
+    command_token_after(command, needle).and_then(|token| TcHandle::from_string(token).ok())
+}
+
+fn command_interface(command: &[String]) -> Option<&str> {
+    command_token_after(command, "dev")
+}
+
+fn root_infra_class_handle(handle: TcHandle, root_child_majors: &HashSet<u16>) -> bool {
+    let (major, minor) = handle.get_major_minor();
+    root_child_majors.contains(&major) && matches!(minor, 1 | 2)
+}
+
+fn root_infra_class_entry(entry: &LiveTcClassEntry, root_child_majors: &HashSet<u16>) -> bool {
+    let (major, minor) = entry.class_id.get_major_minor();
+    if !root_child_majors.contains(&major) {
+        return false;
+    }
+    match (minor, entry.parent) {
+        (1, Some(parent)) => parent == tc_handle_from_major_minor(major, 0),
+        (2, Some(parent)) => parent == tc_handle_from_major_minor(major, 1),
+        _ => false,
+    }
+}
+
+fn root_infra_qdisc_entry(entry: &LiveTcQdiscEntry, root_child_majors: &HashSet<u16>) -> bool {
+    if entry.kind == "clsact" {
+        return true;
+    }
+    if entry.is_root {
+        return true;
+    }
+    if entry
+        .parent
+        .is_some_and(|parent| parent.get_major_minor().0 == ROOT_MQ_MAJOR)
+    {
+        return true;
+    }
+    entry.parent.is_some_and(|parent| {
+        let (major, minor) = parent.get_major_minor();
+        root_child_majors.contains(&major) && matches!(minor, 1 | 2)
+    })
+}
+
+fn root_infra_class_command(
+    command: &[String],
+    preserved_root_child_majors: &HashMap<String, HashSet<u16>>,
+) -> bool {
+    if !matches!(command.first().map(String::as_str), Some("class")) {
+        return false;
+    }
+    let Some(interface) = command_interface(command) else {
+        return false;
+    };
+    let Some(root_child_majors) = preserved_root_child_majors.get(interface) else {
+        return false;
+    };
+    command_handle_after(command, "classid")
+        .is_some_and(|handle| root_infra_class_handle(handle, root_child_majors))
+}
+
+fn root_infra_qdisc_command(
+    command: &[String],
+    preserved_root_child_majors: &HashMap<String, HashSet<u16>>,
+) -> bool {
+    if !matches!(command.first().map(String::as_str), Some("qdisc")) {
+        return false;
+    }
+    let Some(interface) = command_interface(command) else {
+        return false;
+    };
+    let Some(root_child_majors) = preserved_root_child_majors.get(interface) else {
+        return false;
+    };
+    command_handle_after(command, "parent").is_some_and(|parent| {
+        let (major, minor) = parent.get_major_minor();
+        major == ROOT_MQ_MAJOR || root_child_majors.contains(&major) && matches!(minor, 1 | 2)
+    })
+}
+
+fn idempotent_full_reload_command(
+    mut command: Vec<String>,
+    preserved_root_child_majors: &HashMap<String, HashSet<u16>>,
+) -> Vec<String> {
+    if matches!(command.get(1).map(String::as_str), Some("add"))
+        && root_infra_class_command(&command, preserved_root_child_majors)
+    {
+        command[1] = "replace".to_string();
+    }
+    command
+}
+
+fn class_depth(
+    handle: TcHandle,
+    snapshot: &HashMap<TcHandle, LiveTcClassEntry>,
+    seen: &mut HashSet<TcHandle>,
+) -> usize {
+    if !seen.insert(handle) {
+        return 0;
+    }
+    snapshot
+        .get(&handle)
+        .and_then(|entry| entry.parent)
+        .map(|parent| 1 + class_depth(parent, snapshot, seen))
+        .unwrap_or(0)
+}
+
+fn class_delete_commands(
+    interface: &str,
+    class_snapshot: &HashMap<TcHandle, LiveTcClassEntry>,
+    root_child_majors: &HashSet<u16>,
+) -> Vec<Vec<String>> {
+    let mut entries = class_snapshot
+        .values()
+        .filter(|entry| {
+            entry.class_id.get_major_minor().0 != ROOT_MQ_MAJOR
+                && !root_infra_class_entry(entry, root_child_majors)
+        })
+        .filter_map(|entry| {
+            entry.parent.map(|parent| {
+                let mut seen = HashSet::new();
+                (
+                    class_depth(entry.class_id, class_snapshot, &mut seen),
+                    entry.class_id,
+                    parent,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| Reverse(entry.0));
+    entries
+        .into_iter()
+        .map(|(_, class_id, parent)| {
+            vec![
+                "class".to_string(),
+                "del".to_string(),
+                "dev".to_string(),
+                interface.to_string(),
+                "parent".to_string(),
+                parent.as_tc_string(),
+                "classid".to_string(),
+                class_id.as_tc_string(),
+            ]
+        })
+        .collect()
+}
+
+fn qdisc_delete_commands(
+    interface: &str,
+    qdisc_snapshot: &[LiveTcQdiscEntry],
+    root_child_majors: &HashSet<u16>,
+) -> Vec<Vec<String>> {
+    qdisc_snapshot
+        .iter()
+        .filter(|entry| !root_infra_qdisc_entry(entry, root_child_majors))
+        .filter_map(|entry| entry.parent)
+        .map(|parent| {
+            vec![
+                "qdisc".to_string(),
+                "del".to_string(),
+                "dev".to_string(),
+                interface.to_string(),
+                "parent".to_string(),
+                parent.as_tc_string(),
+            ]
+        })
+        .collect()
+}
+
+fn tc_classify_attached(interface: &str) -> Result<bool, String> {
+    let output = std::process::Command::new("/sbin/tc")
+        .args(["filter", "show", "dev", interface, "egress"])
+        .output()
+        .map_err(|error| {
+            format!("Failed to inspect TC classify attachment on {interface}: {error}")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "Failed to inspect TC classify attachment on {interface}: tc exited with {:?}",
+                output.status.code()
+            )
+        } else {
+            format!("Failed to inspect TC classify attachment on {interface}: {stderr}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains("tc_iphash_to_cp"))
+}
+
+fn verify_tc_classify_attached(config: &Arc<Config>) -> Result<(), String> {
+    let mut missing = Vec::new();
+    for interface in managed_interfaces_for_config(config) {
+        match tc_classify_attached(&interface) {
+            Ok(true) => {}
+            Ok(false) => missing.push(interface),
+            Err(error) => return Err(error),
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "TC classify egress attachment missing on interface(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn drain_managed_tree_to_defaults(
+    interface: &str,
+    qdisc_snapshot: &[LiveTcQdiscEntry],
+) -> Result<HashSet<u16>, String> {
+    let root_child_majors = managed_root_child_parent_handles(qdisc_snapshot)
+        .into_iter()
+        .map(|parent| parent.get_major_minor().1)
+        .collect::<HashSet<_>>();
+    if root_child_majors.is_empty() {
+        return Ok(root_child_majors);
+    }
+    let class_snapshot = read_live_class_snapshot(interface)?;
+    let mut commands = qdisc_delete_commands(interface, qdisc_snapshot, &root_child_majors);
+    commands.extend(class_delete_commands(
+        interface,
+        &class_snapshot,
+        &root_child_majors,
+    ));
+    if commands.is_empty() {
+        return Ok(root_child_majors);
+    }
+    run_root_preflight_commands(
+        &commands,
+        &format!("full reload drain managed tree to defaults on {interface}"),
+    )?;
+    invalidate_live_tc_snapshots();
+    Ok(root_child_majors)
+}
+
+fn prepare_root_mq_for_full_reload(
+    config: &Arc<Config>,
+) -> Result<HashMap<String, HashSet<u16>>, String> {
+    let mut preserved_root_child_majors = HashMap::new();
     for interface in managed_interfaces_for_config(config) {
         let qdisc_snapshot = read_live_qdisc_snapshot(&interface)?;
         if retained_root_mq_entry(&qdisc_snapshot).is_some() {
-            let prune_commands = managed_root_child_parent_handles(&qdisc_snapshot)
-                .into_iter()
-                .map(|parent| {
-                    vec![
-                        "qdisc".to_string(),
-                        "del".to_string(),
-                        "dev".to_string(),
-                        interface.clone(),
-                        "parent".to_string(),
-                        parent.as_tc_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            if !prune_commands.is_empty() {
-                run_root_preflight_commands(
-                    &prune_commands,
-                    &format!("full reload retained-root child prune on {interface}"),
-                )?;
-                invalidate_live_tc_snapshots();
+            let has_managed_root_children =
+                !managed_root_child_parent_handles(&qdisc_snapshot).is_empty();
+            if has_managed_root_children {
+                let root_child_majors =
+                    drain_managed_tree_to_defaults(&interface, &qdisc_snapshot)?;
+                if !root_child_majors.is_empty() {
+                    preserved_root_child_majors.insert(interface.clone(), root_child_majors);
+                }
             }
-
-            let pruned_qdisc_snapshot = read_live_qdisc_snapshot(&interface)?;
-            let pruned_class_snapshot = read_live_class_snapshot(&interface)?;
-            if verify_clean_root_child_tree(
-                &pruned_qdisc_snapshot,
-                &pruned_class_snapshot,
-                &interface,
-            )
-            .is_ok()
-            {
-                continue;
-            }
+            info!(
+                "Bakery: preserving existing root mq/default path on {interface} during full reload"
+            );
+            continue;
         }
 
         let replace_summary = run_root_preflight_commands(
@@ -2747,7 +3126,7 @@ fn prepare_root_mq_for_full_reload(config: &Arc<Config>) -> Result<(), String> {
         )?;
     }
 
-    Ok(())
+    Ok(preserved_root_child_majors)
 }
 
 fn live_tree_mutations_allowed(config: &Arc<Config>) -> bool {
@@ -10447,6 +10826,29 @@ fn full_reload(
         trigger_summary,
     );
     let _reload_scope = FullReloadScope;
+    let mut tc_bypass_guard = match TcClassifyBypassGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let summary =
+                format!("Failed to enable TC classify bypass before full reload: {error}");
+            error!("{summary}");
+            mark_reload_required(format!(
+                "{summary}. Full reload was not attempted because TC classify could not be safely bypassed."
+            ));
+            mark_bakery_action_finished(BakeryApplyMetrics {
+                apply_type: BakeryApplyType::FullReload,
+                summary: &summary,
+                build_duration_ms: 0,
+                apply_duration_ms: 0,
+                total_tc_commands: 0,
+                class_commands: 0,
+                qdisc_commands: 0,
+                ok: false,
+            });
+            *batch = None;
+            return;
+        }
+    };
     let previous_sites = sites.clone();
     let previous_circuits = circuits.clone();
     let previous_live_circuits = live_circuits.clone();
@@ -10454,22 +10856,29 @@ fn full_reload(
     let previous_mq_created = MQ_CREATED.load(Ordering::Relaxed);
     let previous_shaping_tree_active = SHAPING_TREE_ACTIVE.load(Ordering::Relaxed);
 
-    if let Err(error) = prepare_root_mq_for_full_reload(config) {
-        let summary = format!("Failed to prepare root mq state before full reload: {error}");
-        error!("{summary}");
-        mark_bakery_action_finished(BakeryApplyMetrics {
-            apply_type: BakeryApplyType::FullReload,
-            summary: &summary,
-            build_duration_ms: 0,
-            apply_duration_ms: 0,
-            total_tc_commands: 0,
-            class_commands: 0,
-            qdisc_commands: 0,
-            ok: false,
-        });
-        *batch = None;
-        return;
-    }
+    let preserved_root_child_majors = match prepare_root_mq_for_full_reload(config) {
+        Ok(preserved_root_child_majors) => preserved_root_child_majors,
+        Err(error) => {
+            let summary = format!("Failed to prepare root mq state before full reload: {error}");
+            error!("{summary}");
+            tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+            mark_reload_required(format!(
+                "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+            ));
+            mark_bakery_action_finished(BakeryApplyMetrics {
+                apply_type: BakeryApplyType::FullReload,
+                summary: &summary,
+                build_duration_ms: 0,
+                apply_duration_ms: 0,
+                total_tc_commands: 0,
+                class_commands: 0,
+                qdisc_commands: 0,
+                ok: false,
+            });
+            *batch = None;
+            return;
+        }
+    };
     invalidate_live_tc_snapshots();
     MQ_CREATED.store(true, Ordering::Relaxed);
 
@@ -10479,6 +10888,10 @@ fn full_reload(
             let summary =
                 format!("Failed to snapshot live qdisc handles before full reload: {error}");
             error!("{summary}");
+            tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+            mark_reload_required(format!(
+                "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+            ));
             mark_bakery_action_finished(BakeryApplyMetrics {
                 apply_type: BakeryApplyType::FullReload,
                 summary: &summary,
@@ -10502,17 +10915,20 @@ fn full_reload(
         warn!("Bakery: full reload skipped MQ layout restore because layout is unknown");
     }
 
-    let result = process_batch(
+    let batch_result = process_batch(
         new_batch,
         config,
         &mut working_sites,
         &mut working_circuits,
         &layout,
         &mut working_qdisc_handles,
-        &live_reserved_handles,
+        ProcessBatchOptions {
+            extra_reserved_handles: &live_reserved_handles,
+            preserved_root_child_majors: &preserved_root_child_majors,
+        },
     );
 
-    if result.ok {
+    if batch_result.result.ok {
         *sites = working_sites;
         *circuits = working_circuits;
         live_circuits.clear();
@@ -10538,11 +10954,40 @@ fn full_reload(
         *mq_layout = previous_mq_layout;
         MQ_CREATED.store(previous_mq_created, Ordering::Relaxed);
         SHAPING_TREE_ACTIVE.store(previous_shaping_tree_active, Ordering::Relaxed);
+        let summary = "Bakery full reload failed while applying TC command batch";
+        tc_bypass_guard.keep_bypass_enabled_after_failure(summary);
+        mark_reload_required(format!(
+            "{summary}. TC classify bypass remains enabled to avoid stale class-handle classification until a successful reload or operator intervention."
+        ));
     }
-    if result.ok {
+    if batch_result.result.ok {
         refresh_live_capacity_snapshot(config, true);
+        update_queue_distribution_snapshot(sites, circuits);
+        if let Err(error) = verify_tc_classify_attached(config) {
+            let summary = format!(
+                "Bakery full reload applied TC commands but TC classify is not attached: {error}. Operator intervention may be required because traffic would otherwise remain unshaped."
+            );
+            tc_bypass_guard.keep_bypass_enabled_after_failure(&summary);
+            mark_reload_required(format!(
+                "{summary}. TC classify bypass remains enabled until a successful reload or lqosd restart restores classifier attachment."
+            ));
+            mark_bakery_action_finished(batch_result.metrics(&summary, false));
+            *batch = None;
+            return;
+        }
+        if let Err(error) = tc_bypass_guard.disable() {
+            let summary = format!(
+                "Bakery full reload applied TC commands but could not disable TC classify bypass: {error}. Operator intervention may be required because traffic may remain unshaped."
+            );
+            mark_reload_required(summary.clone());
+            mark_bakery_action_finished(batch_result.metrics(&summary, false));
+        } else {
+            mark_bakery_action_finished(batch_result.metrics(&batch_result.summary, true));
+        }
+    } else {
+        update_queue_distribution_snapshot(sites, circuits);
+        mark_bakery_action_finished(batch_result.metrics(&batch_result.summary, false));
     }
-    update_queue_distribution_snapshot(sites, circuits);
     *batch = None;
 }
 
@@ -10553,8 +10998,8 @@ fn process_batch(
     circuits: &mut HashMap<i64, Arc<BakeryCommands>>,
     mq_layout: &MqDeviceLayout,
     qdisc_handles: &mut QdiscHandleState,
-    extra_reserved_handles: &HashMap<String, HashSet<u16>>,
-) -> ExecuteResult {
+    options: ProcessBatchOptions<'_>,
+) -> BakeryFullReloadBatchResult {
     info!("Bakery: Processing batch of {} commands", batch.len());
     update_bakery_apply_progress(Some("Building tc command batch"), 0, 0, 0, 0);
     let build_started = std::time::Instant::now();
@@ -10567,7 +11012,7 @@ fn process_batch(
                 config,
                 mq_layout,
                 qdisc_handles,
-                extra_reserved_handles,
+                options.extra_reserved_handles,
             )
         })
         .filter_map(|b| {
@@ -10585,6 +11030,8 @@ fn process_batch(
             b.to_commands(config, ExecutionMode::Builder)
         })
         .flatten()
+        .map(|command| idempotent_full_reload_command(command, options.preserved_root_child_majors))
+        .filter(|command| !root_infra_qdisc_command(command, options.preserved_root_child_majors))
         .collect::<Vec<Vec<String>>>();
 
     let path = config.debug_state_file_path("linux_tc_rust.txt");
@@ -10620,18 +11067,14 @@ fn process_batch(
     );
     let summary = summarize_apply_result("processing batch", &result);
     maybe_emit_memory_guard_urgent(&summary);
-    mark_bakery_action_finished(BakeryApplyMetrics {
-        apply_type: BakeryApplyType::FullReload,
-        summary: &summary,
+    BakeryFullReloadBatchResult {
+        result,
+        summary,
         build_duration_ms,
-        apply_duration_ms: result.duration_ms,
         total_tc_commands,
         class_commands,
         qdisc_commands,
-        ok: result.ok,
-    });
-
-    result
+    }
 }
 
 fn apply_stormguard_overrides(
@@ -10679,7 +11122,46 @@ fn apply_stormguard_overrides(
 mod tests {
     use super::*;
     use lqos_config::Config;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TC_BYPASS_SETTER_CALLS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+    fn recording_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS
+            .lock()
+            .expect("record setter call")
+            .push(enabled);
+        Ok(())
+    }
+
+    fn failing_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS
+            .lock()
+            .expect("record setter call")
+            .push(enabled);
+        Err(anyhow::anyhow!(
+            "synthetic TC classify bypass setter failure"
+        ))
+    }
+
+    fn disable_failing_tc_bypass_setter(enabled: bool) -> anyhow::Result<()> {
+        TC_BYPASS_SETTER_CALLS
+            .lock()
+            .expect("record setter call")
+            .push(enabled);
+        if enabled {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "synthetic TC classify bypass disable failure"
+            ))
+        }
+    }
+
+    fn take_tc_bypass_setter_calls() -> Vec<bool> {
+        std::mem::take(&mut *TC_BYPASS_SETTER_CALLS.lock().expect("take setter calls"))
+    }
 
     fn bakery_test_lock() -> &'static std::sync::Mutex<()> {
         crate::test_state_lock()
@@ -10725,7 +11207,101 @@ mod tests {
         SHAPING_TREE_ACTIVE.store(false, Ordering::Relaxed);
         FIRST_COMMIT_APPLIED.store(false, Ordering::Relaxed);
         FULL_RELOAD_IN_PROGRESS.store(false, Ordering::Relaxed);
+        take_tc_bypass_setter_calls();
         install_bakery_test_config();
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_disables_on_scope_exit() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let _bypass_guard = TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter)
+                .expect("enable bypass guard");
+            assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![false]);
+        let status = bakery_status_snapshot();
+        assert!(!status.passthrough_degraded);
+        assert!(status.passthrough_degraded_reason.is_none());
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_disables_on_early_return() {
+        fn early_return() -> Result<(), ()> {
+            let _bypass_guard =
+                TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter).map_err(|_| ())?;
+            Err(())
+        }
+
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        assert_eq!(early_return(), Err(()));
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true, false]);
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_does_not_disable_when_enable_fails() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        assert!(TcClassifyBypassGuard::with_setter(failing_tc_bypass_setter).is_err());
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
+        let status = bakery_status_snapshot();
+        assert!(!status.passthrough_degraded);
+        assert!(status.passthrough_degraded_reason.is_none());
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_reports_disable_failure_once() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let mut bypass_guard =
+                TcClassifyBypassGuard::with_setter(disable_failing_tc_bypass_setter)
+                    .expect("enable bypass guard");
+            assert!(bypass_guard.disable().is_err());
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true, false]);
+        let status = bakery_status_snapshot();
+        assert!(status.passthrough_degraded);
+        assert!(
+            status
+                .passthrough_degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not disable pass-through mode")
+        );
+    }
+
+    #[test]
+    fn tc_classify_bypass_guard_keeps_bypass_enabled_after_failure() {
+        let _guard = bakery_test_lock().lock().expect("bakery test lock");
+        reset_bakery_test_state();
+
+        {
+            let mut bypass_guard = TcClassifyBypassGuard::with_setter(recording_tc_bypass_setter)
+                .expect("enable bypass guard");
+            bypass_guard.keep_bypass_enabled_after_failure("test failure after TC mutation");
+        }
+
+        assert_eq!(take_tc_bypass_setter_calls(), vec![true]);
+        let status = bakery_status_snapshot();
+        assert!(status.passthrough_degraded);
+        assert!(
+            status
+                .passthrough_degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Traffic is passing without shaping")
+        );
     }
 
     fn mk_add_circuit(hash: i64, ip_addresses: &str) -> Arc<BakeryCommands> {
@@ -12963,6 +13539,169 @@ mod tests {
             managed_root_child_parent_handles(&managed_snapshot),
             HashSet::from([TcHandle::from_u32(0x7fff0001)])
         );
+    }
+
+    #[test]
+    fn root_infra_qdisc_entry_preserves_clsact() {
+        let root_child_majors = HashSet::from([0x1]);
+        assert!(root_infra_qdisc_entry(
+            &live_qdisc_entry("clsact", Some(0xffff0000), Some(0xfffffff1), false),
+            &root_child_majors,
+        ));
+    }
+
+    #[test]
+    fn qdisc_delete_commands_skip_clsact() {
+        let qdisc_snapshot = vec![
+            live_qdisc_entry("clsact", Some(0xffff0000), Some(0xfffffff1), false),
+            live_qdisc_entry("fq_codel", Some(0x95000000), Some(0x10020), false),
+        ];
+        assert_eq!(
+            qdisc_delete_commands("eth0", &qdisc_snapshot, &HashSet::from([0x1])),
+            vec![vec![
+                "qdisc".to_string(),
+                "del".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "0x1:0x20".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn idempotent_full_reload_command_replaces_class_adds() {
+        let root_child_majors = HashMap::from([("eth0".to_string(), HashSet::from([0x1]))]);
+        assert_eq!(
+            idempotent_full_reload_command(
+                vec![
+                    "class".to_string(),
+                    "add".to_string(),
+                    "dev".to_string(),
+                    "eth0".to_string(),
+                    "classid".to_string(),
+                    "0x1:1".to_string(),
+                ],
+                &root_child_majors,
+            ),
+            vec![
+                "class".to_string(),
+                "replace".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "classid".to_string(),
+                "0x1:1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn idempotent_full_reload_command_leaves_non_add_commands_unchanged() {
+        let root_child_majors = HashMap::from([("eth0".to_string(), HashSet::from([0x1]))]);
+        assert_eq!(
+            idempotent_full_reload_command(
+                vec![
+                    "qdisc".to_string(),
+                    "add".to_string(),
+                    "dev".to_string(),
+                    "eth0".to_string(),
+                ],
+                &root_child_majors,
+            ),
+            vec![
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+            ]
+        );
+        assert_eq!(
+            idempotent_full_reload_command(
+                vec![
+                    "class".to_string(),
+                    "del".to_string(),
+                    "dev".to_string(),
+                    "eth0".to_string(),
+                ],
+                &root_child_majors,
+            ),
+            vec![
+                "class".to_string(),
+                "del".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+            ]
+        );
+        assert_eq!(
+            idempotent_full_reload_command(
+                vec![
+                    "filter".to_string(),
+                    "add".to_string(),
+                    "dev".to_string(),
+                    "eth0".to_string(),
+                ],
+                &root_child_majors,
+            ),
+            vec![
+                "filter".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_infra_qdisc_command_matches_root_and_default_qdiscs() {
+        let root_child_majors = HashMap::from([("eth0".to_string(), HashSet::from([0x1]))]);
+        assert!(root_infra_qdisc_command(
+            &[
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "7FFF:0x1".to_string()
+            ],
+            &root_child_majors,
+        ));
+        assert!(root_infra_qdisc_command(
+            &[
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "0x1:2".to_string()
+            ],
+            &root_child_majors,
+        ));
+        assert!(!root_infra_qdisc_command(
+            &[
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "0x1:0x20".to_string()
+            ],
+            &root_child_majors,
+        ));
+        assert!(!root_infra_qdisc_command(
+            &[
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "0x3:2".to_string()
+            ],
+            &root_child_majors,
+        ));
+        assert!(!root_infra_qdisc_command(
+            &["class".to_string(), "replace".to_string()],
+            &root_child_majors,
+        ));
     }
 
     #[test]

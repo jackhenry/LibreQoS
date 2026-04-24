@@ -234,7 +234,7 @@ mod tests {
             ("fast", 40, 90, 2_000),
             ("idle", 0, 0, u64::MAX),
         ]);
-        let mut rows = vec![
+        let mut rows = [
             test_device("slow", "Slow Circuit", "Slow Device"),
             test_device("idle", "Idle Circuit", "Idle Device"),
             test_device("fast", "Fast Circuit", "Fast Device"),
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn dynamic_inventory_order_uses_alphabetic_tie_breakers() {
         let snapshot = test_snapshot(&[("alpha", 25, 25, 100), ("beta", 25, 25, 100)]);
-        let mut rows = vec![
+        let mut rows = [
             test_device("beta", "Beta Circuit", "Second Device"),
             test_device("alpha", "Alpha Circuit", "First Device"),
         ];

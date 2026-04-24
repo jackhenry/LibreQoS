@@ -121,12 +121,12 @@ fn active_runtime_shaping_inputs_path(config: &lqos_config::Config) -> Result<Op
 fn load_active_runtime_shaping_inputs(
     config: &lqos_config::Config,
 ) -> Result<Option<TopologyShapingInputsFile>> {
-    if let Some(active_path) = active_runtime_shaping_inputs_path(config)? {
-        if active_path.exists() {
-            let raw = std::fs::read_to_string(&active_path)?;
-            let shaping_inputs = serde_json::from_str(&raw)?;
-            return Ok(Some(shaping_inputs));
-        }
+    if let Some(active_path) = active_runtime_shaping_inputs_path(config)?
+        && active_path.exists()
+    {
+        let raw = std::fs::read_to_string(&active_path)?;
+        let shaping_inputs = serde_json::from_str(&raw)?;
+        return Ok(Some(shaping_inputs));
     }
 
     let fallback_path = topology_shaping_inputs_path(config);

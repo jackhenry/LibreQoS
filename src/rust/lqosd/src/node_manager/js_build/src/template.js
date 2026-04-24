@@ -1159,13 +1159,16 @@ function initUrgentIssues() {
                 const td = document.createElement('td');
                 const when = new Date(it.ts * 1000).toLocaleString();
                 const sev = it.severity === 'Error' ? 'danger' : 'warning';
+                const clearControl = it.clearable === false
+                    ? '<span class="badge bg-secondary-subtle text-secondary border float-end ms-3">Active</span>'
+                    : `<button type="button" class="btn btn-link btn-sm text-secondary float-end ms-3 p-0 urgent-clear" data-id="${it.id}" title="Acknowledge issue" aria-label="Acknowledge issue ${escapeAttr(it.code)}"><i class="fa fa-times" aria-hidden="true"></i></button>`;
                 td.innerHTML = `
                     <div>
                         <span class="badge bg-${sev}">${it.severity}</span>
                         <strong class="ms-2">${it.code}</strong>
                         <span class="text-muted ms-2">(${it.source})</span>
                         <span class="text-muted float-end">${when}</span>
-                        <button type="button" class="btn btn-link btn-sm text-secondary float-end ms-3 p-0 urgent-clear" data-id="${it.id}" title="Acknowledge issue" aria-label="Acknowledge issue ${escapeAttr(it.code)}"><i class="fa fa-times" aria-hidden="true"></i></button>
+                        ${clearControl}
                     </div>
                     <div class="mt-1" style="white-space: pre-wrap;">${it.message}</div>
                     ${it.context ? `<pre class="mt-2">${it.context}</pre>` : ''}

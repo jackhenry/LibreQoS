@@ -213,7 +213,7 @@ fn dedup_raw_devices_by_id(
     let mut deduped_devices = Vec::with_capacity(original_raw_len);
     let mut deduped_json = Vec::with_capacity(original_json_len);
 
-    for (device, raw_json) in devices_raw.into_iter().zip(devices_as_json.into_iter()) {
+    for (device, raw_json) in devices_raw.into_iter().zip(devices_as_json) {
         let device_id = device.identification.id.clone();
         if !seen_ids.insert(device_id.clone()) {
             *duplicate_counts.entry(device_id).or_insert(0) += 1;

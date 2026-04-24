@@ -152,6 +152,8 @@ fn map_status(snapshot: BakeryStatusSnapshot) -> BakeryStatusData {
             },
             reload_required: snapshot.reload_required,
             reload_required_reason: snapshot.reload_required_reason,
+            passthrough_degraded: snapshot.passthrough_degraded,
+            passthrough_degraded_reason: snapshot.passthrough_degraded_reason,
             dirty_subtree_count: snapshot.dirty_subtree_count,
             queue_distribution: snapshot
                 .queue_distribution

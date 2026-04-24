@@ -287,10 +287,11 @@ mod tests {
     }
 
     fn test_config(runtime_dir: &std::path::Path, display_cobrand: bool) -> Config {
-        let mut config = Config::default();
-        config.lqos_directory = runtime_dir.display().to_string();
-        config.display_cobrand = display_cobrand;
-        config
+        Config {
+            lqos_directory: runtime_dir.display().to_string(),
+            display_cobrand,
+            ..Default::default()
+        }
     }
 
     #[test]
