@@ -109,6 +109,9 @@ int xdp_prog(struct xdp_md *ctx)
         bpf_debug("Error: interface direction unspecified, aborting.");
         return XDP_PASS;
     }
+    if (tc_classify_bypass_enabled()) {
+        return XDP_PASS;
+    }
 
     // Do we need to perform a VLAN redirect?
     bool vlan_redirect = false;

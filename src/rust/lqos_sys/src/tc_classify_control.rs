@@ -1,4 +1,4 @@
-//! Control-map helpers for temporarily bypassing TC classification.
+//! Control-map helpers for temporarily bypassing XDP redirection and TC classification.
 
 use crate::lqos_kernel::bpf::libbpf_num_possible_cpus;
 use anyhow::{Error, Result};
@@ -19,7 +19,8 @@ const PER_CPU_VALUE_ALIGNMENT: usize = 8;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct TcClassifyControl {
-    /// Non-zero tells TC classify to pass packets without setting TC handles.
+    /// Non-zero tells XDP and TC classify to pass packets without redirecting
+    /// or setting TC handles.
     pub bypass: u32,
 }
 
@@ -109,8 +110,9 @@ pub fn initialize_tc_classify_bypass() -> Result<()> {
 /// Enables or disables TC classify bypass.
 ///
 /// This function has side effects: it writes all per-CPU values for the pinned
-/// `tc_classify_control` BPF map. When enabled, TC classify returns `TC_ACT_OK`
-/// before consuming XDP metadata, flow cache, hot cache, or LPM mappings.
+/// `tc_classify_control` BPF map. When enabled, XDP returns `XDP_PASS` before
+/// CPU redirection, and TC classify returns `TC_ACT_OK` before consuming XDP
+/// metadata, flow cache, hot cache, or LPM mappings.
 pub fn set_tc_classify_bypass(enabled: bool) -> Result<()> {
     update_tc_classify_control(enabled)
 }
