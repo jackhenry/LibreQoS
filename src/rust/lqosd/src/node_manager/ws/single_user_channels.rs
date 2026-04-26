@@ -29,6 +29,7 @@ pub struct PrivateState {
     chatbot_request: Option<u64>,
     circuit_watch: Option<tokio::task::JoinHandle<()>>,
     ping_monitor_watch: Option<tokio::task::JoinHandle<()>>,
+    cake_watch: Option<tokio::task::JoinHandle<()>>,
     tree_attached_circuits_watch: Option<tokio::task::JoinHandle<()>>,
     circuit_metrics_watch: Option<tokio::task::JoinHandle<()>>,
 }
@@ -55,6 +56,7 @@ impl PrivateState {
             chatbot_request: None,
             circuit_watch: None,
             ping_monitor_watch: None,
+            cake_watch: None,
             tree_attached_circuits_watch: None,
             circuit_metrics_watch: None,
         }
@@ -90,7 +92,10 @@ impl PrivateState {
                 self.abort_ping_monitor_watch();
             }
             PrivateRequest::CakeWatcher { circuit } => {
-                spawn(cake_watcher(circuit, self.tx.clone()));
+                self.replace_cake_watch(circuit);
+            }
+            PrivateRequest::StopCakeWatcher => {
+                self.abort_cake_watch();
             }
             PrivateRequest::Chatbot { browser_ts_ms } => {
                 self.start_chatbot(normalize_browser_ts_ms(browser_ts_ms))
@@ -140,6 +145,17 @@ impl PrivateState {
 
     fn abort_ping_monitor_watch(&mut self) {
         if let Some(handle) = self.ping_monitor_watch.take() {
+            handle.abort();
+        }
+    }
+
+    fn replace_cake_watch(&mut self, circuit: String) {
+        self.abort_cake_watch();
+        self.cake_watch = Some(spawn(cake_watcher(circuit, self.tx.clone())));
+    }
+
+    fn abort_cake_watch(&mut self) {
+        if let Some(handle) = self.cake_watch.take() {
             handle.abort();
         }
     }
@@ -250,6 +266,7 @@ impl Drop for PrivateState {
     fn drop(&mut self) {
         self.abort_circuit_watch();
         self.abort_ping_monitor_watch();
+        self.abort_cake_watch();
         self.abort_tree_attached_circuits_watch();
         self.abort_circuit_metrics_watch();
     }
