@@ -356,7 +356,15 @@ export class WsClient {
             return;
         }
         for (const handler of Array.from(list)) {
-            handler(msg);
+            try {
+                handler(msg);
+            } catch (err) {
+                console.error(`Websocket handler failed for ${msg.event}`, err);
+                dashboardWsDebug("handler-error", {
+                    eventName: msg.event,
+                    message: err && err.message ? err.message : String(err),
+                });
+            }
         }
     }
 
