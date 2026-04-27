@@ -206,9 +206,6 @@ fn build_effective_queue_aliases(
         if exported_effective_nodes.contains_key(&effective_node.node_id) {
             continue;
         }
-        if effective_node.effective_attachment_id.is_some() {
-            continue;
-        }
         let Some(parent_name) = exported_effective_nodes
             .get(effective_node.logical_parent_node_id.as_str())
             .cloned()
@@ -230,6 +227,18 @@ fn build_effective_queue_aliases(
     }
 
     (aliases_by_id, aliases_by_name)
+}
+
+fn effective_parent_is_exported(
+    parent_id: &str,
+    parent_name: &str,
+    exported_effective_nodes: &HashMap<String, String>,
+    exported_effective_names: &HashMap<String, Option<String>>,
+) -> bool {
+    optional_non_empty(parent_id)
+        .is_some_and(|node_id| exported_effective_nodes.contains_key(&node_id))
+        || optional_non_empty(parent_name)
+            .is_some_and(|node_name| exported_effective_names.contains_key(&node_name))
 }
 
 fn resolve_legacy_parent_from_effective_tree(
@@ -338,7 +347,7 @@ fn resolve_effective_parent_from_anchor(
             attachment_name,
         ));
     }
-    let Some((owner_node_id, owner_node_name)) =
+    let Some((owner_node_id, _owner_node_name)) =
         attachment_owner_by_attachment_id.get(anchor_id).cloned()
     else {
         if let Some((parent_id, parent_name)) = queue_aliases_by_id.get(anchor_id).cloned() {
@@ -375,15 +384,15 @@ fn resolve_effective_parent_from_anchor(
     }
     if let Some((parent_id, parent_name)) = queue_aliases_by_id.get(owner_node_id.as_str()).cloned()
     {
-        return Some((parent_id, parent_name, None, None));
+        return Some((
+            parent_id,
+            parent_name,
+            optional_non_empty_owned(owner_effective.effective_attachment_id.clone()),
+            selected_attachment_name_for_node(owner_ui, owner_effective),
+        ));
     }
 
-    Some((
-        owner_node_id,
-        owner_node_name,
-        optional_non_empty_owned(owner_effective.effective_attachment_id.clone()),
-        selected_attachment_name_for_node(owner_ui, owner_effective),
-    ))
+    None
 }
 
 fn ipv4_with_prefix_to_string(entry: &(std::net::Ipv4Addr, u32)) -> String {
@@ -554,11 +563,11 @@ fn build_shaping_inputs(
                 .and_then(|value| optional_non_empty(value))
         });
         let (
-            effective_parent_node_id,
-            effective_parent_node_name,
-            effective_attachment_id,
-            effective_attachment_name,
-            resolution_source,
+            mut effective_parent_node_id,
+            mut effective_parent_node_name,
+            mut effective_attachment_id,
+            mut effective_attachment_name,
+            mut resolution_source,
         ) = if let Some((bucket_id, bucket_name)) = flat_bucket_assignments
             .as_ref()
             .and_then(|assignments| assignments.get(&device.circuit_id))
@@ -687,6 +696,27 @@ fn build_shaping_inputs(
                 TopologyShapingResolutionSource::RuntimeFallback,
             )
         };
+
+        if matches!(
+            resolution_source,
+            TopologyShapingResolutionSource::TopologyAnchor
+                | TopologyShapingResolutionSource::LegacyParent
+        ) && !effective_parent_is_exported(
+            &effective_parent_node_id,
+            &effective_parent_node_name,
+            &exported_effective_nodes,
+            &exported_effective_names,
+        ) {
+            warnings.push(format!(
+                "Circuit '{}' resolved to non-exported effective parent '{}' ({}). Falling back to generated parent-node shaping.",
+                device.circuit_id, effective_parent_node_name, effective_parent_node_id
+            ));
+            effective_parent_node_id.clear();
+            effective_parent_node_name.clear();
+            effective_attachment_id = None;
+            effective_attachment_name = None;
+            resolution_source = TopologyShapingResolutionSource::RuntimeFallback;
+        }
 
         let logical_parent_node_name = optional_non_empty(&device.parent_node);
         let logical_parent_node_id = optional_non_empty_owned(device.parent_node_id.clone());
@@ -992,23 +1022,44 @@ struct QueueVirtualizationContext {
     forced_visible_node_names: HashSet<String>,
 }
 
-fn insert_optional_node_id(target: &mut HashSet<String>, value: Option<&str>) {
-    if let Some(node_id) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        target.insert(node_id.to_string());
+fn insert_direct_node_and_attachment_owner(
+    target: &mut HashSet<String>,
+    value: Option<&str>,
+    attachment_owner_by_attachment_id: &HashMap<String, (String, String)>,
+) {
+    let Some(node_id) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    target.insert(node_id.to_string());
+    if let Some((owner_node_id, _)) = attachment_owner_by_attachment_id.get(node_id) {
+        target.insert(owner_node_id.clone());
     }
 }
 
 fn collect_direct_circuit_node_ids(
     shaped_devices: &ConfigShapedDevices,
     circuit_anchors: &[CircuitAnchor],
+    attachment_owner_by_attachment_id: &HashMap<String, (String, String)>,
 ) -> HashSet<String> {
     let mut direct_node_ids = HashSet::new();
     for device in &shaped_devices.devices {
-        insert_optional_node_id(&mut direct_node_ids, device.parent_node_id.as_deref());
-        insert_optional_node_id(&mut direct_node_ids, device.anchor_node_id.as_deref());
+        insert_direct_node_and_attachment_owner(
+            &mut direct_node_ids,
+            device.parent_node_id.as_deref(),
+            attachment_owner_by_attachment_id,
+        );
+        insert_direct_node_and_attachment_owner(
+            &mut direct_node_ids,
+            device.anchor_node_id.as_deref(),
+            attachment_owner_by_attachment_id,
+        );
     }
     for anchor in circuit_anchors {
-        insert_optional_node_id(&mut direct_node_ids, Some(anchor.anchor_node_id.as_str()));
+        insert_direct_node_and_attachment_owner(
+            &mut direct_node_ids,
+            Some(anchor.anchor_node_id.as_str()),
+            attachment_owner_by_attachment_id,
+        );
     }
     direct_node_ids
 }
@@ -1029,8 +1080,12 @@ fn forced_visible_node_names(overrides: &lqos_overrides::OverrideFile) -> HashSe
         .collect()
 }
 
-fn load_queue_virtualization_context(config: &Config) -> Result<QueueVirtualizationContext> {
+fn load_queue_virtualization_context(
+    config: &Config,
+    ui_state: &TopologyEditorStateFile,
+) -> Result<QueueVirtualizationContext> {
     let runtime_overrides = load_runtime_shaping_overrides(config)?;
+    let attachment_owner_by_attachment_id = build_attachment_owner_map(ui_state);
     let direct_circuit_node_ids = if topology_import_ingress_enabled(config) {
         let Some((mut shaped_devices, circuit_anchors)) =
             load_integration_shaping_artifacts(config)?
@@ -1045,7 +1100,11 @@ fn load_queue_virtualization_context(config: &Config) -> Result<QueueVirtualizat
             &runtime_overrides,
         );
         shaped_devices.replace_with_new_data(runtime_devices);
-        collect_direct_circuit_node_ids(&shaped_devices, &circuit_anchors)
+        collect_direct_circuit_node_ids(
+            &shaped_devices,
+            &circuit_anchors,
+            &attachment_owner_by_attachment_id,
+        )
     } else {
         let shaped_devices_path = ConfigShapedDevices::path_for_config(config);
         if !shaped_devices_path.exists() {
@@ -1058,7 +1117,11 @@ fn load_queue_virtualization_context(config: &Config) -> Result<QueueVirtualizat
                 || "Unable to load ShapedDevices.csv while preparing queue virtualization",
             )?;
             let circuit_anchors = load_circuit_anchors(config, shaped_devices_mtime);
-            collect_direct_circuit_node_ids(&shaped_devices, &circuit_anchors)
+            collect_direct_circuit_node_ids(
+                &shaped_devices,
+                &circuit_anchors,
+                &attachment_owner_by_attachment_id,
+            )
         }
     };
 
@@ -1267,7 +1330,7 @@ pub fn build_effective_topology_artifacts_from_canonical_with_runtime_queue_cont
     health: &TopologyAttachmentHealthStateFile,
 ) -> std::result::Result<EffectiveTopologyArtifacts, Vec<String>> {
     let prepared = prepared_runtime_topology_editor_state(&canonical.to_editor_state(), overrides);
-    let virtualization = load_queue_virtualization_context(config).map_err(|err| {
+    let virtualization = load_queue_virtualization_context(config, &prepared).map_err(|err| {
         vec![format!(
             "Unable to load queue virtualization context: {err:#}"
         )]
@@ -2527,6 +2590,18 @@ fn resolved_queue_visibility_policy(
     child_branch_counts: &HashMap<String, usize>,
     virtualization: &QueueVirtualizationContext,
 ) -> TopologyQueueVisibilityPolicy {
+    if virtualization
+        .forced_visible_node_names
+        .contains(ui_node.node_name.as_str())
+    {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
+    if virtualization
+        .direct_circuit_node_ids
+        .contains(ui_node.node_id.as_str())
+    {
+        return TopologyQueueVisibilityPolicy::QueueVisible;
+    }
     match ui_node.queue_visibility_policy {
         TopologyQueueVisibilityPolicy::QueueVisible => resolved_auto_queue_visibility_policy(
             config,
@@ -2553,20 +2628,8 @@ fn resolved_auto_queue_visibility_policy(
     ui_node: &TopologyEditorNode,
     tree_node: Option<&Value>,
     child_branch_counts: &HashMap<String, usize>,
-    virtualization: &QueueVirtualizationContext,
+    _virtualization: &QueueVirtualizationContext,
 ) -> TopologyQueueVisibilityPolicy {
-    if virtualization
-        .forced_visible_node_names
-        .contains(ui_node.node_name.as_str())
-    {
-        return TopologyQueueVisibilityPolicy::QueueVisible;
-    }
-    if virtualization
-        .direct_circuit_node_ids
-        .contains(ui_node.node_id.as_str())
-    {
-        return TopologyQueueVisibilityPolicy::QueueVisible;
-    }
     let Some(tree_node) = tree_node.and_then(Value::as_object) else {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     };
@@ -4185,12 +4248,13 @@ mod tests {
         apply_effective_topology_to_canonical_state, apply_effective_topology_to_network_json,
         apply_effective_topology_to_network_json_from_canonical, auto_attachment_option,
         build_effective_topology_artifacts, build_effective_topology_artifacts_from_canonical,
-        build_shaping_inputs, compute_effective_state, publish_effective_topology_artifacts,
-        publish_topology_runtime_error_status, validate_effective_topology_network,
+        build_shaping_inputs, collect_direct_circuit_node_ids, compute_effective_state,
+        publish_effective_topology_artifacts, publish_topology_runtime_error_status,
+        validate_effective_topology_network,
     };
     use lqos_config::{
-        CircuitAnchor, CircuitAnchorsFile, Config, TopologyAllowedParent,
-        TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus,
+        CircuitAnchor, CircuitAnchorsFile, Config, ConfigShapedDevices, ShapedDevice,
+        TopologyAllowedParent, TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus,
         TopologyAttachmentOption, TopologyAttachmentRateSource, TopologyAttachmentRole,
         TopologyCanonicalIngressKind, TopologyCanonicalNode, TopologyCanonicalStateFile,
         TopologyEditorNode, TopologyEditorStateFile, TopologyEffectiveAttachmentState,
@@ -4200,7 +4264,7 @@ mod tests {
     };
     use lqos_overrides::{TopologyAttachmentMode, TopologyOverridesFile};
     use serde_json::{Value, json};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4968,6 +5032,99 @@ mod tests {
         assert_eq!(
             circuit.effective_attachment_name.as_deref(),
             Some("New Attachment")
+        );
+    }
+
+    #[test]
+    fn shaping_inputs_resolve_virtual_attachment_owner_to_exported_parent_queue() {
+        let lqos_directory = unique_temp_dir("lqos-topology-virtual-owner-anchor");
+        let config = Config {
+            lqos_directory: lqos_directory.to_string_lossy().to_string(),
+            state_directory: None,
+            ..Config::default()
+        };
+        fs::write(
+            lqos_directory.join("ShapedDevices.csv"),
+            concat!(
+                "Circuit ID,Circuit Name,Device ID,Device Name,Parent Node,Parent Node ID,Anchor Node ID,MAC,IPv4,IPv6,Download Min Mbps,Upload Min Mbps,Download Max Mbps,Upload Max Mbps,Comment\n",
+                "\"circuit-1\",\"Glenn Tower Client Site\",\"device-1\",\"Device 1\",\"glenn-s1.streamitnet.com\",\"attachment-node\",\"attachment-node\",\"aa:bb:cc:dd:ee:ff\",\"192.0.2.10/32\",\"\",\"10\",\"10\",\"100\",\"100\",\"\"\n",
+            ),
+        )
+        .expect("ShapedDevices.csv should write");
+
+        let artifacts = EffectiveTopologyArtifacts {
+            effective: TopologyEffectiveStateFile {
+                schema_version: 1,
+                generated_unix: Some(1),
+                canonical_generated_unix: Some(1),
+                health_generated_unix: Some(1),
+                nodes: vec![TopologyEffectiveNodeState {
+                    node_id: "site-pop".to_string(),
+                    logical_parent_node_id: "parent-switch".to_string(),
+                    preferred_attachment_id: Some("attachment-node".to_string()),
+                    effective_attachment_id: Some("attachment-node".to_string()),
+                    fallback_reason: None,
+                    all_attachments_suppressed: false,
+                    attachments: Vec::new(),
+                }],
+            },
+            ui_state: TopologyEditorStateFile {
+                schema_version: 1,
+                source: "test".to_string(),
+                generated_unix: Some(1),
+                ingress_identity: None,
+                nodes: vec![TopologyEditorNode {
+                    node_id: "site-pop".to_string(),
+                    node_name: "Glenn Fiber PoP".to_string(),
+                    allowed_parents: vec![TopologyAllowedParent {
+                        parent_node_id: "parent-switch".to_string(),
+                        parent_node_name: "Parent Switch".to_string(),
+                        attachment_options: vec![sample_attachment_option(
+                            "attachment-node",
+                            "glenn-s1.streamitnet.com",
+                        )],
+                        all_attachments_suppressed: false,
+                        has_probe_unavailable_attachments: false,
+                    }],
+                    effective_attachment_name: Some("glenn-s1.streamitnet.com".to_string()),
+                    ..TopologyEditorNode::default()
+                }],
+            },
+            effective_network: Some(json!({
+                "Parent Switch": {
+                    "id": "parent-switch",
+                    "name": "Parent Switch",
+                    "children": {
+                        "Glenn Fiber PoP": {
+                            "id": "site-pop",
+                            "name": "Glenn Fiber PoP",
+                            "virtual": true,
+                            "active_attachment_name": "glenn-s1.streamitnet.com",
+                            "children": {}
+                        }
+                    }
+                }
+            })),
+        };
+
+        let shaping_inputs = build_shaping_inputs(&config, &artifacts)
+            .expect("shaping inputs should build")
+            .expect("shaping inputs should exist");
+        let circuit = shaping_inputs
+            .circuits
+            .iter()
+            .find(|circuit| circuit.circuit_id == "circuit-1")
+            .expect("expected circuit");
+
+        assert_eq!(circuit.effective_parent_node_id, "parent-switch");
+        assert_eq!(circuit.effective_parent_node_name, "Parent Switch");
+        assert_eq!(
+            circuit.effective_attachment_name.as_deref(),
+            Some("glenn-s1.streamitnet.com")
+        );
+        assert_eq!(
+            circuit.resolution_source,
+            lqos_config::TopologyShapingResolutionSource::TopologyAnchor
         );
     }
 
@@ -6047,6 +6204,33 @@ mod tests {
             .expect("Aggregation should remain exported");
 
         assert_eq!(site.get("virtual").and_then(Value::as_bool), None);
+    }
+
+    #[test]
+    fn active_attachment_circuit_marks_owner_site_direct() {
+        let shaped_devices = ConfigShapedDevices {
+            devices: vec![ShapedDevice {
+                circuit_id: "circuit-1".to_string(),
+                circuit_name: "Circuit 1".to_string(),
+                device_id: "device-1".to_string(),
+                device_name: "Device 1".to_string(),
+                parent_node: "Attachment Node".to_string(),
+                parent_node_id: Some("attachment-node".to_string()),
+                anchor_node_id: Some("attachment-node".to_string()),
+                ..ShapedDevice::default()
+            }],
+            ..ConfigShapedDevices::default()
+        };
+        let attachment_owners = HashMap::from([(
+            "attachment-node".to_string(),
+            ("site-agg".to_string(), "Aggregation".to_string()),
+        )]);
+
+        let direct_node_ids =
+            collect_direct_circuit_node_ids(&shaped_devices, &[], &attachment_owners);
+
+        assert!(direct_node_ids.contains("attachment-node"));
+        assert!(direct_node_ids.contains("site-agg"));
     }
 
     #[test]

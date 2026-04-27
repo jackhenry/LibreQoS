@@ -2356,15 +2356,33 @@ def refreshShapers():
                     f"{circuit_id} ({circuit.get('circuitName', '')}) parent={circuit.get('ParentNode', '')} parent_id={circuit.get('effectiveParentNodeID', circuit.get('ParentNodeID', ''))}"
                 )
         if unattached_circuits:
+            examples = unattached_circuits[:20]
             warnings.warn(
-                "Some shaped circuits did not attach to the live queue tree. First examples: " + "; ".join(unattached_circuits[:20]),
+                "Some shaped circuits did not attach to the live queue tree. First examples: " + "; ".join(examples),
                 stacklevel=2,
             )
             logging.warning(
                 "Unattached shaped circuits after queue build: %s total. Examples: %s",
                 len(unattached_circuits),
-                "; ".join(unattached_circuits[:20]),
+                "; ".join(examples),
             )
+            try:
+                submit_urgent_issue(
+                    "LibreQoS",
+                    "Warning",
+                    "UNATTACHED_SHAPED_CIRCUITS",
+                    (
+                        f"{len(unattached_circuits)} shaped circuit(s) did not attach to the live queue tree. "
+                        "These circuits will not have class IDs or queue stats until topology/shaping inputs are fixed."
+                    ),
+                    json.dumps({
+                        "count": len(unattached_circuits),
+                        "examples": examples,
+                    }),
+                    "UNATTACHED_SHAPED_CIRCUITS",
+                )
+            except Exception as exc:
+                logging.debug("Unable to submit unattached shaped circuits urgent issue: %s", exc)
 
         minorByCPU = {
             int(queue): int(minor)
