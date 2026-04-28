@@ -92,6 +92,7 @@ pub enum PrivateRequest {
     StopCircuitWatcher,
     StopPingMonitorWatch,
     CakeWatcher { circuit: String },
+    StopCakeWatcher,
     Chatbot { browser_ts_ms: Option<f64> },
     ChatbotUserInput { text: String },
     WatchTreeAttachedCircuits { query: TreeAttachedCircuitsQuery },

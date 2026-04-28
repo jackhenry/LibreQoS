@@ -2617,6 +2617,7 @@ function cleanupCircuitPage() {
         channelLink = null;
     }
     if (cakeChannel) {
+        wsClient.send({ Private: { StopCakeWatcher: null } });
         cakeChannel.close();
         cakeChannel = null;
     }
