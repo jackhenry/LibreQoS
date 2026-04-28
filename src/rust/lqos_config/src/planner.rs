@@ -835,6 +835,97 @@ mod tests {
     }
 
     #[test]
+    fn class_identity_planner_compacts_when_full_reload_ignores_saved_minors() {
+        const FRAGMENTED_SITE_MINOR: u16 = 0xff00;
+        const FRAGMENTED_CHILD_MINOR: u16 = 0xff02;
+        const FRAGMENTED_CIRCUIT_MINOR: u16 = 0xff10;
+        const CIRCUIT_PADDING: u32 = 8;
+
+        let site_inputs = vec![
+            SiteIdentityInput {
+                site_key: "CpueQueue0/site-a".to_string(),
+                parent_path: "CpueQueue0".to_string(),
+                queue: 1,
+                has_children: true,
+            },
+            SiteIdentityInput {
+                site_key: "CpueQueue0/site-a/child".to_string(),
+                parent_path: "CpueQueue0/site-a".to_string(),
+                queue: 1,
+                has_children: false,
+            },
+        ];
+        let circuit_groups = vec![CircuitIdentityGroupInput {
+            parent_node: "child".to_string(),
+            queue: 1,
+            circuit_ids: vec!["c1".to_string(), "c2".to_string()],
+        }];
+        let fragmented_sites = BTreeMap::from([
+            (
+                "CpueQueue0/site-a".to_string(),
+                PlannerSiteIdentityState {
+                    class_minor: FRAGMENTED_SITE_MINOR,
+                    queue: 1,
+                    parent_path: "CpueQueue0".to_string(),
+                    class_major: 1,
+                    up_class_major: 0x41,
+                },
+            ),
+            (
+                "CpueQueue0/site-a/child".to_string(),
+                PlannerSiteIdentityState {
+                    class_minor: FRAGMENTED_CHILD_MINOR,
+                    queue: 1,
+                    parent_path: "CpueQueue0/site-a".to_string(),
+                    class_major: 1,
+                    up_class_major: 0x41,
+                },
+            ),
+        ]);
+        let fragmented_circuits = BTreeMap::from([(
+            "c1".to_string(),
+            PlannerCircuitIdentityState {
+                class_minor: FRAGMENTED_CIRCUIT_MINOR,
+                queue: 1,
+                parent_node: "child".to_string(),
+                class_major: 1,
+                up_class_major: 0x41,
+            },
+        )]);
+
+        let sticky_result = plan_class_identities(
+            &site_inputs,
+            &circuit_groups,
+            &fragmented_sites,
+            &fragmented_circuits,
+            0x40,
+            CIRCUIT_PADDING,
+        );
+        assert!(sticky_result.last_used_minor_by_queue[&1] > u32::from(FRAGMENTED_CIRCUIT_MINOR));
+
+        let full_reload_result = plan_class_identities(
+            &site_inputs,
+            &circuit_groups,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            0x40,
+            CIRCUIT_PADDING,
+        );
+
+        let expected_last_minor = u32::from(full_reload_result.circuits[1].class_minor)
+            .saturating_add(1)
+            .saturating_add(CIRCUIT_PADDING);
+        assert_eq!(full_reload_result.sites[0].class_minor, 3);
+        assert_eq!(full_reload_result.sites[1].class_minor, 5);
+        assert_eq!(full_reload_result.circuits[0].class_minor, 6);
+        assert_eq!(full_reload_result.circuits[1].class_minor, 7);
+        assert_eq!(
+            full_reload_result.last_used_minor_by_queue[&1],
+            expected_last_minor
+        );
+    }
+
+    #[test]
     fn class_identity_planner_runtime_constraints_prefer_runtime_band() {
         let site_inputs = vec![SiteIdentityInput {
             site_key: "CpueQueue6/site-runtime".to_string(),
