@@ -3,6 +3,7 @@ import { Encoder, decode } from "../lq_js_common/helpers/cbor-x";
 const ACK_TEXT = "I accept that this is an unstable, internal API and is unsupported";
 const EXPECTED_UI_VERSION = (window.LQOS_UI_VERSION || "").trim() || null;
 const USER_TOKEN_COOKIE = "User-Token";
+const VERSION_RELOAD_KEY = "lqosWsVersionReload";
 const encoder = new Encoder({ useRecords: false, variableMapSize: true });
 const DIAGNOSTIC_CHANNELS = new Set(["Cpu", "Ram", "RttHistogram"]);
 
@@ -78,6 +79,28 @@ function get_user_token() {
     return get_cookie_value(USER_TOKEN_COOKIE);
 }
 
+function versionReloadKey(serverVersion) {
+    const clientVersion = EXPECTED_UI_VERSION || "missing";
+    const wsVersion = (serverVersion || "missing").toString().trim() || "missing";
+    return `${clientVersion}->${wsVersion}`;
+}
+
+function hasReloadedForVersionMismatch(mismatchKey) {
+    try {
+        if (window.sessionStorage.getItem(VERSION_RELOAD_KEY) === mismatchKey) {
+            return true;
+        }
+        window.sessionStorage.setItem(VERSION_RELOAD_KEY, mismatchKey);
+        return false;
+    } catch (_) {
+        if (window.__lqosWsVersionReload === mismatchKey) {
+            return true;
+        }
+        window.__lqosWsVersionReload = mismatchKey;
+        return false;
+    }
+}
+
 export function ws_proto() {
     if (window.location.protocol.startsWith("https")) {
         return "wss://";
@@ -95,6 +118,7 @@ export class WsClient {
         this.reconnectTimer = null;
         this.reconnectDelayMs = 1000;
         this.manualClose = false;
+        this.versionReloading = false;
     }
 
     connect() {
@@ -159,7 +183,9 @@ export class WsClient {
             });
             this.ws = null;
             this.handshake_done = false;
-            this._scheduleReconnect();
+            if (!this.versionReloading) {
+                this._scheduleReconnect();
+            }
         };
 
         socket.onerror = () => {
@@ -171,7 +197,9 @@ export class WsClient {
             });
             this.ws = null;
             this.handshake_done = false;
-            this._scheduleReconnect();
+            if (!this.versionReloading) {
+                this._scheduleReconnect();
+            }
         };
     }
 
@@ -192,6 +220,54 @@ export class WsClient {
         this.pending = [];
         this.desiredChannels.clear();
         this.handlers.clear();
+    }
+
+    _dropSocket(reason = "unspecified") {
+        dashboardWsDebug("drop-socket", {
+            reason,
+            desiredChannels: Array.from(this.desiredChannels.keys()),
+        });
+        const oldSocket = this.ws;
+        this.ws = null;
+        this.handshake_done = false;
+        if (oldSocket) {
+            try {
+                oldSocket.close();
+            } catch (_) {
+                // Ignore close errors; reconnect/reload handling continues below.
+            }
+        }
+    }
+
+    _reloadForVersionMismatch(serverVersion) {
+        const mismatchKey = versionReloadKey(serverVersion);
+        dashboardWsDebug("version-mismatch", {
+            expected: EXPECTED_UI_VERSION || "missing",
+            actual: serverVersion || "missing",
+            mismatchKey,
+        });
+
+        if (!hasReloadedForVersionMismatch(mismatchKey)) {
+            this.versionReloading = true;
+            this._dropSocket("version-mismatch");
+            window.location.reload();
+            window.setTimeout(() => {
+                if (this.versionReloading) {
+                    this.versionReloading = false;
+                    this._scheduleReconnect();
+                }
+            }, 3000);
+            return true;
+        }
+
+        console.error(
+            "Websocket version mismatch persisted after reload:",
+            `client=${EXPECTED_UI_VERSION || "missing"}`,
+            `server=${serverVersion || "missing"}`,
+        );
+        this._dropSocket("version-mismatch-persistent");
+        this._scheduleReconnect();
+        return true;
     }
 
     refreshSubscriptions(reason = "unspecified") {
@@ -318,8 +394,13 @@ export class WsClient {
                 "Websocket version mismatch:",
                 hello ? hello.version : "missing",
             );
-            this.close();
+            this._reloadForVersionMismatch(hello ? hello.version : null);
             return;
+        }
+        try {
+            window.sessionStorage.removeItem(VERSION_RELOAD_KEY);
+        } catch (_) {
+            // Storage cleanup is best-effort.
         }
         this.handshake_done = true;
         dashboardWsDebug("handshake-complete", {
