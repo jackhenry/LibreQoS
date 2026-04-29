@@ -40,6 +40,8 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 type GraphType = petgraph::Graph<GraphMapping, LinkMapping, Directed>;
+const GENERATED_INTERNET_ROOT_NAME: &str = "INSERTED_INTERNET";
+const GENERATED_INTERNET_ROOT_ID: &str = "ROOT-001";
 
 #[derive(Clone, Debug)]
 struct LegacyShapedDevice {
@@ -152,9 +154,145 @@ fn anchor_for_site_ap(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedRootSite {
+    Existing(String),
+    GeneratedInternet,
+}
+
+impl ResolvedRootSite {
+    fn name(&self) -> String {
+        match self {
+            ResolvedRootSite::Existing(name) => name.clone(),
+            ResolvedRootSite::GeneratedInternet => GENERATED_INTERNET_ROOT_NAME.to_string(),
+        }
+    }
+}
+
+fn generated_internet_root() -> GraphMapping {
+    GraphMapping::Root {
+        name: GENERATED_INTERNET_ROOT_NAME.to_string(),
+        id: GENERATED_INTERNET_ROOT_ID.to_string(),
+        latitude: None,
+        longitude: None,
+    }
+}
+
+fn resolve_root_site_from_names(
+    configured_site: &str,
+    site_names: &[String],
+    internet_site_candidates: &[String],
+    require_configured_root_site: bool,
+) -> Result<ResolvedRootSite, UispIntegrationError> {
+    let configured_site = configured_site.trim();
+    if !configured_site.is_empty() {
+        if site_names.iter().any(|site_name| site_name == configured_site) {
+            info!("Using root UISP site from /etc/lqos.conf: {configured_site}");
+            return Ok(ResolvedRootSite::Existing(configured_site.to_string()));
+        }
+
+        let mut sorted_site_names = site_names.to_vec();
+        sorted_site_names.sort_unstable();
+        let sample_sites = sorted_site_names
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if require_configured_root_site {
+            tracing::error!(
+                "Configured UISP root site '{configured_site}' was not found. Available non-client site sample: {sample_sites}"
+            );
+            return Err(UispIntegrationError::NoRootSite(configured_site.to_string()));
+        }
+
+        warn!(
+            "Configured UISP root site '{configured_site}' was not found. Non-full topology mode will auto-detect a root instead."
+        );
+    } else {
+        warn!("Root UISP site is blank; attempting to auto-detect an import root.");
+    }
+
+    let mut candidates = internet_site_candidates
+        .iter()
+        .filter(|candidate| site_names.iter().any(|site_name| site_name == *candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    match candidates.len() {
+        0 => {
+            tracing::error!("Unable to auto-detect a UISP root site from Internet data-links.");
+            Err(UispIntegrationError::NoRootSite(
+                "no Internet-connected UISP sites were found".to_string(),
+            ))
+        }
+        1 => {
+            info!(
+                "Auto-detected root UISP site from Internet data-links: {}",
+                candidates[0]
+            );
+            Ok(ResolvedRootSite::Existing(candidates.remove(0)))
+        }
+        _ => {
+            warn!(
+                "Multiple Internet-connected UISP sites detected. Creating a generated Internet root."
+            );
+            Ok(ResolvedRootSite::GeneratedInternet)
+        }
+    }
+}
+
+fn resolve_root_site(
+    config: &Config,
+    uisp_data: &UispData,
+    require_configured_root_site: bool,
+) -> Result<ResolvedRootSite, UispIntegrationError> {
+    let mut site_names = uisp_data
+        .sites_raw
+        .iter()
+        .filter(|site| !site.is_client_site())
+        .map(|site| site.name_or_blank())
+        .collect::<Vec<_>>();
+    site_names.sort_unstable();
+    site_names.dedup();
+
+    let mut internet_site_ids = uisp_data
+        .data_links_raw
+        .iter()
+        .filter(|link| !link.can_delete)
+        .filter_map(|link| {
+            link.from
+                .site
+                .as_ref()
+                .map(|site| site.identification.id.clone())
+        })
+        .collect::<Vec<_>>();
+    internet_site_ids.sort_unstable();
+    internet_site_ids.dedup();
+
+    let mut internet_site_candidates = uisp_data
+        .sites_raw
+        .iter()
+        .filter(|site| internet_site_ids.iter().any(|site_id| site_id == &site.id))
+        .map(|site| site.name_or_blank())
+        .collect::<Vec<_>>();
+    internet_site_candidates.sort_unstable();
+    internet_site_candidates.dedup();
+
+    resolve_root_site_from_names(
+        &config.uisp_integration.site,
+        &site_names,
+        &internet_site_candidates,
+        require_configured_root_site,
+    )
+}
+
 pub async fn build_imported_full2_bundle(
     config: Arc<Config>,
     ip_ranges: IpRanges,
+    require_configured_root_site: bool,
 ) -> Result<ImportedTopologyBundle, UispIntegrationError> {
     let build_started = Instant::now();
     let ethernet_policy = EthernetPortLimitPolicy::from(&config.integration_common);
@@ -170,7 +308,9 @@ pub async fn build_imported_full2_bundle(
     let mut graph = GraphType::new();
 
     // Find the root
-    let root_site_name = config.uisp_integration.site.clone();
+    let resolved_root_site =
+        resolve_root_site(&config, &uisp_data, require_configured_root_site)?;
+    let root_site_name = resolved_root_site.name();
 
     // Add all sites to the graph
     let graph_build_started = Instant::now();
@@ -183,7 +323,14 @@ pub async fn build_imported_full2_bundle(
         &mut site_map,
         &mut root_idx,
     );
-    let root_idx = root_idx.expect("Root site not found");
+    let root_idx = match (root_idx, resolved_root_site) {
+        (Some(root_idx), _) => root_idx,
+        (None, ResolvedRootSite::GeneratedInternet) => graph.add_node(generated_internet_root()),
+        (None, ResolvedRootSite::Existing(root_site_name)) => {
+            tracing::error!("Root UISP site '{root_site_name}' was not added to the graph.");
+            return Err(UispIntegrationError::NoRootSite(root_site_name));
+        }
+    };
     let site_graph_elapsed_ms = graph_build_started.elapsed().as_millis();
 
     // Iterate all UISP devices and if their parent site is in the graph, add them
@@ -3088,6 +3235,50 @@ mod tests {
             .node_indices()
             .find(|node| graph[*node].network_json_id() == id)
             .expect("expected node to exist")
+    }
+
+    #[test]
+    fn root_resolution_accepts_configured_site() {
+        let sites = vec!["Main".to_string(), "Backup".to_string()];
+        let internet_candidates = vec!["Backup".to_string()];
+
+        let root =
+            resolve_root_site_from_names("Main", &sites, &internet_candidates, true).unwrap();
+
+        assert_eq!(root, ResolvedRootSite::Existing("Main".to_string()));
+    }
+
+    #[test]
+    fn root_resolution_rejects_bad_configured_site_for_full_mode() {
+        let sites = vec!["Main".to_string(), "Backup".to_string()];
+        let internet_candidates = vec!["Backup".to_string()];
+
+        let error =
+            resolve_root_site_from_names("Old Root", &sites, &internet_candidates, true)
+                .unwrap_err();
+
+        assert_eq!(error, UispIntegrationError::NoRootSite("Old Root".to_string()));
+    }
+
+    #[test]
+    fn root_resolution_auto_detects_for_non_full_mode() {
+        let sites = vec!["Main".to_string(), "Backup".to_string()];
+        let internet_candidates = vec!["Backup".to_string()];
+
+        let root =
+            resolve_root_site_from_names("Old Root", &sites, &internet_candidates, false).unwrap();
+
+        assert_eq!(root, ResolvedRootSite::Existing("Backup".to_string()));
+    }
+
+    #[test]
+    fn root_resolution_uses_generated_root_for_multiple_internet_sites() {
+        let sites = vec!["Main".to_string(), "Backup".to_string()];
+        let internet_candidates = vec!["Main".to_string(), "Backup".to_string()];
+
+        let root = resolve_root_site_from_names("", &sites, &internet_candidates, false).unwrap();
+
+        assert_eq!(root, ResolvedRootSite::GeneratedInternet);
     }
 
     #[test]

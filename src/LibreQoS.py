@@ -363,6 +363,32 @@ def _circuit_attachment_name_candidates(circuit):
     return candidates
 
 
+def _normalize_circuit_shaping_parent(circuit, parent_node_ids=None):
+    parent_name = str(circuit.get('ParentNode', '') or '').strip()
+    effective_name = str(circuit.get('effectiveParentNodeName', '') or '').strip()
+    parent_id = str(circuit.get('effectiveParentNodeID', '') or circuit.get('ParentNodeID', '') or '').strip()
+    resolved_id_parent = ''
+    if parent_node_ids and parent_id:
+        resolved_id_parent = str(parent_node_ids.get(parent_id, '') or '').strip()
+
+    if not parent_name:
+        parent_name = effective_name
+    if (not parent_name or parent_name == 'none') and resolved_id_parent:
+        parent_name = resolved_id_parent
+    if not parent_name:
+        parent_name = 'none'
+
+    if is_generated_parent_node_name(parent_name) or (
+        resolved_id_parent and resolved_id_parent != parent_name
+    ):
+        parent_id = ''
+
+    circuit['shapingParentNode'] = parent_name
+    circuit['shapingParentNodeID'] = parent_id
+    circuit['shapingParentKey'] = f"id:{parent_id}" if parent_id else f"name:{parent_name}"
+    return parent_name, parent_id
+
+
 def _validate_planned_circuit_attachment(node_name, node_data, circuit, planned_identity):
     site_major = _parse_int_token(node_data.get('classMajor'))
     site_up_major = _parse_int_token(node_data.get('up_classMajor'))
@@ -1753,11 +1779,10 @@ def refreshShapers():
         circuits_by_parent_id = {}
         circuits_by_parent_name = {}
         for circuit in subscriberCircuits:
-            parent_id = str(circuit.get('effectiveParentNodeID', '') or circuit.get('ParentNodeID', '') or '').strip()
+            parent_name, parent_id = _normalize_circuit_shaping_parent(circuit, parent_node_ids)
             if parent_id:
                 circuits_by_parent_id.setdefault(parent_id, []).append(circuit)
-
-            for parent_name in _circuit_attachment_name_candidates(circuit):
+            elif parent_name and parent_name != 'none':
                 circuits_by_parent_name.setdefault(parent_name, []).append(circuit)
 
         # Parse network structure and add devices from ShapedDevices.csv

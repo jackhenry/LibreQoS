@@ -111,6 +111,39 @@ class TestLibreQoSShapingInputs(unittest.TestCase):
         )
         self.assertEqual(candidates, ["Generated_PN_2"])
 
+    def test_canonical_shaping_parent_ignores_logical_anchor_for_generated_parent(self):
+        circuit = {
+            "ParentNode": "Generated_PN_1",
+            "effectiveParentNodeName": "Generated_PN_1",
+            "ParentNodeID": "uisp:device:glenn-s1",
+            "effectiveParentNodeID": "uisp:device:glenn-s1",
+            "logicalParentNode": "glenn-s1.streamitnet.com",
+            "parentResolutionSource": "topology_anchor",
+        }
+
+        parent_name, parent_id = LibreQoS._normalize_circuit_shaping_parent(circuit)
+
+        self.assertEqual(parent_name, "Generated_PN_1")
+        self.assertEqual(parent_id, "")
+        self.assertEqual(circuit["shapingParentNode"], "Generated_PN_1")
+        self.assertEqual(circuit["shapingParentNodeID"], "")
+        self.assertEqual(circuit["shapingParentKey"], "name:Generated_PN_1")
+
+    def test_canonical_shaping_parent_drops_mismatched_parent_id(self):
+        circuit = {
+            "ParentNode": "Physical_AP",
+            "ParentNodeID": "uisp:device:logical-ap",
+        }
+
+        parent_name, parent_id = LibreQoS._normalize_circuit_shaping_parent(
+            circuit,
+            {"uisp:device:logical-ap": "Logical_AP"},
+        )
+
+        self.assertEqual(parent_name, "Physical_AP")
+        self.assertEqual(parent_id, "")
+        self.assertEqual(circuit["shapingParentKey"], "name:Physical_AP")
+
     def test_validate_planned_circuit_attachment_rejects_major_mismatch(self):
         with self.assertRaisesRegex(ValueError, "Planned circuit class majors do not match"):
             LibreQoS._validate_planned_circuit_attachment(
