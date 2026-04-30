@@ -79,7 +79,11 @@ pub async fn build_with_strategy(
     blackboard(BlackboardSystem::System, "UISP", strategy.as_str()).await;
     let mode = compile_mode_for_strategy(&strategy)?;
     info!("Strategy selected: {strategy}");
-    let imported = full2::build_imported_full2_bundle(config.clone(), ip_ranges).await?;
+    let require_configured_root_site =
+        matches!(mode, TopologyCompileMode::Full | TopologyCompileMode::Full2);
+    let imported =
+        full2::build_imported_full2_bundle(config.clone(), ip_ranges, require_configured_root_site)
+            .await?;
     let topology_import = TopologyImportFile::from_imported_bundle(&imported, strategy.clone());
     let compiled = compile_topology(imported, mode).map_err(|e| {
         error!("Unable to compile UISP topology for mode '{strategy}': {e:?}");

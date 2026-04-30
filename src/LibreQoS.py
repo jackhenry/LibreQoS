@@ -363,6 +363,32 @@ def _circuit_attachment_name_candidates(circuit):
     return candidates
 
 
+def _normalize_circuit_shaping_parent(circuit, parent_node_ids=None):
+    parent_name = str(circuit.get('ParentNode', '') or '').strip()
+    effective_name = str(circuit.get('effectiveParentNodeName', '') or '').strip()
+    parent_id = str(circuit.get('effectiveParentNodeID', '') or circuit.get('ParentNodeID', '') or '').strip()
+    resolved_id_parent = ''
+    if parent_node_ids and parent_id:
+        resolved_id_parent = str(parent_node_ids.get(parent_id, '') or '').strip()
+
+    if not parent_name:
+        parent_name = effective_name
+    if (not parent_name or parent_name == 'none') and resolved_id_parent:
+        parent_name = resolved_id_parent
+    if not parent_name:
+        parent_name = 'none'
+
+    if is_generated_parent_node_name(parent_name) or (
+        resolved_id_parent and resolved_id_parent != parent_name
+    ):
+        parent_id = ''
+
+    circuit['shapingParentNode'] = parent_name
+    circuit['shapingParentNodeID'] = parent_id
+    circuit['shapingParentKey'] = f"id:{parent_id}" if parent_id else f"name:{parent_name}"
+    return parent_name, parent_id
+
+
 def _validate_planned_circuit_attachment(node_name, node_data, circuit, planned_identity):
     site_major = _parse_int_token(node_data.get('classMajor'))
     site_up_major = _parse_int_token(node_data.get('up_classMajor'))
@@ -663,60 +689,6 @@ def planner_circuit_identity_key(circuit):
         raise ValueError("Missing circuitID is unsupported for planner identity")
     return circuit_id
 
-
-def load_minor_state_from_queuing_structure(path=None):
-    if path is None:
-        path = get_queuing_structure_path()
-    data = _load_json_dict(path)
-    network = data.get("Network")
-    if not isinstance(network, dict):
-        return {"sites": {}, "circuits": {}}
-
-    sites = {}
-    circuits = {}
-
-    def walk(node_map, trail=()):
-        for node_name, node in sorted(node_map.items()):
-            if not isinstance(node, dict):
-                continue
-            node_path = trail + (node_name,)
-            site_key = "/".join(node_path)
-            parent_path = "/".join(trail)
-            queue = _parse_int_token(node.get("cpuNum"))
-            class_minor = _parse_int_token(node.get("classMinor"))
-            class_major = _parse_int_token(node.get("classMajor"))
-            up_class_major = _parse_int_token(node.get("up_classMajor"))
-            if queue is not None and class_minor is not None:
-                sites[site_key] = {
-                    "class_minor": class_minor,
-                    "queue": queue + 1,
-                    "parent_path": parent_path,
-                    "class_major": class_major,
-                    "up_class_major": up_class_major,
-                }
-
-            if isinstance(node.get("circuits"), list):
-                for circuit in node.get("circuits", []):
-                    if not isinstance(circuit, dict):
-                        continue
-                    circuit_id = circuit.get("circuitID")
-                    circuit_minor = _parse_int_token(circuit.get("classMinor"))
-                    if queue is None or circuit_id is None or circuit_minor is None:
-                        continue
-                    circuits[str(circuit_id)] = {
-                        "class_minor": circuit_minor,
-                        "queue": queue + 1,
-                        "parent_node": circuit.get("ParentNode", node_name),
-                        "class_major": _parse_int_token(circuit.get("classMajor")),
-                        "up_class_major": _parse_int_token(circuit.get("up_classMajor")),
-                    }
-
-            children = node.get("children")
-            if isinstance(children, dict):
-                walk(children, node_path)
-
-    walk(network)
-    return {"sites": sites, "circuits": circuits}
 
 def calculateR2q(maxRateInMbps):
     # So we've learned that r2q defaults to 10, and is used to calculate quantum. Quantum is rateInBytes/r2q by
@@ -1807,11 +1779,10 @@ def refreshShapers():
         circuits_by_parent_id = {}
         circuits_by_parent_name = {}
         for circuit in subscriberCircuits:
-            parent_id = str(circuit.get('effectiveParentNodeID', '') or circuit.get('ParentNodeID', '') or '').strip()
+            parent_name, parent_id = _normalize_circuit_shaping_parent(circuit, parent_node_ids)
             if parent_id:
                 circuits_by_parent_id.setdefault(parent_id, []).append(circuit)
-
-            for parent_name in _circuit_attachment_name_candidates(circuit):
+            elif parent_name and parent_name != 'none':
                 circuits_by_parent_name.setdefault(parent_name, []).append(circuit)
 
         # Parse network structure and add devices from ShapedDevices.csv
@@ -2029,9 +2000,8 @@ def refreshShapers():
                         f"Failed to save planner state at {state_path}: {e}", stacklevel=2
                     )
 
-        # Seed persisted site/circuit minor assignments. When planner state is absent,
-        # fall back to the previous queuing structure so the first run after an upgrade
-        # can preserve existing class IDs.
+        # Load persisted top-level planner state. Full reloads rebuild TC, so
+        # site/circuit class minors are runtime artifacts and are not reused below.
         try:
             state  # noqa: B018
         except NameError:
@@ -2039,24 +2009,6 @@ def refreshShapers():
         state_path = get_planner_state_path()
         if not isinstance(state, dict) or len(state.keys()) == 0:
             state = load_planner_state(state_path, None)
-        try:
-            circuit_state_from_disk = state.get("circuits", {}) if isinstance(state, dict) else {}
-        except Exception:
-            circuit_state_from_disk = {}
-        try:
-            site_state_from_disk = state.get("sites", {}) if isinstance(state, dict) else {}
-        except Exception:
-            site_state_from_disk = {}
-        if not isinstance(circuit_state_from_disk, dict):
-            circuit_state_from_disk = {}
-        if not isinstance(site_state_from_disk, dict):
-            site_state_from_disk = {}
-        if not circuit_state_from_disk or not site_state_from_disk:
-            fallback_minor_state = load_minor_state_from_queuing_structure()
-            if not site_state_from_disk:
-                site_state_from_disk = fallback_minor_state.get("sites", {}) or {}
-            if not circuit_state_from_disk:
-                circuit_state_from_disk = fallback_minor_state.get("circuits", {}) or {}
         circuit_state_updated = {}
         site_state_updated = {}
         planner_site_inputs = []
@@ -2126,8 +2078,8 @@ def refreshShapers():
         identity_plan = plan_class_identities(
             planner_site_inputs,
             planner_circuit_groups,
-            site_state=site_state_from_disk,
-            circuit_state=circuit_state_from_disk,
+            site_state={},
+            circuit_state={},
             stick_offset=stickOffset,
             circuit_padding=CIRCUIT_PADDING,
         )

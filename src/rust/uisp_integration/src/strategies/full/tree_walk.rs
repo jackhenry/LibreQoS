@@ -22,7 +22,7 @@ pub fn walk_tree_for_routing(
     // Make sure we know where the root is
     let Some(root_idx) = sites.iter().position(|s| s.name == root_site) else {
         tracing::error!("Unable to build a path-weights graph because I can't find the root node");
-        return Err(UispIntegrationError::NoRootSite);
+        return Err(UispIntegrationError::NoRootSite(root_site.to_string()));
     };
 
     // Now we iterate through every node that ISN'T the root

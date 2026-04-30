@@ -19,6 +19,8 @@ Use esta guía para evitar confusión con opciones:
 3. Use `full` cuando necesite jerarquía/backhaul completo, tenga margen de CPU y ya haya validado topología/overrides.
 4. Use `flat` solo si la jerarquía no es necesaria y prioriza rendimiento máximo.
 
+El ajuste `Root UISP Site` solo es obligatorio en modo de topología `full`. En los modos `flat`, `ap_only` y `ap_site`, puede dejarse vacío; LibreQoS usará los data-links de Internet de UISP para elegir la raíz de importación, o creará una raíz de Internet generada cuando UISP reporte varios sitios conectados a Internet.
+
 ## Expectativas en router mode
 
 - Router mode en UISP es compatible, pero depende de que la topología en UISP esté bien definida.
