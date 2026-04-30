@@ -6,6 +6,7 @@ pub(crate) mod flows_by_circuit;
 mod ping_monitor;
 mod tree_attached_circuits;
 
+use crate::lts2_sys::control_channel::ControlChannelCommand;
 use crate::node_manager::ws::messages::{PrivateRequest, WsResponse, encode_ws_message};
 use crate::node_manager::ws::single_user_channels::cake_watcher::cake_watcher;
 use crate::node_manager::ws::single_user_channels::circuit::circuit_watcher;
@@ -13,17 +14,52 @@ use crate::node_manager::ws::single_user_channels::circuit_metrics::watch_circui
 use crate::node_manager::ws::single_user_channels::ping_monitor::ping_monitor;
 use crate::node_manager::ws::single_user_channels::tree_attached_circuits::watch_tree_attached_circuits;
 use lqos_probe::ProbeClient;
+use std::{sync::Arc, time::Duration};
 use tokio::spawn;
-use tokio::sync::mpsc::Sender;
-use tracing::info;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::time::timeout;
+use tracing::{debug, info};
+
+const CONTROL_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sends a private watcher payload without waiting behind a slow websocket.
+pub(super) fn try_send_private_payload(
+    tx: &Sender<Arc<Vec<u8>>>,
+    payload: Arc<Vec<u8>>,
+    channel_name: &'static str,
+) -> bool {
+    match tx.try_send(payload) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            debug!("{channel_name} outbound queue full; stopping watcher");
+            false
+        }
+        Err(TrySendError::Closed(_)) => {
+            debug!("{channel_name} channel closed");
+            false
+        }
+    }
+}
+
+async fn send_control_command(
+    control_tx: &tokio::sync::mpsc::Sender<ControlChannelCommand>,
+    command: ControlChannelCommand,
+    context: &'static str,
+) {
+    match timeout(CONTROL_CHANNEL_SEND_TIMEOUT, control_tx.send(command)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => debug!("{context} control channel is closed"),
+        Err(_) => debug!("{context} timed out queueing control channel command"),
+    }
+}
 
 pub struct PrivateState {
-    tx: Sender<std::sync::Arc<Vec<u8>>>,
+    tx: Sender<Arc<Vec<u8>>>,
     bus_tx: Sender<(
         tokio::sync::oneshot::Sender<lqos_bus::BusReply>,
         lqos_bus::BusRequest,
     )>,
-    control_tx: tokio::sync::mpsc::Sender<crate::lts2_sys::control_channel::ControlChannelCommand>,
+    control_tx: tokio::sync::mpsc::Sender<ControlChannelCommand>,
     probe_client: ProbeClient,
     browser_language: Option<String>,
     chatbot_request: Option<u64>,
@@ -41,9 +77,7 @@ impl PrivateState {
             tokio::sync::oneshot::Sender<lqos_bus::BusReply>,
             lqos_bus::BusRequest,
         )>,
-        control_tx: tokio::sync::mpsc::Sender<
-            crate::lts2_sys::control_channel::ControlChannelCommand,
-        >,
+        control_tx: tokio::sync::mpsc::Sender<ControlChannelCommand>,
         probe_client: ProbeClient,
         browser_language: Option<String>,
     ) -> Self {
@@ -62,9 +96,7 @@ impl PrivateState {
         }
     }
 
-    pub fn control_tx(
-        &self,
-    ) -> tokio::sync::mpsc::Sender<crate::lts2_sys::control_channel::ControlChannelCommand> {
+    pub fn control_tx(&self) -> tokio::sync::mpsc::Sender<ControlChannelCommand> {
         self.control_tx.clone()
     }
 
@@ -205,7 +237,7 @@ impl PrivateState {
                 message: message.to_string(),
             };
             if let Ok(payload) = encode_ws_message(&response) {
-                let _ = self.tx.send(payload).await;
+                let _ = try_send_private_payload(&self.tx, payload, "Chatbot");
             }
             return;
         }
@@ -220,7 +252,7 @@ impl PrivateState {
                 let text = String::from_utf8_lossy(&chunk).to_string();
                 let response = WsResponse::ChatbotChunk { text };
                 if let Ok(payload) = encode_ws_message(&response) {
-                    if to_client.send(payload).await.is_err() {
+                    if !try_send_private_payload(&to_client, payload, "Chatbot") {
                         break;
                     }
                 } else {
@@ -229,17 +261,17 @@ impl PrivateState {
             }
         });
 
-        let _ = self
-            .control_tx
-            .send(
-                crate::lts2_sys::control_channel::ControlChannelCommand::StartChat {
-                    request_id,
-                    browser_ts_ms,
-                    browser_language: self.browser_language.clone(),
-                    stream: stream_tx,
-                },
-            )
-            .await;
+        send_control_command(
+            &self.control_tx,
+            ControlChannelCommand::StartChat {
+                request_id,
+                browser_ts_ms,
+                browser_language: self.browser_language.clone(),
+                stream: stream_tx,
+            },
+            "StartChat",
+        )
+        .await;
         info!(
             "[chatbot] starting session request_id={} browser_ts_ms={:?}",
             request_id, browser_ts_ms
@@ -250,15 +282,12 @@ impl PrivateState {
         let Some(request_id) = self.chatbot_request else {
             return;
         };
-        let _ = self
-            .control_tx
-            .send(
-                crate::lts2_sys::control_channel::ControlChannelCommand::ChatSend {
-                    request_id,
-                    text,
-                },
-            )
-            .await;
+        send_control_command(
+            &self.control_tx,
+            ControlChannelCommand::ChatSend { request_id, text },
+            "ChatSend",
+        )
+        .await;
     }
 }
 

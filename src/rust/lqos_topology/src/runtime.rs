@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lqos_bus::{BusRequest, BusResponse, bus_request};
+use lqos_bus::{BusRequest, BusResponse, bus_request_with_timeout};
 use lqos_config::{
     TopologyAttachmentEndpointStatus, TopologyAttachmentHealthEntry,
     TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus,
@@ -21,6 +21,7 @@ use crate::{
 };
 
 const TOPOLOGY_PROBE_MAX_AGE_MS: u64 = 250;
+const TOPOLOGY_PROBE_BUS_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn now_unix() -> Option<u64> {
     SystemTime::now()
@@ -120,10 +121,13 @@ async fn probe_specs(
         return Ok(HashMap::new());
     }
 
-    let responses = bus_request(vec![BusRequest::ProbeBatch {
-        requests: probe_requests,
-        max_age_ms: TOPOLOGY_PROBE_MAX_AGE_MS,
-    }])
+    let responses = bus_request_with_timeout(
+        vec![BusRequest::ProbeBatch {
+            requests: probe_requests,
+            max_age_ms: TOPOLOGY_PROBE_MAX_AGE_MS,
+        }],
+        TOPOLOGY_PROBE_BUS_TIMEOUT,
+    )
     .await
     .map_err(|err| anyhow::anyhow!("unable to query shared probe manager: {err}"))?;
     let Some(response) = responses.into_iter().next() else {

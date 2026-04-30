@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::lts2_sys::control_channel::ControlChannelCommand;
 use crate::node_manager::auth::{LoginResult, login_from_token};
 use crate::node_manager::local_api::{
     circuit, circuit_count, config, cpu_affinity, dashboard_themes, device_counts, directories,
@@ -55,6 +57,21 @@ mod ticker;
 
 const WS_VERSION: &str = include_str!("../../../../VERSION_STRING");
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const CONTROL_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn send_control_command(
+    control_tx: &tokio::sync::mpsc::Sender<ControlChannelCommand>,
+    command: ControlChannelCommand,
+) -> bool {
+    match tokio::time::timeout(CONTROL_CHANNEL_SEND_TIMEOUT, control_tx.send(command)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            warn!("Timed out queueing websocket control-channel command");
+            false
+        }
+    }
+}
 
 /// Provides an Axum router for the websocket system. Exposes a single /ws route that supports
 /// pubsub subscriptions and private commands.
@@ -742,14 +759,13 @@ async fn receive_channel_message(
             _ => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketList {
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketList {
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -766,8 +782,11 @@ async fn receive_channel_message(
                         tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(tickets))) => {
-                            if send_ws_response(&tx, WsResponse::SupportTicketListResult { tickets })
-                                .await
+                            if send_ws_response(
+                                &tx,
+                                WsResponse::SupportTicketListResult { tickets },
+                            )
+                            .await
                             {
                                 return true;
                             }
@@ -816,15 +835,14 @@ async fn receive_channel_message(
             _ => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketGet {
-                            ticket_id,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketGet {
+                        ticket_id,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -899,18 +917,17 @@ async fn receive_channel_message(
             } else {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketCreate {
-                            subject,
-                            priority,
-                            body,
-                            commentor,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketCreate {
+                        subject,
+                        priority,
+                        body,
+                        commentor,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -923,12 +940,15 @@ async fn receive_channel_message(
                         return true;
                     }
                 } else {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
-                        .await;
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(ticket))) => {
-                            if send_ws_response(&tx, WsResponse::SupportTicketCreateResult { ticket })
-                                .await
+                            if send_ws_response(
+                                &tx,
+                                WsResponse::SupportTicketCreateResult { ticket },
+                            )
+                            .await
                             {
                                 return true;
                             }
@@ -988,18 +1008,17 @@ async fn receive_channel_message(
                     .unwrap_or(0);
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketAddComment {
-                            ticket_id,
-                            commentor,
-                            body,
-                            date,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketAddComment {
+                        ticket_id,
+                        commentor,
+                        body,
+                        date,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -1012,8 +1031,8 @@ async fn receive_channel_message(
                         return true;
                     }
                 } else {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
-                        .await;
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(()))) => {
                             if send_ws_response(
