@@ -67,6 +67,8 @@ sudo dpkg --configure -a
 sudo systemctl restart lqosd lqos_scheduler
 ```
 
+Git-based installs must rebuild the virtual environment before restarting `lqos_scheduler` after pulling updates that change the service file. If systemd reports `status=203/EXEC`, rebuild the virtual environment with the command above and restart `lqos_scheduler`.
+
 ### Python ModuleNotFoundError in older Ubuntu 24.04 installs
 ```
 pip uninstall binpacking --break-system-packages --yes

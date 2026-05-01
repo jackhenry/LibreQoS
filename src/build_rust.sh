@@ -226,6 +226,9 @@ rebuild_python_venv() {
 }
 
 SERVICE_UNITS_UPDATED=0
+
+rebuild_python_venv
+
 refresh_service_unit lqosd
 refresh_service_unit lqos_scheduler
 refresh_service_unit lqos_api
@@ -250,8 +253,6 @@ if service_unit_exists lqos_netplan_helper; then
         sudo systemctl daemon-reload
     fi
 fi
-
-rebuild_python_venv
 
 if hotfix_blocks_service_restart; then
     echo "Ubuntu 24.04 systemd hotfix is still required. Skipping LibreQoS service restarts."

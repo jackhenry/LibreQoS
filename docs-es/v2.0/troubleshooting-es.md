@@ -120,6 +120,8 @@ sudo dpkg --configure -a
 sudo systemctl restart lqosd lqos_scheduler
 ```
 
+Las instalaciones basadas en git deben reconstruir el entorno virtual antes de reiniciar `lqos_scheduler` después de actualizar cambios que modifiquen el archivo de servicio. Si systemd informa `status=203/EXEC`, reconstruya el entorno virtual con el comando anterior y reinicie `lqos_scheduler`.
+
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
 
 ### El estado del scheduler en WebUI aparece no saludable
