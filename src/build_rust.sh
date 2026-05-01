@@ -22,6 +22,8 @@ do
     esac
 done
 
+VENV_PYTHON="/opt/libreqos/venv/bin/python"
+
 # Check Pre-Requisites
 sudo apt install python3-pip python3-venv clang gcc gcc-multilib llvm libelf-dev git nano curl screen llvm pkg-config linux-tools-common linux-tools-`uname -r` libbpf-dev libssl-dev curl
 
@@ -222,7 +224,16 @@ rebuild_python_venv() {
     fi
 
     echo "Rebuilding /opt/libreqos/venv before restarting Python services."
-    sudo "$script_path"
+    if ! sudo "$script_path"; then
+        echo "Failed to rebuild /opt/libreqos/venv. Skipping service refresh/restarts."
+        exit 1
+    fi
+
+    if [ ! -x "$VENV_PYTHON" ]; then
+        echo "Expected $VENV_PYTHON to exist and be executable after rebuilding the Python venv."
+        echo "Skipping service refresh/restarts."
+        exit 1
+    fi
 }
 
 SERVICE_UNITS_UPDATED=0
