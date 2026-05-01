@@ -275,8 +275,9 @@ else
         echo "lqosd is active as a service. Restarting it. You may need to enter your sudo password."
         sudo systemctl restart lqosd
     fi
-    if service_is_active lqos_scheduler; then
-        echo "lqos_scheduler is active as a service. Restarting it. You may need to enter your sudo password."
+    if service_is_active lqos_scheduler || service_is_failed lqos_scheduler || service_is_enabled lqos_scheduler; then
+        echo "lqos_scheduler is installed as an active, failed, or enabled service. Restarting it. You may need to enter your sudo password."
+        sudo systemctl reset-failed lqos_scheduler || true
         sudo systemctl restart lqos_scheduler
     fi
     if service_is_active lqos_api || service_is_failed lqos_api || service_is_enabled lqos_api; then
