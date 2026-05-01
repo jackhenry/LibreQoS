@@ -214,7 +214,27 @@ If status repeatedly oscillates between ready/error, collect both logs and confi
 
 This tends to show up when the MQ qdisc cannot be added correctly to the NIC interface. This would suggest the NIC has insufficient RX/TX queues. Please make sure you are using the [recommended NICs](requirements.md).
 
-### Python ModuleNotFoundError in Ubuntu 24.04
+### Python dependency or virtual environment errors
+
+Packaged installs keep LibreQoS Python dependencies in `/opt/libreqos/venv`. The services still run as root, but Python packages do not mix with apt-managed system packages. If the scheduler reports missing Python modules, or package configuration was interrupted while installing Python dependencies, rebuild the virtual environment:
+
+```bash
+sudo /opt/libreqos/src/bin/rebuild_python_venv.sh
+sudo dpkg --configure -a
+sudo systemctl restart lqosd lqos_scheduler
+```
+
+For manual shaping tests, use the same interpreter as the service:
+
+```bash
+sudo systemctl stop lqos_scheduler
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
+sudo systemctl start lqos_scheduler
+```
+
+Older installs that predate the virtual environment may show `ModuleNotFoundError` and suggest system `pip` commands. Upgrade to a package that creates `/opt/libreqos/venv`, then use the repair command above.
+
+### Python ModuleNotFoundError in older Ubuntu 24.04 installs
 ```
 pip uninstall binpacking --break-system-packages --yes
 sudo pip uninstall binpacking --break-system-packages --yes
@@ -230,7 +250,7 @@ sudo pip install deepdiff --break-system-packages
 ```
 cd /opt/libreqos/src
 sudo systemctl stop lqos_scheduler
-sudo python3 LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 The console output from running LibreQoS.py directly provides more specific errors regarding issues with ShapedDevices.csv and network.json

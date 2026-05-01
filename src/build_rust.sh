@@ -23,7 +23,7 @@ do
 done
 
 # Check Pre-Requisites
-sudo apt install python3-pip clang gcc gcc-multilib llvm libelf-dev git nano curl screen llvm pkg-config linux-tools-common linux-tools-`uname -r` libbpf-dev libssl-dev curl
+sudo apt install python3-pip python3-venv clang gcc gcc-multilib llvm libelf-dev git nano curl screen llvm pkg-config linux-tools-common linux-tools-`uname -r` libbpf-dev libssl-dev curl
 
 if ! rustup -V &> /dev/null
 then
@@ -214,6 +214,17 @@ clear_pinned_maps_before_lqosd_restart() {
     fi
 }
 
+rebuild_python_venv() {
+    local script_path="./bin/rebuild_python_venv.sh"
+    if [ ! -x "$script_path" ]; then
+        echo "Expected $script_path to exist and be executable before refreshing Python services."
+        exit 1
+    fi
+
+    echo "Rebuilding /opt/libreqos/venv before restarting Python services."
+    sudo "$script_path"
+}
+
 SERVICE_UNITS_UPDATED=0
 refresh_service_unit lqosd
 refresh_service_unit lqos_scheduler
@@ -239,6 +250,8 @@ if service_unit_exists lqos_netplan_helper; then
         sudo systemctl daemon-reload
     fi
 fi
+
+rebuild_python_venv
 
 if hotfix_blocks_service_restart; then
     echo "Ubuntu 24.04 systemd hotfix is still required. Skipping LibreQoS service restarts."
@@ -267,6 +280,7 @@ fi
 echo "-----------------------------------------------------------------"
 echo "Don't forget to setup /etc/lqos.conf!"
 echo "Template .service files can be found in bin/"
+echo "Debian package installs create/update /opt/libreqos/venv for Python dependencies."
 echo "If src/deb-requirements-constraints.txt exists, Debian package installs use it to constrain Python dependencies."
 echo "Use ./systemd_hotfix.sh to evaluate or install the Ubuntu 24.04 networkd hotfix from the LibreQoS APT repo at https://repo.libreqos.com."
 echo "The hotfix installer now offers to schedule a reboot after it finishes."

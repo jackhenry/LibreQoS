@@ -5,7 +5,7 @@ Requires=lqosd.service
 
 [Service]
 WorkingDirectory=/opt/libreqos/src
-ExecStart=/usr/bin/python3 /opt/libreqos/src/scheduler.py
+ExecStart=/opt/libreqos/venv/bin/python /opt/libreqos/src/scheduler.py
 Restart=always
 
 [Install]

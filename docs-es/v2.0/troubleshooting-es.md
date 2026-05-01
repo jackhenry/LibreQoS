@@ -112,6 +112,14 @@ sudo RUST_LOG=info /opt/libreqos/src/bin/lqosd
 sudo journalctl -u lqos_scheduler --since "1 day ago" --no-pager > lqos_sched_log.txt
 ```
 
+Las instalaciones empaquetadas mantienen las dependencias Python de LibreQoS en `/opt/libreqos/venv`. Los servicios siguen ejecutándose como root, pero los paquetes Python no se mezclan con los paquetes administrados por apt. Si el scheduler informa módulos faltantes, o si la configuración del paquete se interrumpió al instalar dependencias Python, reconstruya el entorno virtual:
+
+```bash
+sudo /opt/libreqos/src/bin/rebuild_python_venv.sh
+sudo dpkg --configure -a
+sudo systemctl restart lqosd lqos_scheduler
+```
+
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
 
 ### El estado del scheduler en WebUI aparece no saludable
@@ -174,7 +182,7 @@ sudo pip install deepdiff --break-system-packages
 ```bash
 cd /opt/libreqos/src
 sudo systemctl stop lqos_scheduler
-sudo python3 LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 Corrija errores en `ShapedDevices.csv` y/o `network.json`, luego:

@@ -51,15 +51,15 @@ sudo journalctl -u lqos_scheduler -b
 
 ### Depuración de lqos_scheduler
 
-`lqos_scheduler` ejecuta `scheduler.py`, que a su vez invoca `LibreQoS.py`.
+`lqos_scheduler` ejecuta `scheduler.py`, que a su vez invoca `LibreQoS.py`. En instalaciones empaquetadas, Python se ejecuta desde el entorno virtual propiedad de root en `/opt/libreqos/venv`.
 
 Flujo de depuración recomendado:
 
 ```bash
 sudo systemctl stop lqos_scheduler
 cd /opt/libreqos/src
-sudo ./LibreQoS.py --debug
-sudo python3 scheduler.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py --debug
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/scheduler.py
 sudo systemctl start lqos_scheduler
 ```
 
