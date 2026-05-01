@@ -55,6 +55,7 @@ mod ticker;
 
 const WS_VERSION: &str = include_str!("../../../../VERSION_STRING");
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Provides an Axum router for the websocket system. Exposes a single /ws route that supports
 /// pubsub subscriptions and private commands.
@@ -182,19 +183,29 @@ async fn handle_socket(
                 // Received a websocket message
                 match inbound {
                     Some(Ok(msg)) => {
-                        let should_close = receive_channel_message(
-                            msg,
-                            channels.clone(),
-                            tx.clone(),
-                            &mut subscribed_channels,
-                            &mut handshake_complete,
-                            &mut WsRequestState {
-                                private_state: &mut private_state,
-                                login: &mut login,
-                                shaper_query: shaper_query.clone(),
-                            },
+                        let should_close = match tokio::time::timeout(
+                            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                            receive_channel_message(
+                                msg,
+                                channels.clone(),
+                                tx.clone(),
+                                &mut subscribed_channels,
+                                &mut handshake_complete,
+                                &mut WsRequestState {
+                                    private_state: &mut private_state,
+                                    login: &mut login,
+                                    shaper_query: shaper_query.clone(),
+                                },
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(should_close) => should_close,
+                            Err(_) => {
+                                warn!("Websocket request timed out; closing connection");
+                                true
+                            }
+                        };
                         if should_close {
                             break;
                         }
@@ -212,6 +223,11 @@ async fn handle_socket(
             }
         }
     }
+    for channel in subscribed_channels.drain() {
+        channels.unsubscribe(channel, tx.clone()).await;
+    }
+    drop(private_state);
+    drop(tx);
     outbound_handle.abort();
     let _ = outbound_handle.await;
     info!("Websocket disconnected");
