@@ -1513,7 +1513,14 @@ pub const FQ_CODEL_QDISC_ESTIMATED_MEMORY_BYTES: u64 = 64 * 1024;
 /// substantially exceeding the earlier heuristic during busy periods.
 pub const CAKE_QDISC_ESTIMATED_MEMORY_BYTES: u64 = 512 * 1024;
 /// Minimum memory headroom Bakery tries to leave unused after a projected or in-flight apply.
-pub const BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES: u64 = 768 * 1024 * 1024;
+pub const BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Divisor used to scale Bakery's memory guard floor with installed RAM.
+pub const BAKERY_MEMORY_GUARD_TOTAL_RAM_DIVISOR: u64 = 8;
+
+/// Returns Bakery's effective memory guard floor for a host with `total_bytes` RAM.
+pub fn bakery_memory_guard_min_available_bytes(total_bytes: u64) -> u64 {
+    BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES.max(total_bytes / BAKERY_MEMORY_GUARD_TOTAL_RAM_DIVISOR)
+}
 /// Maximum number of mapped circuits allowed without Insight.
 const DEFAULT_MAPPED_CIRCUITS_LIMIT: usize = 1000;
 /// Minimum interval between repeated mapped-circuit-limit urgent issues.
@@ -2055,20 +2062,67 @@ fn telemetry_state() -> &'static RwLock<BakeryTelemetryState> {
     BAKERY_TELEMETRY.get_or_init(|| RwLock::new(BakeryTelemetryState::default()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcCommandType {
+    Class,
+    Qdisc,
+}
+
+fn tc_command_type(argv: &[String]) -> Option<TcCommandType> {
+    match argv.first()?.as_str() {
+        "class" => Some(TcCommandType::Class),
+        "qdisc" => Some(TcCommandType::Qdisc),
+        _ => None,
+    }
+}
+
 fn count_tc_command_types(commands: &[Vec<String>]) -> (usize, usize, usize) {
     let total = commands.len();
     let mut class_count = 0usize;
     let mut qdisc_count = 0usize;
     for argv in commands {
-        if let Some(kind) = argv.first() {
-            match kind.as_str() {
-                "class" => class_count += 1,
-                "qdisc" => qdisc_count += 1,
-                _ => {}
-            }
+        match tc_command_type(argv) {
+            Some(TcCommandType::Class) => class_count += 1,
+            Some(TcCommandType::Qdisc) => qdisc_count += 1,
+            None => {}
         }
     }
     (total, class_count, qdisc_count)
+}
+
+fn count_tc_command_types_and_estimate_qdisc_memory(
+    commands: &[Vec<String>],
+) -> (usize, usize, usize, u64) {
+    let total = commands.len();
+    let mut class_count = 0usize;
+    let mut qdisc_count = 0usize;
+    let mut estimated_qdisc_memory_bytes = 0u64;
+    let mut seen_qdiscs = HashSet::new();
+
+    for argv in commands {
+        match tc_command_type(argv) {
+            Some(TcCommandType::Class) => class_count += 1,
+            Some(TcCommandType::Qdisc) => qdisc_count += 1,
+            None => {}
+        }
+
+        let Some(qdisc_identity) = planned_qdisc_identity(argv) else {
+            continue;
+        };
+        if !seen_qdiscs.insert(qdisc_identity) {
+            continue;
+        }
+        let kind = planned_qdisc_kind(argv).unwrap_or(PlannedQdiscKind::Infra);
+        estimated_qdisc_memory_bytes =
+            estimated_qdisc_memory_bytes.saturating_add(qdisc_kind_estimated_memory_bytes(kind));
+    }
+
+    (
+        total,
+        class_count,
+        qdisc_count,
+        estimated_qdisc_memory_bytes,
+    )
 }
 
 fn push_bakery_event(event: &str, status: &str, summary: String) {
@@ -2505,6 +2559,8 @@ pub struct QdiscBudgetEstimate {
     pub estimated_total_memory_bytes: u64,
     /// Current host memory snapshot used for preflight, if available.
     pub memory_snapshot: Option<MemorySnapshot>,
+    /// Effective memory floor used for the memory preflight.
+    pub memory_guard_min_available_bytes: u64,
     /// Whether the memory preflight passed.
     pub memory_ok: bool,
 }
@@ -2649,10 +2705,14 @@ pub fn estimate_full_reload_auto_qdisc_budget(
         acc.saturating_add(detail.estimated_memory_bytes)
     });
     let memory_snapshot = read_memory_snapshot().ok();
+    let memory_guard_min_available_bytes = memory_snapshot
+        .as_ref()
+        .map(|snapshot| bakery_memory_guard_min_available_bytes(snapshot.total_bytes))
+        .unwrap_or(BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES);
     let memory_ok = memory_snapshot.as_ref().is_none_or(|snapshot| {
         snapshot
             .available_bytes
-            .saturating_sub(BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES)
+            .saturating_sub(memory_guard_min_available_bytes)
             >= estimated_total_memory_bytes
     });
 
@@ -2663,6 +2723,7 @@ pub fn estimate_full_reload_auto_qdisc_budget(
         hard_limit: HARD_QDISC_HANDLE_LIMIT_PER_INTERFACE,
         estimated_total_memory_bytes,
         memory_snapshot,
+        memory_guard_min_available_bytes,
         memory_ok,
     }
 }
@@ -3889,16 +3950,26 @@ fn maybe_emit_mapped_circuit_limit_urgent(stats: &MappedLimitStats) {
     });
 }
 
-fn maybe_emit_memory_guard_urgent(summary: &str) {
+fn maybe_emit_memory_guard_urgent(
+    summary: &str,
+    memory_guard_required_available_bytes: u64,
+    estimated_qdisc_memory_bytes: u64,
+) {
     if !summary.contains("Bakery memory guard stopped") {
         return;
     }
 
     let message = summary.to_string();
     let context = read_memory_snapshot().ok().map(|snapshot| {
+        let memory_guard_floor_bytes =
+            bakery_memory_guard_min_available_bytes(snapshot.total_bytes);
         format!(
-            "{{\"available_bytes\":{},\"total_bytes\":{},\"memory_guard_floor_bytes\":{}}}",
-            snapshot.available_bytes, snapshot.total_bytes, BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES
+            "{{\"available_bytes\":{},\"total_bytes\":{},\"memory_guard_floor_bytes\":{},\"estimated_qdisc_memory_bytes\":{},\"memory_guard_required_available_bytes\":{}}}",
+            snapshot.available_bytes,
+            snapshot.total_bytes,
+            memory_guard_floor_bytes,
+            estimated_qdisc_memory_bytes,
+            memory_guard_required_available_bytes
         )
     });
 
@@ -9059,6 +9130,34 @@ fn site_commands_observed_live(
     })
 }
 
+fn read_optional_restore_class_snapshots(
+    config: &Arc<Config>,
+    site_label: &str,
+) -> Option<(
+    HashMap<TcHandle, LiveTcClassEntry>,
+    HashMap<TcHandle, LiveTcClassEntry>,
+)> {
+    let down_snapshot = match read_live_class_snapshot(&config.isp_interface()) {
+        Ok(snapshot) => snapshot,
+        Err(summary) => {
+            debug!(
+                "Bakery: skipping live restore shortcut for {site_label}; unable to snapshot downlink classes: {summary}"
+            );
+            return None;
+        }
+    };
+    let up_snapshot = match read_live_class_snapshot(&config.internet_interface()) {
+        Ok(snapshot) => snapshot,
+        Err(summary) => {
+            debug!(
+                "Bakery: skipping live restore shortcut for {site_label}; unable to snapshot uplink classes: {summary}"
+            );
+            return None;
+        }
+    };
+    Some((down_snapshot, up_snapshot))
+}
+
 fn live_parent_matches(observed: Option<TcHandle>, expected: TcHandle) -> bool {
     if observed == Some(expected) {
         return true;
@@ -10593,28 +10692,27 @@ fn handle_treeguard_set_node_virtual_live(
         }
 
         let reversible_standby = saved_state.active_branch_hides_original_site();
-        let live_restore_snapshots = if reversible_standby {
-            Some((
-                read_live_class_snapshot(&config.isp_interface())?,
-                read_live_class_snapshot(&config.internet_interface())?,
-            ))
-        } else {
-            None
-        };
+        let mut live_restore_snapshots = None;
 
         if !saved_state.pending_prune
             && let Some(cmds) = saved_state
                 .site
                 .to_commands(&config, ExecutionMode::Builder)
         {
-            let root_already_live =
+            let root_already_live = if reversible_standby {
                 live_restore_snapshots
+                    .get_or_insert_with(|| {
+                        read_optional_restore_class_snapshots(&config, &site_label)
+                    })
                     .as_ref()
                     .is_some_and(|(down_snapshot, up_snapshot)| {
                         let mut only_root = HashMap::new();
                         only_root.insert(site_hash, saved_state.site.clone());
                         site_commands_observed_live(&only_root, down_snapshot, up_snapshot)
-                    });
+                    })
+            } else {
+                false
+            };
             if !root_already_live {
                 let result =
                     execute_and_record_live_change(&cmds, "TreeGuard runtime hidden site restore");
@@ -10643,8 +10741,9 @@ fn handle_treeguard_set_node_virtual_live(
                 )
             })
             .collect();
-        let originals_already_live =
+        let originals_already_live = if reversible_standby && !saved_state.saved_sites.is_empty() {
             live_restore_snapshots
+                .get_or_insert_with(|| read_optional_restore_class_snapshots(&config, &site_label))
                 .as_ref()
                 .is_some_and(|(down_snapshot, up_snapshot)| {
                     site_commands_observed_live(
@@ -10652,7 +10751,10 @@ fn handle_treeguard_set_node_virtual_live(
                         down_snapshot,
                         up_snapshot,
                     )
-                });
+                })
+        } else {
+            false
+        };
         if reversible_standby && originals_already_live {
             for (hash, command) in &saved_state.saved_sites {
                 sites.insert(*hash, Arc::clone(command));
@@ -11037,7 +11139,12 @@ fn process_batch(
     let path = config.debug_state_file_path("linux_tc_rust.txt");
     write_command_file(&path, &commands);
     let build_duration_ms = build_started.elapsed().as_millis() as u64;
-    let (total_tc_commands, class_commands, qdisc_commands) = count_tc_command_types(&commands);
+    let (total_tc_commands, class_commands, qdisc_commands, estimated_qdisc_memory_bytes) =
+        count_tc_command_types_and_estimate_qdisc_memory(&commands);
+    let memory_guard_required_available_bytes = read_memory_snapshot()
+        .map(|snapshot| bakery_memory_guard_min_available_bytes(snapshot.total_bytes))
+        .unwrap_or(BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES)
+        .saturating_add(estimated_qdisc_memory_bytes);
     let total_chunks = if total_tc_commands == 0 {
         0
     } else {
@@ -11054,7 +11161,7 @@ fn process_batch(
         &commands,
         "processing batch",
         FULL_RELOAD_TC_CHUNK_SIZE,
-        Some(BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES),
+        Some(memory_guard_required_available_bytes),
         |completed_tc_commands, total_tc_commands, completed_chunks, total_chunks| {
             update_bakery_apply_progress(
                 Some("Applying tc command chunks"),
@@ -11066,7 +11173,11 @@ fn process_batch(
         },
     );
     let summary = summarize_apply_result("processing batch", &result);
-    maybe_emit_memory_guard_urgent(&summary);
+    maybe_emit_memory_guard_urgent(
+        &summary,
+        memory_guard_required_available_bytes,
+        estimated_qdisc_memory_bytes,
+    );
     BakeryFullReloadBatchResult {
         result,
         summary,
@@ -13361,6 +13472,65 @@ mod tests {
             Some(7)
         );
         assert!(estimate.ok());
+    }
+
+    #[test]
+    fn bakery_memory_guard_floor_scales_with_host_ram() {
+        assert_eq!(
+            bakery_memory_guard_min_available_bytes(8 * 1024 * 1024 * 1024),
+            BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES
+        );
+        assert_eq!(
+            bakery_memory_guard_min_available_bytes(64 * 1024 * 1024 * 1024),
+            8 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn command_qdisc_memory_estimate_deduplicates_qdisc_identity() {
+        let commands = vec![
+            vec![
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "1:10".to_string(),
+                "cake".to_string(),
+            ],
+            vec![
+                "qdisc".to_string(),
+                "replace".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "1:10".to_string(),
+                "cake".to_string(),
+            ],
+            vec![
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth1".to_string(),
+                "parent".to_string(),
+                "1:10".to_string(),
+                "cake".to_string(),
+            ],
+            vec![
+                "qdisc".to_string(),
+                "add".to_string(),
+                "dev".to_string(),
+                "eth0".to_string(),
+                "parent".to_string(),
+                "1:11".to_string(),
+                "fq_codel".to_string(),
+            ],
+        ];
+
+        assert_eq!(
+            count_tc_command_types_and_estimate_qdisc_memory(&commands).3,
+            (CAKE_QDISC_ESTIMATED_MEMORY_BYTES * 2) + FQ_CODEL_QDISC_ESTIMATED_MEMORY_BYTES
+        );
     }
 
     #[test]

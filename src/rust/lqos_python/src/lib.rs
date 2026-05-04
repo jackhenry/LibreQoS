@@ -3571,15 +3571,15 @@ impl Bakery {
             (false, false) => "exceeds qdisc-count preflight and failed memory preflight",
         };
         let memory_summary = if let Some(snapshot) = estimate.memory_snapshot.as_ref() {
-            let memory_floor = lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES;
-            let required_available_bytes =
-                memory_floor.saturating_add(estimate.estimated_total_memory_bytes);
+            let required_available_bytes = estimate
+                .memory_guard_min_available_bytes
+                .saturating_add(estimate.estimated_total_memory_bytes);
             format!(
                 "estimated qdisc memory {} bytes; available memory {} bytes; required minimum {} bytes (safety floor {} bytes plus estimate)",
                 estimate.estimated_total_memory_bytes,
                 snapshot.available_bytes,
                 required_available_bytes,
-                memory_floor
+                estimate.memory_guard_min_available_bytes
             )
         } else {
             format!(
@@ -3625,7 +3625,7 @@ impl Bakery {
                 .memory_snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.available_bytes),
-            memory_guard_min_available_bytes: lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES,
+            memory_guard_min_available_bytes: estimate.memory_guard_min_available_bytes,
             memory_ok: estimate.memory_ok,
             interfaces: interface_reports,
         }]);
@@ -3658,7 +3658,7 @@ impl Bakery {
         result.set_item("memory_ok", estimate.memory_ok)?;
         result.set_item(
             "memory_guard_min_available_bytes",
-            lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES,
+            estimate.memory_guard_min_available_bytes,
         )?;
         if let Some(snapshot) = estimate.memory_snapshot {
             result.set_item("memory_total_bytes", snapshot.total_bytes)?;
