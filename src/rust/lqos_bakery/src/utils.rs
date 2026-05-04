@@ -269,7 +269,7 @@ fn memory_guard_failure_summary(
     phase: &str,
 ) -> String {
     format!(
-        "Bakery memory guard stopped {purpose} {phase} chunk {}/{}: available memory {} bytes is below safety floor {} bytes (total RAM {} bytes).",
+        "Bakery memory guard stopped {purpose} {phase} chunk {}/{}: available memory {} bytes is below required available memory {} bytes (total RAM {} bytes).",
         chunk_number,
         total_chunks,
         snapshot.available_bytes,
