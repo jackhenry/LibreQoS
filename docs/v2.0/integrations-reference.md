@@ -153,7 +153,7 @@ use_mikrotik_ipv6 = false
 - `api_key` is the Bearer token generated inside Netzur.
 - `api_url` must return JSON containing `zones` (mapped to sites) and `customers` (mapped to client circuits and devices).
 - `timeout_secs` overrides the default HTTP timeout (60 seconds) when the API is slow.
-- `use_mikrotik_ipv6` enriches subscriber devices with IPv6 prefixes discovered via `/etc/libreqos/mikrotik_ipv6.toml`.
+- `use_mikrotik_ipv6` enriches subscriber devices with IPv6 prefixes discovered via `/etc/libreqos/mikrotik_ipv6.toml`. LibreQoS matches IPv4 and IPv6 by MAC address using MikroTik ARP, DHCPv4, DHCPv6, and IPv6 neighbor data.
 
 Run a manual import with:
 
