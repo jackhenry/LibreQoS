@@ -33,9 +33,133 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TOPOLOGY_EFFECTIVE_PUBLISH_LOCK_FILENAME: &str = "topology_effective_publish.lock";
+const TOPOLOGY_WARNING_EXAMPLE_LIMIT: usize = 5;
 type EffectiveQueueAliasMap = HashMap<String, (String, String)>;
 
 pub use runtime::start_topology;
+
+#[derive(Default)]
+struct TopologyFallbackWarningSummary {
+    unresolved_exported_anchor_count: usize,
+    unresolved_exported_anchor_examples: Vec<String>,
+    missing_anchor_count: usize,
+    missing_anchor_examples: Vec<String>,
+    missing_parent_count: usize,
+    missing_parent_examples: Vec<String>,
+    non_exported_parent_count: usize,
+    non_exported_parent_examples: Vec<String>,
+}
+
+impl TopologyFallbackWarningSummary {
+    fn record_unresolved_exported_anchor(
+        &mut self,
+        circuit_id: &str,
+        anchor_id: &str,
+        anchor_name: &str,
+    ) {
+        self.unresolved_exported_anchor_count += 1;
+        push_capped_warning_example(
+            &mut self.unresolved_exported_anchor_examples,
+            format!("circuit '{circuit_id}' -> anchor '{anchor_id}' ('{anchor_name}')"),
+        );
+    }
+
+    fn record_missing_anchor(
+        &mut self,
+        circuit_id: &str,
+        anchor_id: &str,
+        anchor_name: Option<&str>,
+    ) {
+        self.missing_anchor_count += 1;
+        let example = if let Some(anchor_name) = anchor_name.filter(|value| !value.is_empty()) {
+            format!("circuit '{circuit_id}' -> anchor '{anchor_id}' ('{anchor_name}')")
+        } else {
+            format!("circuit '{circuit_id}' -> anchor '{anchor_id}'")
+        };
+        push_capped_warning_example(&mut self.missing_anchor_examples, example);
+    }
+
+    fn record_missing_parent(&mut self, circuit_id: &str, parent_name: &str, parent_id: &str) {
+        self.missing_parent_count += 1;
+        push_capped_warning_example(
+            &mut self.missing_parent_examples,
+            format!("circuit '{circuit_id}' -> parent '{parent_name}' ({parent_id})"),
+        );
+    }
+
+    fn record_non_exported_parent(&mut self, circuit_id: &str, parent_name: &str, parent_id: &str) {
+        self.non_exported_parent_count += 1;
+        push_capped_warning_example(
+            &mut self.non_exported_parent_examples,
+            format!("circuit '{circuit_id}' -> parent '{parent_name}' ({parent_id})"),
+        );
+    }
+
+    fn append_to(self, warnings: &mut Vec<String>) {
+        push_fallback_summary_warning(
+            warnings,
+            self.unresolved_exported_anchor_count,
+            "anchor(s) that did not resolve to exported effective queue nodes",
+            &self.unresolved_exported_anchor_examples,
+        );
+        push_fallback_summary_warning(
+            warnings,
+            self.missing_anchor_count,
+            "anchor(s) that were not found in the effective topology",
+            &self.missing_anchor_examples,
+        );
+        push_fallback_summary_warning(
+            warnings,
+            self.missing_parent_count,
+            "parent reference(s) that were not found in the exported effective topology",
+            &self.missing_parent_examples,
+        );
+        push_fallback_summary_warning(
+            warnings,
+            self.non_exported_parent_count,
+            "resolved parent(s) that were not exported effective queue nodes",
+            &self.non_exported_parent_examples,
+        );
+    }
+}
+
+fn push_capped_warning_example(examples: &mut Vec<String>, example: String) {
+    if examples.len() < TOPOLOGY_WARNING_EXAMPLE_LIMIT {
+        examples.push(example);
+    }
+}
+
+fn push_fallback_summary_warning(
+    warnings: &mut Vec<String>,
+    count: usize,
+    reason: &str,
+    examples: &[String],
+) {
+    if count == 0 {
+        return;
+    }
+    let mut warning = format!(
+        "{count} circuit(s) referenced {reason}. Falling back to generated parent-node shaping."
+    );
+    if !examples.is_empty() {
+        warning.push_str(" Examples: ");
+        warning.push_str(&examples.join("; "));
+        warning.push('.');
+        let omitted_count = count.saturating_sub(examples.len());
+        if omitted_count > 0 {
+            warning.push_str(&format!(" {omitted_count} more omitted."));
+        }
+    }
+    warnings.push(warning);
+}
+
+fn push_unresolved_runtime_fallback_summary(warnings: &mut Vec<String>, count: usize) {
+    if count > 0 {
+        warnings.push(format!(
+            "{count} circuit(s) are unresolved in runtime topology and will be shaped under generated parent nodes."
+        ));
+    }
+}
 
 /// One unique probe pair emitted from topology state plus operator intent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,6 +671,7 @@ fn build_shaping_inputs(
 
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+    let mut fallback_warning_summary = TopologyFallbackWarningSummary::default();
     let mut circuits = Vec::<TopologyShapingCircuitInput>::new();
     let mut circuits_by_id = HashMap::<String, usize>::new();
 
@@ -612,12 +737,11 @@ fn build_shaping_inputs(
                 ) {
                     (Some(ui_node), Some(_effective_node), _) => {
                         anchor_node_name = Some(ui_node.node_name.clone());
-                        warnings.push(format!(
-                            "Circuit '{}' anchor '{}' ('{}') did not resolve to an exported effective queue node. Falling back to generated parent-node shaping.",
-                            device.circuit_id,
+                        fallback_warning_summary.record_unresolved_exported_anchor(
+                            &device.circuit_id,
                             anchor_id,
-                            ui_node.node_name
-                        ));
+                            &ui_node.node_name,
+                        );
                         (
                             String::new(),
                             String::new(),
@@ -627,15 +751,11 @@ fn build_shaping_inputs(
                         )
                     }
                     (None, None, Some(anchor)) => {
-                        warnings.push(format!(
-                            "Circuit '{}' anchor '{}' ('{}') was not found in the effective topology. Falling back to generated parent-node shaping.",
-                            device.circuit_id,
+                        fallback_warning_summary.record_missing_anchor(
+                            &device.circuit_id,
                             anchor_id,
-                            anchor
-                                .anchor_node_name
-                                .as_deref()
-                                .unwrap_or_default()
-                        ));
+                            anchor.anchor_node_name.as_deref(),
+                        );
                         (
                             String::new(),
                             String::new(),
@@ -645,10 +765,11 @@ fn build_shaping_inputs(
                         )
                     }
                     _ => {
-                        warnings.push(format!(
-                            "Circuit '{}' anchor '{}' was not found in the effective topology. Falling back to generated parent-node shaping.",
-                            device.circuit_id, anchor_id
-                        ));
+                        fallback_warning_summary.record_missing_anchor(
+                            &device.circuit_id,
+                            anchor_id,
+                            None,
+                        );
                         (
                             String::new(),
                             String::new(),
@@ -681,12 +802,11 @@ fn build_shaping_inputs(
             if optional_non_empty(&device.parent_node).is_some()
                 || optional_non_empty_owned(device.parent_node_id.clone()).is_some()
             {
-                warnings.push(format!(
-                    "Circuit '{}' parent reference '{}' ({}) was not found in the exported effective topology. Falling back to generated parent-node shaping.",
-                    device.circuit_id,
+                fallback_warning_summary.record_missing_parent(
+                    &device.circuit_id,
                     device.parent_node.trim(),
-                    device.parent_node_id.clone().unwrap_or_default().trim()
-                ));
+                    device.parent_node_id.clone().unwrap_or_default().trim(),
+                );
             }
             (
                 String::new(),
@@ -707,10 +827,11 @@ fn build_shaping_inputs(
             &exported_effective_nodes,
             &exported_effective_names,
         ) {
-            warnings.push(format!(
-                "Circuit '{}' resolved to non-exported effective parent '{}' ({}). Falling back to generated parent-node shaping.",
-                device.circuit_id, effective_parent_node_name, effective_parent_node_id
-            ));
+            fallback_warning_summary.record_non_exported_parent(
+                &device.circuit_id,
+                &effective_parent_node_name,
+                &effective_parent_node_id,
+            );
             effective_parent_node_id.clear();
             effective_parent_node_name.clear();
             effective_attachment_id = None;
@@ -781,6 +902,7 @@ fn build_shaping_inputs(
             .devices
             .sort_unstable_by(|left, right| left.device_id.cmp(&right.device_id));
     }
+    fallback_warning_summary.append_to(&mut warnings);
 
     let unresolved_runtime_fallbacks = circuits
         .iter()
@@ -795,16 +917,7 @@ fn build_shaping_inputs(
                 "Flat topology mode assigned {unresolved_runtime_fallbacks} circuit(s) to generated parent nodes during queue construction."
             ));
         } else {
-            for circuit in &circuits {
-                if circuit.effective_parent_node_id.trim().is_empty()
-                    && circuit.resolution_source == TopologyShapingResolutionSource::RuntimeFallback
-                {
-                    warnings.push(format!(
-                        "Circuit '{}' is unresolved in runtime topology and will be shaped under generated parent nodes.",
-                        circuit.circuit_id
-                    ));
-                }
-            }
+            push_unresolved_runtime_fallback_summary(&mut warnings, unresolved_runtime_fallbacks);
         }
     }
 
@@ -5396,6 +5509,73 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("generated parent nodes"))
+        );
+    }
+
+    #[test]
+    fn shaping_inputs_aggregate_missing_parent_warnings() {
+        let lqos_directory = unique_temp_dir("lqos-topology-missing-parent-summary");
+        let config = Config {
+            lqos_directory: lqos_directory.to_string_lossy().to_string(),
+            state_directory: None,
+            ..Config::default()
+        };
+        let mut csv = String::from(
+            "Circuit ID,Circuit Name,Device ID,Device Name,Parent Node,Parent Node ID,Anchor Node ID,MAC,IPv4,IPv6,Download Min Mbps,Upload Min Mbps,Download Max Mbps,Upload Max Mbps,Comment\n",
+        );
+        for circuit_number in 1..=12 {
+            csv.push_str(&format!(
+                "\"circuit-{circuit_number}\",\"Circuit {circuit_number}\",\"device-{circuit_number}\",\"Device {circuit_number}\",\"Missing Parent\",\"missing-parent\",\"\",\"aa:bb:cc:dd:ee:{circuit_number:02x}\",\"192.0.2.{circuit_number}/32\",\"\",\"10\",\"10\",\"100\",\"100\",\"\"\n",
+            ));
+        }
+        fs::write(lqos_directory.join("ShapedDevices.csv"), csv)
+            .expect("ShapedDevices.csv should write");
+
+        let artifacts = EffectiveTopologyArtifacts {
+            effective: TopologyEffectiveStateFile {
+                schema_version: 1,
+                generated_unix: Some(1),
+                canonical_generated_unix: Some(1),
+                health_generated_unix: Some(1),
+                nodes: Vec::new(),
+            },
+            ui_state: TopologyEditorStateFile {
+                schema_version: 1,
+                source: "test".to_string(),
+                generated_unix: Some(1),
+                ingress_identity: None,
+                nodes: Vec::new(),
+            },
+            effective_network: Some(json!({})),
+        };
+
+        let shaping_inputs = build_shaping_inputs(&config, &artifacts)
+            .expect("shaping inputs should build")
+            .expect("shaping inputs should be present");
+        assert_eq!(shaping_inputs.circuits.len(), 12);
+        assert!(shaping_inputs.circuits.iter().all(|circuit| {
+            circuit.resolution_source
+                == lqos_config::TopologyShapingResolutionSource::RuntimeFallback
+        }));
+
+        let parent_warnings = shaping_inputs
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("parent reference(s)"))
+            .collect::<Vec<_>>();
+        assert_eq!(parent_warnings.len(), 1);
+        assert!(parent_warnings[0].contains("12 circuit(s)"));
+        assert!(parent_warnings[0].contains("circuit-1"));
+        assert!(parent_warnings[0].contains("circuit-5"));
+        assert!(!parent_warnings[0].contains("circuit-6"));
+        assert!(parent_warnings[0].contains("7 more omitted"));
+        assert_eq!(
+            shaping_inputs
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("unresolved in runtime topology"))
+                .count(),
+            1
         );
     }
 
