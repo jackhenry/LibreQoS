@@ -155,6 +155,34 @@ use_mikrotik_ipv6 = false
 - `timeout_secs` overrides the default HTTP timeout (60 seconds) when the API is slow.
 - `use_mikrotik_ipv6` enriches subscriber devices with IPv6 prefixes discovered via `/etc/libreqos/mikrotik_ipv6.toml`. LibreQoS matches IPv4 and IPv6 by MAC address using MikroTik ARP, DHCPv4, DHCPv6, and IPv6 neighbor data.
 
+### MikroTik IPv6 Router Credentials
+
+When `use_mikrotik_ipv6` or `ipv6_with_mikrotik` is enabled, create `/etc/libreqos/mikrotik_ipv6.toml`. Add one `[[router]]` block for each MikroTik router LibreQoS should query:
+
+```toml
+version = 1
+
+[[router]]
+name = "core-1"
+host = "100.64.0.1"
+port = 8728
+username = "libreqos"
+password = "secret"
+use_ssl = false
+plaintext_login = true
+
+[[router]]
+name = "core-2"
+host = "100.64.0.2"
+port = 8728
+username = "libreqos"
+password = "secret"
+use_ssl = false
+plaintext_login = true
+```
+
+Use additional `[[router]]` blocks for additional routers. `port`, `use_ssl`, and `plaintext_login` can be omitted when the defaults are correct: port `8728`, SSL disabled, and plaintext login enabled.
+
 Run a manual import with:
 
 ```bash
