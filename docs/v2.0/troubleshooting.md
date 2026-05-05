@@ -122,6 +122,16 @@ Press the End key on the keyboard to take you to the bottom of the log to see th
 
 Lqosd will provide specific reasons it failed, such as an interface not being up, an interface lacking multi-queue, or other concerns.
 
+If `journalctl -u lqosd` shows `lqosd memory watchdog restarting daemon`, the daemon intentionally exited before host memory pressure reached the kernel OOM path. Systemd should restart `lqosd` automatically. Capture the watchdog log line before changing settings; it includes available memory, `lqosd` RSS/swap, thread count, flow count, and timing counters that help diagnose the source of memory growth.
+
+The watchdog can be tuned with systemd environment overrides:
+
+```bash
+sudo systemctl edit lqosd
+```
+
+Common override variables are `LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB`, `LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB`, and `LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB`. Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` only for short troubleshooting windows where you are actively watching memory pressure.
+
 ### Advanced lqosd debug
 
 At the command-line, run:

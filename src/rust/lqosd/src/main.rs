@@ -10,6 +10,7 @@ mod ip_mapping;
 #[cfg(feature = "equinix_tests")]
 mod lqos_daht_test;
 pub mod lts2_sys;
+mod memory_watchdog;
 mod network_devices_hooks;
 mod node_manager;
 mod preflight_checks;
@@ -248,6 +249,7 @@ fn main() -> Result<()> {
 
     // Memory Debugging
     memory_debug();
+    memory_watchdog::start_memory_watchdog();
 
     let control_tx_for_webserver = control_tx_for_web.clone();
     let system_usage_tx_for_web = system_usage_tx.clone();
