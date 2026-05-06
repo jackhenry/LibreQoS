@@ -15,6 +15,9 @@ fn default_true() -> bool {
     true
 }
 
+const MIN_INTERFACE_MTU: u32 = 576;
+const MAX_INTERFACE_MTU: u32 = 9216;
+
 fn default_rtt_green_ms() -> u32 {
     0
 }
@@ -25,6 +28,17 @@ fn default_rtt_yellow_ms() -> u32 {
 
 fn default_rtt_red_ms() -> u32 {
     200
+}
+
+fn validate_interface_mtu(field_name: &str, mtu: Option<u32>) -> Result<(), String> {
+    if let Some(mtu) = mtu
+        && !(MIN_INTERFACE_MTU..=MAX_INTERFACE_MTU).contains(&mtu)
+    {
+        return Err(format!(
+            "{field_name} must be between {MIN_INTERFACE_MTU} and {MAX_INTERFACE_MTU}"
+        ));
+    }
+    Ok(())
 }
 
 /// RTT color scale thresholds (milliseconds) used by the web UI.
@@ -224,6 +238,12 @@ impl Config {
                 "Configuration file may not contain both a bridge and a single-interface section."
                     .to_string(),
             );
+        }
+        if let Some(bridge) = &self.bridge {
+            validate_interface_mtu("bridge.mtu", bridge.mtu)?;
+        }
+        if let Some(single_interface) = &self.single_interface {
+            validate_interface_mtu("single_interface.mtu", single_interface.mtu)?;
         }
         if self.version.trim() != "1.5" {
             return Err(format!(
@@ -569,6 +589,7 @@ impl Config {
 
 #[cfg(test)]
 mod test {
+    use super::super::bridge::{BridgeConfig, SingleInterfaceConfig};
     use super::{Config, RttThresholds};
 
     fn remove_sections(raw: &str, sections: &[&str]) -> String {
@@ -770,6 +791,86 @@ mod test {
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn bridge_mtu_defaults_to_none_when_omitted() {
+        let config =
+            Config::load_from_string(include_str!("example.toml")).expect("example should load");
+        assert_eq!(config.bridge.as_ref().and_then(|bridge| bridge.mtu), None);
+    }
+
+    #[test]
+    fn interface_mtu_values_deserialize() {
+        let bridge_raw = include_str!("example.toml")
+            .replace("to_network = \"eth1\"", "to_network = \"eth1\"\nmtu = 9000");
+        let bridge_config = Config::load_from_string(&bridge_raw).expect("bridge MTU should load");
+        assert_eq!(
+            bridge_config.bridge.as_ref().and_then(|bridge| bridge.mtu),
+            Some(9000)
+        );
+
+        let single_raw = remove_sections(include_str!("example.toml"), &["bridge"])
+            + r#"
+[single_interface]
+interface = "eth0"
+internet_vlan = 2
+network_vlan = 3
+mtu = 1500
+"#;
+        let single_config =
+            Config::load_from_string(&single_raw).expect("single-interface MTU should load");
+        assert_eq!(
+            single_config
+                .single_interface
+                .as_ref()
+                .and_then(|single| single.mtu),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn interface_mtu_validation_rejects_out_of_range_values() {
+        let mut bridge_config = Config {
+            bridge: Some(BridgeConfig {
+                mtu: Some(575),
+                ..BridgeConfig::default()
+            }),
+            ..Config::default()
+        };
+        let bridge_error = bridge_config
+            .validate()
+            .expect_err("bridge.mtu below range should fail");
+        assert!(bridge_error.contains("bridge.mtu"));
+
+        bridge_config.bridge.as_mut().expect("bridge").mtu = Some(9217);
+        let bridge_error = bridge_config
+            .validate()
+            .expect_err("bridge.mtu above range should fail");
+        assert!(bridge_error.contains("bridge.mtu"));
+
+        let mut single_config = Config {
+            bridge: None,
+            single_interface: Some(SingleInterfaceConfig {
+                mtu: Some(575),
+                ..SingleInterfaceConfig::default()
+            }),
+            ..Config::default()
+        };
+        let single_error = single_config
+            .validate()
+            .expect_err("single_interface.mtu below range should fail");
+        assert!(single_error.contains("single_interface.mtu"));
+
+        single_config
+            .single_interface
+            .as_mut()
+            .expect("single interface")
+            .mtu = Some(9217);
+        let single_error = single_config
+            .validate()
+            .expect_err("single_interface.mtu above range should fail");
+        assert!(single_error.contains("single_interface.mtu"));
     }
 
     #[test]

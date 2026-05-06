@@ -77,7 +77,7 @@ fn unauthorized() -> (StatusCode, Json<ApplyResponse>) {
 }
 
 fn helper_validation_error_response(message: String) -> (StatusCode, Json<ApplyResponse>) {
-    warn!("Bridge helper request failed: {message}");
+    warn!("Network-mode request failed: {message}");
     (
         StatusCode::BAD_REQUEST,
         Json(ApplyResponse {
@@ -90,7 +90,7 @@ fn helper_validation_error_response(message: String) -> (StatusCode, Json<ApplyR
 }
 
 fn helper_internal_error_response(message: String) -> (StatusCode, Json<ApplyResponse>) {
-    error!("Bridge helper internal error: {message}");
+    error!("Network-mode internal error: {message}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ApplyResponse {
@@ -102,11 +102,20 @@ fn helper_internal_error_response(message: String) -> (StatusCode, Json<ApplyRes
     )
 }
 
-fn merge_network_mode(candidate: Config) -> Result<Config, StatusCode> {
-    let live = lqos_config::load_config().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeNetworkModeError {
+    LoadLiveConfig,
+    InvalidCandidate(String),
+}
+
+fn merge_network_mode(candidate: Config) -> Result<Config, MergeNetworkModeError> {
+    let live = lqos_config::load_config().map_err(|_| MergeNetworkModeError::LoadLiveConfig)?;
     let mut merged = (*live).clone();
     merged.bridge = candidate.bridge;
     merged.single_interface = candidate.single_interface;
+    merged
+        .validate()
+        .map_err(MergeNetworkModeError::InvalidCandidate)?;
     Ok(merged)
 }
 
@@ -156,13 +165,23 @@ pub async fn inspect(
     State(state): State<NetworkModeApiState>,
     Extension(login): Extension<LoginResult>,
     Json(body): Json<NetworkModeInspectRequest>,
-) -> Result<Json<NetworkModeInspection>, StatusCode> {
+) -> Result<Json<NetworkModeInspection>, (StatusCode, Json<ApplyResponse>)> {
     if login != LoginResult::Admin {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(unauthorized());
     }
 
-    let merged = merge_network_mode(body.config)?;
-    Ok(Json(run_network_mode_inspection(&state, merged).await?))
+    let merged = merge_network_mode(body.config).map_err(|error| match error {
+        MergeNetworkModeError::InvalidCandidate(message) => {
+            helper_validation_error_response(message)
+        }
+        MergeNetworkModeError::LoadLiveConfig => helper_internal_error_response(
+            "Unable to load the live LibreQoS configuration".to_string(),
+        ),
+    })?;
+    run_network_mode_inspection(&state, merged)
+        .await
+        .map(Json)
+        .map_err(|_| helper_internal_error_response("Unable to inspect network mode".to_string()))
 }
 
 pub async fn apply(
@@ -178,16 +197,17 @@ pub async fn apply(
     let username = get_username(&jar).await;
     let merged = match merge_network_mode(body.config) {
         Ok(config) => config,
-        Err(status) => {
-            return (
-                status,
-                Json(ApplyResponse {
-                    ok: false,
-                    message: "Unable to load the live LibreQoS configuration".to_string(),
-                    operation: None,
-                    last_backup_id: None,
-                }),
-            );
+        Err(error) => {
+            return match error {
+                MergeNetworkModeError::InvalidCandidate(message) => {
+                    helper_validation_error_response(message)
+                }
+                MergeNetworkModeError::LoadLiveConfig => {
+                    helper_internal_error_response(
+                        "Unable to load the live LibreQoS configuration".to_string(),
+                    )
+                }
+            };
         }
     };
     let result = tokio::task::spawn_blocking({
@@ -212,7 +232,9 @@ pub async fn apply(
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)),
         Ok(Err(err)) => helper_validation_error_response(err.to_string()),
-        Err(err) => helper_internal_error_response(format!("Bridge helper task failed: {err}")),
+        Err(err) => {
+            helper_internal_error_response(format!("Network-mode helper task failed: {err}"))
+        }
     }
 }
 
@@ -238,7 +260,9 @@ pub async fn confirm(
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)),
         Ok(Err(err)) => helper_validation_error_response(err.to_string()),
-        Err(err) => helper_internal_error_response(format!("Bridge helper task failed: {err}")),
+        Err(err) => {
+            helper_internal_error_response(format!("Network-mode helper task failed: {err}"))
+        }
     }
 }
 
@@ -264,7 +288,9 @@ pub async fn revert(
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)),
         Ok(Err(err)) => helper_validation_error_response(err.to_string()),
-        Err(err) => helper_internal_error_response(format!("Bridge helper task failed: {err}")),
+        Err(err) => {
+            helper_internal_error_response(format!("Network-mode helper task failed: {err}"))
+        }
     }
 }
 
@@ -290,7 +316,9 @@ pub async fn rollback(
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)),
         Ok(Err(err)) => helper_validation_error_response(err.to_string()),
-        Err(err) => helper_internal_error_response(format!("Bridge helper task failed: {err}")),
+        Err(err) => {
+            helper_internal_error_response(format!("Network-mode helper task failed: {err}"))
+        }
     }
 }
 
@@ -314,6 +342,88 @@ pub async fn retry_shaping(
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)),
         Ok(Err(err)) => helper_internal_error_response(err.to_string()),
-        Err(err) => helper_internal_error_response(format!("Bridge helper task failed: {err}")),
+        Err(err) => {
+            helper_internal_error_response(format!("Network-mode helper task failed: {err}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MergeNetworkModeError, merge_network_mode};
+    use lqos_config::{BridgeConfig, Config, SingleInterfaceConfig};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_config_env<T>(test_fn: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().expect("network-mode env lock");
+        let old_lqos_config = std::env::var_os("LQOS_CONFIG");
+        let config_path = std::env::temp_dir().join(format!(
+            "lqosd-network-mode-test-{}.toml",
+            std::process::id()
+        ));
+        let raw = include_str!("../../../../lqos_config/src/etc/v15/example.toml");
+        std::fs::write(&config_path, raw).expect("write config");
+        lqos_config::clear_cached_config();
+
+        unsafe {
+            std::env::set_var("LQOS_CONFIG", &config_path);
+        }
+        let result = test_fn();
+
+        match old_lqos_config {
+            Some(value) => unsafe {
+                std::env::set_var("LQOS_CONFIG", value);
+            },
+            None => unsafe {
+                std::env::remove_var("LQOS_CONFIG");
+            },
+        }
+        lqos_config::clear_cached_config();
+        let _ = std::fs::remove_file(config_path);
+        result
+    }
+
+    #[test]
+    fn merge_network_mode_rejects_invalid_bridge_mtu() {
+        let mut candidate = Config::default();
+        candidate.bridge = Some(BridgeConfig {
+            mtu: Some(9217),
+            ..BridgeConfig::default()
+        });
+
+        let error =
+            with_config_env(|| merge_network_mode(candidate).expect_err("invalid MTU should fail"));
+
+        assert_eq!(
+            error,
+            MergeNetworkModeError::InvalidCandidate(
+                "bridge.mtu must be between 576 and 9216".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn merge_network_mode_rejects_invalid_single_interface_mtu() {
+        let mut candidate = Config::default();
+        candidate.bridge = None;
+        candidate.single_interface = Some(SingleInterfaceConfig {
+            mtu: Some(575),
+            ..SingleInterfaceConfig::default()
+        });
+
+        let error =
+            with_config_env(|| merge_network_mode(candidate).expect_err("invalid MTU should fail"));
+
+        assert_eq!(
+            error,
+            MergeNetworkModeError::InvalidCandidate(
+                "single_interface.mtu must be between 576 and 9216".to_string()
+            )
+        );
     }
 }

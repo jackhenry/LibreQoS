@@ -11,6 +11,7 @@ fi
 echo "[test-node-manager] Running frontend contract tests..."
 node --test \
   "${SCRIPT_DIR}/src/config/shaped_device_wire.test.mjs" \
+  "${SCRIPT_DIR}/src/config/config_interface_mtu.test.mjs" \
   "${SCRIPT_DIR}/src/pubsub/ws.test.mjs"
 
 echo "[test-node-manager] Building bundles..."
