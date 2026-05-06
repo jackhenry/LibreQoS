@@ -120,7 +120,9 @@ sudo dpkg --configure -a
 sudo systemctl restart lqosd lqos_scheduler
 ```
 
-Las instalaciones basadas en git deben usar `./build_rust.sh` después de actualizar. Ese script reconstruye el entorno virtual antes de actualizar los archivos de servicio o reiniciar servicios. Si systemd informa `status=203/EXEC`, reconstruya el entorno virtual con el comando anterior y reinicie `lqos_scheduler`.
+Las instalaciones basadas en git deben usar `./build_rust.sh` después de actualizar. Ese script reconstruye el entorno virtual antes de actualizar los archivos de servicio o reiniciar servicios. Si systemd informa `status=203/EXEC` en `/opt/libreqos/venv/bin/python`, o una falla en la comprobación previa del scheduler, reconstruya el entorno virtual con el comando anterior y reinicie `lqos_scheduler`.
+
+Las instalaciones antiguas anteriores al entorno virtual pueden mostrar `ModuleNotFoundError` y recomendar comandos de `pip` del sistema. No repare instalaciones actuales con `pip` del sistema ni con `--break-system-packages`; esos paquetes no los usa el servicio `lqos_scheduler` respaldado por el entorno virtual. Actualice a un paquete que cree `/opt/libreqos/venv` y use el comando de reparación anterior.
 
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
 
@@ -174,20 +176,6 @@ Si `journalctl -u lqosd` muestra advertencias repetidas como `BeginIngest queue 
 ### RTNETLINK answers: Invalid argument
 
 Suele indicar que no se pudo agregar correctamente qdisc MQ en la NIC (colas RX/TX insuficientes). Verifique [NICs recomendadas](requirements-es.md).
-
-### Python ModuleNotFoundError en Ubuntu 24.04
-
-```bash
-pip uninstall binpacking --break-system-packages --yes
-sudo pip uninstall binpacking --break-system-packages --yes
-sudo pip install binpacking --break-system-packages
-pip uninstall apscheduler --break-system-packages --yes
-sudo pip uninstall apscheduler --break-system-packages --yes
-sudo pip install apscheduler --break-system-packages
-pip uninstall deepdiff --break-system-packages --yes
-sudo pip uninstall deepdiff --break-system-packages --yes
-sudo pip install deepdiff --break-system-packages
-```
 
 ### Todas las IPs de clientes aparecen como Unknown IPs
 

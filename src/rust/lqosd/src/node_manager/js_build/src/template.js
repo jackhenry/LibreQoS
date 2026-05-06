@@ -2,6 +2,7 @@ import {clearDiv} from "./helpers/builders";
 import {initRedact} from "./helpers/redact";
 import {initDayNightMode} from "./helpers/dark_mode";
 import {initColorBlind} from "./helpers/colorblind";
+import {listenOnceMatchingWithTimeout as listenWsOnceMatchingWithTimeout} from "./pubsub/listeners";
 import {get_ws_client} from "./pubsub/ws";
 
 const wsClient = get_ws_client();
@@ -29,6 +30,7 @@ function escapeHtml(text) {
 
 const SCHEDULER_STATUS_POLL_MS = 2000;
 const SCHEDULER_STATUS_TIMEOUT_MS = 2500;
+const URGENT_ISSUES_TIMEOUT_MS = 2500;
 const SCHEDULER_STATUS_STARTING_GRACE_MS = 30000;
 const SCHEDULER_MODAL_IDLE_POLL_MS = 3000;
 const SCHEDULER_MODAL_ACTIVE_POLL_MS = 1000;
@@ -41,24 +43,6 @@ let schedulerModalRequestInFlight = false;
 let schedulerModalInstance = null;
 let cachedSchedulerDetailsData = null;
 let cachedQueueModeConfig = null;
-
-function listenOnceWithTimeout(eventName, timeoutMs, handler, onTimeout) {
-    let done = false;
-    const wrapped = (msg) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        wsClient.off(eventName, wrapped);
-        handler(msg);
-    };
-    const timer = setTimeout(() => {
-        if (done) return;
-        done = true;
-        wsClient.off(eventName, wrapped);
-        onTimeout();
-    }, timeoutMs);
-    wsClient.on(eventName, wrapped);
-}
 
 function clampSchedulerPercent(value) {
     const parsed = Number(value);
@@ -526,7 +510,7 @@ function loadSchedulerStatus(force = false) {
     }
 
     schedulerStatusRequestInFlight = true;
-    listenOnceWithTimeout("SchedulerStatus", SCHEDULER_STATUS_TIMEOUT_MS, (msg) => {
+    listenWsOnceMatchingWithTimeout(wsClient, "SchedulerStatus", SCHEDULER_STATUS_TIMEOUT_MS, () => true, (msg) => {
         schedulerStatusRequestInFlight = false;
         if (!msg || !msg.data) {
             if (cachedSchedulerStatusData) {
@@ -685,7 +669,7 @@ function refreshSchedulerModalDetails(showLoading = false) {
         renderSchedulerModalLoading();
     }
     schedulerModalRequestInFlight = true;
-    listenOnceWithTimeout("SchedulerDetails", SCHEDULER_STATUS_TIMEOUT_MS, (msg) => {
+    listenWsOnceMatchingWithTimeout(wsClient, "SchedulerDetails", SCHEDULER_STATUS_TIMEOUT_MS, () => true, (msg) => {
         schedulerModalRequestInFlight = false;
         if (!isSchedulerModalOpen()) {
             stopSchedulerModalPolling();
@@ -1108,6 +1092,15 @@ function initUrgentIssues() {
     const containerId = 'urgentStatus';
     const linkId = 'urgentStatusLink';
     const badgeId = 'urgentBadge';
+    let urgentClearState = null;
+    let urgentStatusPending = false;
+    let urgentStatusRefreshQueued = false;
+    let urgentListPending = false;
+    let urgentListActiveRequestId = null;
+    let urgentListCancel = null;
+    let urgentRequestId = 0;
+    let pendingUrgentActionError = null;
+    let pendingUrgentRetryMessage = null;
 
     function ensurePlaceholder() {
         return document.getElementById(containerId) !== null;
@@ -1131,38 +1124,251 @@ function initUrgentIssues() {
 
     function poll() {
         if (!ensurePlaceholder()) return;
-        listenOnce("UrgentStatus", (msg) => {
-            const count = msg && msg.data ? msg.data.count : 0;
-            renderStatus(count || 0);
+        if (urgentStatusPending) {
+            urgentStatusRefreshQueued = true;
+            return;
+        }
+        urgentStatusPending = true;
+        const requestId = ++urgentRequestId;
+        listenWsOnceMatchingWithTimeout(
+            wsClient,
+            "UrgentStatus",
+            URGENT_ISSUES_TIMEOUT_MS,
+            (msg) => msg.request_id === requestId,
+            (msg) => {
+                urgentStatusPending = false;
+                const count = msg && msg.data ? msg.data.count : 0;
+                renderStatus(count || 0);
+                runQueuedUrgentStatusRefresh();
+            },
+            () => {
+                urgentStatusPending = false;
+                runQueuedUrgentStatusRefresh();
+            }
+        );
+        wsClient.send({ UrgentStatus: { request_id: requestId } });
+    }
+
+    function runQueuedUrgentStatusRefresh() {
+        if (!urgentStatusRefreshQueued) return false;
+        urgentStatusRefreshQueued = false;
+        poll();
+        return true;
+    }
+
+    function clearActionInFlight() {
+        return urgentClearState !== null;
+    }
+
+    function clearActionBlocked() {
+        return clearActionInFlight() || urgentListPending;
+    }
+
+    function setClearControlsDisabled(disabled) {
+        document.querySelectorAll('.urgent-clear').forEach((button) => {
+            button.disabled = disabled;
         });
-        wsClient.send({ UrgentStatus: {} });
+        const clearAllButton = document.getElementById('urgentClearAll');
+        if (clearAllButton) {
+            clearAllButton.disabled = disabled;
+        }
+    }
+
+    function showUrgentBusyState(message) {
+        const holder = document.getElementById('urgentListContainer');
+        if (!holder || !urgentModalIsOpen()) return;
+        holder.setAttribute('aria-busy', 'true');
+        holder.querySelector('.urgent-busy-status')?.remove();
+        holder.insertAdjacentHTML('afterbegin', `
+            <div class="alert alert-info mb-2 urgent-busy-status" role="status" aria-live="polite" tabindex="-1">
+                <i class="fa fa-spinner fa-spin" aria-hidden="true"></i>
+                ${escapeHtml(message)}
+            </div>`);
+        holder.querySelector('.urgent-busy-status')?.focus();
+    }
+
+    function clearUrgentBusyState(holder) {
+        const target = holder || document.getElementById('urgentListContainer');
+        if (!target) return;
+        target.removeAttribute('aria-busy');
+        target.querySelector('.urgent-busy-status')?.remove();
+    }
+
+    function renderUrgentWarning(holder, message, { focus = false, retry = false } = {}) {
+        if (!holder) return;
+        holder.querySelector('.urgent-action-error')?.remove();
+        const retryButton = retry
+            ? '<button type="button" class="btn btn-link btn-sm urgent-refresh">Retry</button>'
+            : '';
+        holder.insertAdjacentHTML('afterbegin', `
+            <div class="alert alert-warning mb-2 urgent-action-error" role="alert" tabindex="-1">
+                ${escapeHtml(message)}
+                ${retryButton}
+            </div>`);
+        if (focus) {
+            holder.querySelector(retry ? '.urgent-refresh' : '.urgent-action-error')?.focus();
+        }
+    }
+
+    function showUrgentActionError(message) {
+        pendingUrgentActionError = message;
+        if (!urgentModalIsOpen()) return;
+        const holder = document.getElementById('urgentListContainer');
+        if (!holder) return;
+        clearUrgentBusyState(holder);
+        renderUrgentWarning(holder, message, { focus: true });
+        pendingUrgentActionError = null;
+    }
+
+    function attachPendingUrgentActionError(holder) {
+        if (!pendingUrgentActionError || !urgentModalIsOpen() || !holder) return;
+        renderUrgentWarning(holder, pendingUrgentActionError);
+        pendingUrgentActionError = null;
+    }
+
+    function showUrgentRetryState(message) {
+        pendingUrgentRetryMessage = message;
+        const holder = document.getElementById('urgentListContainer');
+        if (!holder || !urgentModalIsOpen()) return;
+        pendingUrgentRetryMessage = null;
+        setClearControlsDisabled(true);
+        clearUrgentBusyState(holder);
+        holder.innerHTML = '';
+        renderUrgentWarning(holder, message, { focus: true, retry: true });
+        $(holder).off('click').on('click', '.urgent-refresh', function (e) {
+            e.preventDefault();
+            showModal();
+        });
+    }
+
+    function showPendingUrgentRetryState() {
+        if (!pendingUrgentRetryMessage || !urgentModalIsOpen()) return false;
+        showUrgentRetryState(pendingUrgentRetryMessage);
+        return true;
+    }
+
+    function urgentModalIsOpen() {
+        return document.getElementById('urgentModal')?.classList.contains('show') === true;
+    }
+
+    function focusUrgentModalFallback() {
+        const modalEl = document.getElementById('urgentModal');
+        if (!modalEl || !urgentModalIsOpen()) return;
+        modalEl
+            .querySelector('.urgent-clear:not(:disabled), #urgentClearAll:not(:disabled), .btn-close:not(:disabled), [data-bs-dismiss="modal"]:not(:disabled)')
+            ?.focus();
+    }
+
+    function refreshUrgentIssues() {
+        showModal();
+        poll();
+    }
+
+    function completeClearAction() {
+        urgentClearState = null;
+        setClearControlsDisabled(clearActionInFlight());
+        refreshUrgentIssues();
+    }
+
+    function startUrgentClear({
+        responseEvent,
+        requestPayload,
+        busyMessage,
+        failureMessage,
+        timeoutMessage,
+    }) {
+        if (clearActionBlocked()) {
+            return;
+        }
+        const requestId = ++urgentRequestId;
+        setClearControlsDisabled(true);
+        showUrgentBusyState(busyMessage);
+        urgentClearState = {
+            busyMessage,
+            cancel: null,
+        };
+        urgentClearState.cancel = listenWsOnceMatchingWithTimeout(
+            wsClient,
+            responseEvent,
+            URGENT_ISSUES_TIMEOUT_MS,
+            (msg) => msg.request_id === requestId,
+            (msg) => {
+                urgentClearState = null;
+                if (msg && msg.ok === false) {
+                    setClearControlsDisabled(false);
+                    showUrgentActionError(failureMessage);
+                    return;
+                }
+                completeClearAction();
+            },
+            () => {
+                urgentClearState = null;
+                setClearControlsDisabled(false);
+                showUrgentActionError(timeoutMessage);
+            }
+        );
+        wsClient.send(requestPayload(requestId));
     }
 
     function showModal() {
         const modalEl = document.getElementById('urgentModal');
-        if (!modalEl) return;
-        new bootstrap.Modal(modalEl, { focus: true }).show();
+        if (!modalEl) {
+            return;
+        }
+        bootstrap.Modal.getOrCreateInstance(modalEl, { focus: true }).show();
         const holder = document.getElementById('urgentListContainer');
-        if (!holder) return;
-        holder.innerHTML = `<div class="text-center text-muted"><i class='fa fa-spinner fa-spin'></i> Loading...</div>`;
-        listenOnce("UrgentList", (msg) => {
-            const items = msg && msg.data ? msg.data.items || [] : [];
-            if (items.length === 0) {
-                holder.innerHTML = '<div class="text-center text-success">No urgent issues.</div>';
-                return;
-            }
-            const table = document.createElement('table');
-            table.className = 'lqos-table lqos-table-compact mb-0';
-            const tbody = document.createElement('tbody');
-            items.forEach((it) => {
-                const tr = document.createElement('tr');
-                const td = document.createElement('td');
-                const when = new Date(it.ts * 1000).toLocaleString();
-                const sev = it.severity === 'Error' ? 'danger' : 'warning';
-                const clearControl = it.clearable === false
-                    ? '<span class="badge bg-secondary-subtle text-secondary border float-end ms-3">Active</span>'
-                    : `<button type="button" class="btn btn-link btn-sm text-secondary float-end ms-3 p-0 urgent-clear" data-id="${it.id}" title="Acknowledge issue" aria-label="Acknowledge issue ${escapeAttr(it.code)}"><i class="fa fa-times" aria-hidden="true"></i></button>`;
-                td.innerHTML = `
+        if (!holder) {
+            return;
+        }
+        if (showPendingUrgentRetryState()) {
+            return;
+        }
+        if (clearActionInFlight()) {
+            setClearControlsDisabled(true);
+            showUrgentBusyState(urgentClearState.busyMessage);
+            return;
+        }
+        if (urgentListPending) {
+            setClearControlsDisabled(true);
+            return;
+        }
+        urgentListPending = true;
+        const requestId = ++urgentRequestId;
+        urgentListActiveRequestId = requestId;
+        setClearControlsDisabled(true);
+        clearUrgentBusyState(holder);
+        holder.innerHTML = `<div class="text-center text-muted urgent-loading" role="status" aria-live="polite" tabindex="-1"><i class='fa fa-spinner fa-spin'></i> Loading...</div>`;
+        holder.querySelector('.urgent-loading')?.focus();
+        urgentListCancel = listenWsOnceMatchingWithTimeout(
+            wsClient,
+            "UrgentList",
+            URGENT_ISSUES_TIMEOUT_MS,
+            (msg) => msg.request_id === requestId && urgentListActiveRequestId === requestId,
+            (msg) => {
+                urgentListPending = false;
+                urgentListActiveRequestId = null;
+                urgentListCancel = null;
+                const items = msg && msg.data ? msg.data.items || [] : [];
+                clearUrgentBusyState(holder);
+                if (items.length === 0) {
+                    holder.innerHTML = '<div class="text-center text-success" role="status" aria-live="polite" tabindex="-1">No urgent issues.</div>';
+                    attachPendingUrgentActionError(holder);
+                    setClearControlsDisabled(true);
+                    holder.querySelector('[role="status"]')?.focus();
+                    return;
+                }
+                const table = document.createElement('table');
+                table.className = 'lqos-table lqos-table-compact mb-0';
+                const tbody = document.createElement('tbody');
+                items.forEach((it) => {
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    const when = new Date(it.ts * 1000).toLocaleString();
+                    const sev = it.severity === 'Error' ? 'danger' : 'warning';
+                    const clearControl = it.clearable === false
+                        ? '<span class="badge bg-secondary-subtle text-secondary border float-end ms-3">Active</span>'
+                        : `<button type="button" class="btn btn-link btn-sm text-secondary float-end ms-3 p-0 urgent-clear" data-id="${it.id}" title="Acknowledge issue" aria-label="Acknowledge issue ${escapeAttr(it.code)}"><i class="fa fa-times" aria-hidden="true"></i></button>`;
+                    td.innerHTML = `
                     <div>
                         <span class="badge bg-${sev}">${it.severity}</span>
                         <strong class="ms-2">${it.code}</strong>
@@ -1173,26 +1379,44 @@ function initUrgentIssues() {
                     <div class="mt-1" style="white-space: pre-wrap;">${it.message}</div>
                     ${it.context ? `<pre class="mt-2">${it.context}</pre>` : ''}
                     `;
-                tr.appendChild(td);
-                tbody.appendChild(tr);
-            });
-            table.appendChild(tbody);
-            holder.innerHTML = '';
-            const tableWrap = document.createElement('div');
-            tableWrap.className = 'table-responsive lqos-table-wrap';
-            tableWrap.appendChild(table);
-            holder.appendChild(tableWrap);
-            $(holder).off('click').on('click', '.urgent-clear', function (e) {
-                e.preventDefault();
-                const id = $(this).data('id');
-                listenOnce("UrgentClearResult", () => {
-                    showModal();
-                    poll();
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
                 });
-                wsClient.send({ UrgentClear: { id } });
-            });
-        });
-        wsClient.send({ UrgentList: {} });
+                table.appendChild(tbody);
+                holder.innerHTML = '';
+                const tableWrap = document.createElement('div');
+                tableWrap.className = 'table-responsive lqos-table-wrap';
+                tableWrap.appendChild(table);
+                holder.appendChild(tableWrap);
+                attachPendingUrgentActionError(holder);
+                $(holder).off('click').on('click', '.urgent-clear', function (e) {
+                    e.preventDefault();
+                    const id = $(this).data('id');
+                    startUrgentClear({
+                        responseEvent: 'UrgentClearResult',
+                        requestPayload: (requestId) => ({ UrgentClear: { id, request_id: requestId } }),
+                        busyMessage: 'Acknowledging urgent issue...',
+                        failureMessage: 'Unable to acknowledge urgent issue.',
+                        timeoutMessage: 'Timed out while acknowledging urgent issue.',
+                    });
+                });
+                setClearControlsDisabled(clearActionInFlight());
+                focusUrgentModalFallback();
+            },
+            () => {
+                if (urgentListActiveRequestId !== requestId) return;
+                urgentListPending = false;
+                urgentListActiveRequestId = null;
+                urgentListCancel = null;
+                if (!urgentModalIsOpen()) {
+                    setClearControlsDisabled(clearActionInFlight());
+                    return;
+                }
+                showUrgentRetryState('Unable to refresh urgent issues.');
+                setClearControlsDisabled(true);
+            }
+        );
+        wsClient.send({ UrgentList: { request_id: requestId } });
     }
 
     if (!document.getElementById(containerId)) {
@@ -1206,11 +1430,31 @@ function initUrgentIssues() {
     }
 
     $(document).off('click', '#urgentClearAll').on('click', '#urgentClearAll', () => {
-        listenOnce("UrgentClearAllResult", () => {
-            showModal();
-            poll();
+        startUrgentClear({
+            responseEvent: 'UrgentClearAllResult',
+            requestPayload: (requestId) => ({ UrgentClearAll: { request_id: requestId } }),
+            busyMessage: 'Acknowledging urgent issues...',
+            failureMessage: 'Unable to acknowledge urgent issues.',
+            timeoutMessage: 'Timed out while acknowledging urgent issues.',
         });
-        wsClient.send({ UrgentClearAll: {} });
+    });
+
+    $(document).off('hidden.bs.modal', '#urgentModal').on('hidden.bs.modal', '#urgentModal', () => {
+        pendingUrgentRetryMessage = null;
+        if (urgentClearState?.cancel) {
+            urgentClearState.cancel();
+            urgentClearState = null;
+        }
+        if (urgentListPending) {
+            if (urgentListCancel) {
+                urgentListCancel();
+                urgentListCancel = null;
+            }
+            urgentListPending = false;
+            urgentListActiveRequestId = null;
+        }
+        clearUrgentBusyState();
+        setClearControlsDisabled(clearActionInFlight());
     });
 
     poll();
