@@ -1,5 +1,6 @@
 use std::{
     fs::read_to_string,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -201,6 +202,9 @@ fn treeguard_read_path(config: &lqos_config::Config) -> PathBuf {
 
 fn load_from_path(path: &Path) -> Result<OverrideFile> {
     let raw = read_to_string(path)?;
+    if raw.trim().is_empty() {
+        anyhow::bail!("Overrides file '{}' was empty", path.display());
+    }
     let as_json = serde_json::from_str(&raw)?;
     Ok(as_json)
 }
@@ -212,13 +216,40 @@ fn ensure_exists_default(path: &Path) -> Result<()> {
     // Create a default empty file
     let new_override_file = OverrideFile::default();
     let as_json = serde_json::to_string(&new_override_file)?;
-    std::fs::write(path, as_json.as_bytes())?;
+    write_atomic(path, as_json.as_bytes())?;
     Ok(())
 }
 
 fn save_to_path(path: &Path, overrides: &OverrideFile) -> Result<()> {
     let as_json = serde_json::to_string_pretty(overrides)?;
-    std::fs::write(path, as_json.as_bytes())?;
+    write_atomic(path, as_json.as_bytes())?;
+    Ok(())
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("Overrides path '{}' has no parent directory", path.display())
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("Overrides path '{}' has no file name", path.display())
+    })?;
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!("{}.tmp.{}.{}", file_name.to_string_lossy(), pid, nanos);
+    let tmp_path = parent.join(tmp_name);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
@@ -1089,7 +1120,8 @@ impl OverrideStore {
     pub fn load_effective(apply_stormguard: bool, apply_treeguard: bool) -> Result<OverrideFile> {
         let lock = FileLock::new()?;
         let config = lqos_config::load_config()?;
-        let merged = Self::load_effective_for_config(&config, apply_stormguard, apply_treeguard)?;
+        let merged =
+            Self::load_effective_for_config_inner(&config, apply_stormguard, apply_treeguard)?;
         drop(lock);
         Ok(merged)
     }
@@ -1099,6 +1131,17 @@ impl OverrideStore {
     /// This function reads override files from the config's LibreQoS directory without
     /// reloading `/etc/lqos.conf`.
     pub fn load_effective_for_config(
+        config: &lqos_config::Config,
+        apply_stormguard: bool,
+        apply_treeguard: bool,
+    ) -> Result<OverrideFile> {
+        let lock = FileLock::new()?;
+        let merged = Self::load_effective_for_config_inner(config, apply_stormguard, apply_treeguard)?;
+        drop(lock);
+        Ok(merged)
+    }
+
+    fn load_effective_for_config_inner(
         config: &lqos_config::Config,
         apply_stormguard: bool,
         apply_treeguard: bool,
