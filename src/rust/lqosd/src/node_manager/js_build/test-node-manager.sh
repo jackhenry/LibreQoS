@@ -9,7 +9,9 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 echo "[test-node-manager] Running frontend contract tests..."
-node --test "${SCRIPT_DIR}/src/config/shaped_device_wire.test.mjs"
+node --test \
+  "${SCRIPT_DIR}/src/config/shaped_device_wire.test.mjs" \
+  "${SCRIPT_DIR}/src/pubsub/ws.test.mjs"
 
 echo "[test-node-manager] Building bundles..."
 "${SCRIPT_DIR}/esbuild.sh"
