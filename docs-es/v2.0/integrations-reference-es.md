@@ -151,7 +151,35 @@ use_mikrotik_ipv6 = false
 - `api_key` es el token Bearer generado dentro de Netzur.
 - `api_url` debe devolver un JSON con los arreglos `zones` (convertidos en sitios) y `customers` (convertidos en circuitos y dispositivos).
 - `timeout_secs` permite incrementar el tiempo de espera de la petición cuando el API responde lentamente (por defecto 60 segundos).
-- `use_mikrotik_ipv6` agrega prefijos IPv6 obtenidos de `/etc/libreqos/mikrotik_ipv6.toml`.
+- `use_mikrotik_ipv6` agrega prefijos IPv6 obtenidos de `/etc/libreqos/mikrotik_ipv6.toml`. LibreQoS relaciona IPv4 e IPv6 por dirección MAC usando datos de ARP, DHCPv4, DHCPv6 y vecinos IPv6 de MikroTik.
+
+### Credenciales de routers MikroTik para IPv6
+
+Cuando `use_mikrotik_ipv6` o `ipv6_with_mikrotik` esté habilitado, cree `/etc/libreqos/mikrotik_ipv6.toml`. Agregue un bloque `[[router]]` por cada router MikroTik que LibreQoS deba consultar:
+
+```toml
+version = 1
+
+[[router]]
+name = "core-1"
+host = "100.64.0.1"
+port = 8728
+username = "libreqos"
+password = "secreto"
+use_ssl = false
+plaintext_login = true
+
+[[router]]
+name = "core-2"
+host = "100.64.0.2"
+port = 8728
+username = "libreqos"
+password = "secreto"
+use_ssl = false
+plaintext_login = true
+```
+
+Agregue más bloques `[[router]]` para más routers. `port`, `use_ssl` y `plaintext_login` pueden omitirse cuando los valores por defecto son correctos: puerto `8728`, SSL deshabilitado y login en texto plano habilitado.
 
 Para una importación manual:
 

@@ -27,6 +27,7 @@ LQOS_FILES=(
   integrationNetzur.py
   integrationRestHttp.py
   integrationSonar.py
+  integrationUtils.py
   integrationSplynx.py
   integrationVISP.py
   integrationWISPGate.py

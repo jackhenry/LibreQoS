@@ -139,6 +139,10 @@ flowchart LR
 | `lqos_overrides.json` | operator / WebUI / CLI | scheduler / topology runtime | durable operator intent | Yes | Yes | Yes |
 | `topology_attachment_health_state.json` | topology probes | Topology Manager / debug pages | runtime attachment health | Runtime state | Runtime state | No |
 
+## Runtime Fallback Warnings
+
+When a circuit references a parent or anchor that is not present in the queue-visible effective topology, LibreQoS still shapes the circuit under a generated parent node. Scheduler output summarizes those fallbacks by reason and includes a few example circuits instead of printing one warning per circuit. Review the examples in Topology Manager or the source integration when those circuits should attach to a specific real site, AP, or parent node.
+
 ## Consumer Map
 
 ```{mermaid}
