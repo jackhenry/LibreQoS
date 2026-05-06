@@ -172,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn cbor_round_trip_clear_urgent_issue_by_identity_request() {
+        let session = BusSession {
+            requests: vec![BusRequest::ClearUrgentIssueByIdentity {
+                code: "XDP_IP_MAPPING_APPLY_FAILED".to_string(),
+                dedupe_key: "XDP_IP_MAPPING_APPLY_FAILED".to_string(),
+            }],
+        };
+        let bytes = encode_session_cbor(&session).expect("encode_session_cbor");
+        let decoded = decode_session_cbor(&bytes).expect("decode_session_cbor");
+        assert_eq!(decoded.requests, session.requests);
+    }
+
+    #[test]
     fn cbor_round_trip_reply() {
         let reply = BusReply {
             responses: vec![BusResponse::Ack],

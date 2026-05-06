@@ -4,14 +4,13 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use fxhash::{FxHashMap, FxHashSet};
 use lqos_bus::{BusResponse, Circuit};
+#[cfg(test)]
+use lqos_config::load_active_runtime_shaping_inputs;
 use lqos_config::{
     NetworkJsonNode, NetworkJsonTransport, TopologyRuntimeShapingPayloadIdentity,
     TopologyRuntimeStatusFile, TopologyShapingInputsFile,
-    load_active_runtime_shaping_inputs_from_status, load_config,
-    topology_runtime_status_path,
+    load_active_runtime_shaping_inputs_from_status, load_config, topology_runtime_status_path,
 };
-#[cfg(test)]
-use lqos_config::load_active_runtime_shaping_inputs;
 use lqos_queue_tracker::EFFECTIVE_NODE_RATES;
 use lqos_utils::file_watcher::FileWatcher;
 use lqos_utils::hash_to_i64;
@@ -106,7 +105,9 @@ fn publish_shaping_inputs(shaping_inputs: TopologyShapingInputsFile) {
     invalidate_executive_cache_snapshot();
 }
 
-fn topology_status_identity(status: &TopologyRuntimeStatusFile) -> TopologyRuntimeShapingPayloadIdentity {
+fn topology_status_identity(
+    status: &TopologyRuntimeStatusFile,
+) -> TopologyRuntimeShapingPayloadIdentity {
     status.shaping_payload_identity()
 }
 
@@ -286,7 +287,9 @@ fn load_topology_runtime_status_payload() {
     let status = match TopologyRuntimeStatusFile::load(config.as_ref()) {
         Ok(status) => status,
         Err(err) => {
-            warn!("Unable to load topology_runtime_status.json: {err}; keeping last-known-good effective parent cache");
+            warn!(
+                "Unable to load topology_runtime_status.json: {err}; keeping last-known-good effective parent cache"
+            );
             return;
         }
     };
