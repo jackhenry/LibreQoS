@@ -64,7 +64,7 @@ impl FileLock {
         }
         let unix_path = CString::new(LOCK_PATH)?;
         unsafe {
-            nix::libc::chmod(unix_path.as_ptr(), mode_t::from_le(666));
+            nix::libc::chmod(unix_path.as_ptr(), mode_t::from_le(0o666));
         }
         Ok(())
     }
@@ -77,7 +77,7 @@ impl FileLock {
             std::fs::create_dir(dir_path)?;
             let unix_path = CString::new(LOCK_DIR_PERMS)?;
             unsafe {
-                nix::libc::chmod(unix_path.as_ptr(), 777);
+                nix::libc::chmod(unix_path.as_ptr(), 0o777);
             }
             Ok(())
         }

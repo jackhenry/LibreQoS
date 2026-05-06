@@ -25,6 +25,11 @@ pub(crate) fn start_network_devices_directory_watch() -> Result<()> {
         "LibreQoS topology state directory",
         config.resolved_state_directory().join("topology"),
     )?;
+    spawn_directory_watch_thread(
+        "Network Devices Shaping Dir Watcher",
+        "LibreQoS shaping state directory",
+        config.resolved_state_directory().join("shaping"),
+    )?;
     Ok(())
 }
 
@@ -88,7 +93,7 @@ fn classify_changed_path(path: &Path) -> Option<DirectoryReloadEvent> {
         "ShapedDevices.csv"
         | "ShapedDevices.insight.csv"
         | "topology_import.json"
-        | "topology_runtime_status.json" => Some(DirectoryReloadEvent::ShapedDevices),
+        | "shaping_inputs.json" => Some(DirectoryReloadEvent::ShapedDevices),
         "network.effective.json" | "network.insight.json" | "network.json" => {
             Some(DirectoryReloadEvent::NetworkJson)
         }
@@ -118,8 +123,14 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn topology_runtime_status_triggers_shaped_device_reload() {
+    fn topology_runtime_status_does_not_trigger_shaped_device_reload() {
         let event = classify_changed_path(&PathBuf::from("/tmp/topology_runtime_status.json"));
+        assert_eq!(event, None);
+    }
+
+    #[test]
+    fn shaping_inputs_triggers_shaped_device_reload() {
+        let event = classify_changed_path(&PathBuf::from("/tmp/shaping_inputs.json"));
         assert_eq!(event, Some(DirectoryReloadEvent::ShapedDevices));
     }
 
@@ -134,7 +145,7 @@ mod tests {
         let events = classify_changed_paths(&[
             PathBuf::from("/tmp/network.json"),
             PathBuf::from("/tmp/network.effective.json"),
-            PathBuf::from("/tmp/topology_runtime_status.json"),
+            PathBuf::from("/tmp/shaping_inputs.json"),
         ]);
         assert_eq!(
             events,
