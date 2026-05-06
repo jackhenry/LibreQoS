@@ -324,12 +324,19 @@ pub enum WsRequest {
     ProtocolFlowTimeline {
         protocol: String,
     },
-    UrgentStatus,
-    UrgentList,
+    UrgentStatus {
+        request_id: Option<u64>,
+    },
+    UrgentList {
+        request_id: Option<u64>,
+    },
     UrgentClear {
         id: u64,
+        request_id: Option<u64>,
     },
-    UrgentClearAll,
+    UrgentClearAll {
+        request_id: Option<u64>,
+    },
     UnknownIps,
     UnknownIpsClear,
     UnknownIpsCsv,
@@ -626,15 +633,23 @@ pub enum WsResponse {
     },
     UrgentStatus {
         data: UrgentStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentList {
         data: UrgentList,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentClearResult {
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentClearAllResult {
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UnknownIps {
         data: Vec<UnknownIp>,
