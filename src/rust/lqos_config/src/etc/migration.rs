@@ -182,6 +182,7 @@ fn migrate_bridge(
             interface: python_config.interface_a.clone(),
             internet_vlan: python_config.stick_vlan_a as u32,
             network_vlan: python_config.stick_vlan_b as u32,
+            mtu: None,
         });
     } else {
         new_config.single_interface = None;
@@ -193,6 +194,7 @@ fn migrate_bridge(
                 .use_xdp_bridge,
             to_internet: python_config.interface_b.clone(),
             to_network: python_config.interface_a.clone(),
+            mtu: None,
         });
     }
     Ok(())

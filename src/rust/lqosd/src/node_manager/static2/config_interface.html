@@ -55,12 +55,12 @@
             <section class="lqos-config-panel">
                 <div class="lqos-config-section">
                     <h6 class="lqos-config-section-title">Bridge Mode Configuration</h6>
-                    <div class="lqos-config-section-subtitle">Choose the two shaping interfaces for the managed Linux bridge flow, or leave XDP enabled if you are intentionally handling Netplan outside this page.</div>
+                    <div class="lqos-config-section-subtitle">Choose the two shaping interfaces. Linux bridge mode can manage Netplan; XDP mode leaves Netplan alone.</div>
 
                     <div class="mb-3 form-check">
-                        <input type="checkbox" class="form-check-input" id="useXdpBridge">
+                        <input type="checkbox" class="form-check-input" id="useXdpBridge" aria-describedby="useXdpBridgeHelp">
                         <label class="form-check-label" for="useXdpBridge">Use XDP Bridge</label>
-                        <div class="form-text">Use the XDP bridge instead of the Linux Bridge. This remains a manual/power-user netplan workflow.</div>
+                        <div id="useXdpBridgeHelp" class="form-text">XDP does not write Netplan or apply Bridge MTU.</div>
                     </div>
 
                     <div class="mb-3">
@@ -78,6 +78,13 @@
                         </select>
                         <div class="form-text">Pick a different eligible interface for the LAN side.</div>
                     </div>
+
+                    <div class="mb-2">
+                        <label for="bridgeMtu" class="form-label">Bridge MTU</label>
+                        <input type="number" class="form-control" id="bridgeMtu" aria-describedby="bridgeMtuHelp bridgeMtuError">
+                        <div id="bridgeMtuHelp" class="form-text">Applies to the bridge members and br0.</div>
+                        <div id="bridgeMtuError" class="invalid-feedback" role="alert"></div>
+                    </div>
                     <div id="bridgeInterfaceHelp" class="small text-secondary"></div>
                 </div>
             </section>
@@ -87,7 +94,7 @@
             <section class="lqos-config-panel">
                 <div class="lqos-config-section">
                     <h6 class="lqos-config-section-title">Single Interface Mode Configuration</h6>
-                    <div class="lqos-config-section-subtitle">Pick the trunk interface and define the WAN and LAN VLAN IDs that LibreQoS should prepare in managed Netplan.</div>
+                    <div class="lqos-config-section-subtitle">Pick the trunk interface and VLAN IDs for managed Netplan.</div>
 
                     <div class="mb-3">
                         <label for="interface" class="form-label">Interface Name</label>
@@ -107,6 +114,13 @@
                         <label for="networkVlan" class="form-label">LAN VLAN ID</label>
                         <input type="number" class="form-control" id="networkVlan" min="1" max="4094">
                         <div class="form-text">VLAN ID for LAN traffic.</div>
+                    </div>
+
+                    <div class="mb-0 mt-3">
+                        <label for="singleInterfaceMtu" class="form-label">Single Interface MTU</label>
+                        <input type="number" class="form-control" id="singleInterfaceMtu" aria-describedby="singleInterfaceMtuHelp singleInterfaceMtuError">
+                        <div id="singleInterfaceMtuHelp" class="form-text">Applies to the trunk interface.</div>
+                        <div id="singleInterfaceMtuError" class="invalid-feedback" role="alert"></div>
                     </div>
                     <div id="singleInterfaceHelp" class="small text-secondary mt-2"></div>
                 </div>

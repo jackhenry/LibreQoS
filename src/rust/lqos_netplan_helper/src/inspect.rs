@@ -68,6 +68,7 @@ enum RequestedMode {
     LinuxBridge {
         to_internet: String,
         to_network: String,
+        mtu: Option<u32>,
     },
     XdpBridge {
         to_internet: String,
@@ -75,6 +76,7 @@ enum RequestedMode {
     },
     SingleInterface {
         interface: String,
+        mtu: Option<u32>,
     },
     Unknown,
 }
@@ -307,11 +309,13 @@ fn requested_mode(config: &Config) -> RequestedMode {
             RequestedMode::LinuxBridge {
                 to_internet: bridge.to_internet.trim().to_string(),
                 to_network: bridge.to_network.trim().to_string(),
+                mtu: bridge.mtu,
             }
         }
     } else if let Some(single) = &config.single_interface {
         RequestedMode::SingleInterface {
             interface: single.interface.trim().to_string(),
+            mtu: single.mtu,
         }
     } else {
         RequestedMode::Unknown
@@ -332,6 +336,7 @@ fn selected_interfaces(mode: &RequestedMode) -> Vec<String> {
         RequestedMode::LinuxBridge {
             to_internet,
             to_network,
+            ..
         }
         | RequestedMode::XdpBridge {
             to_internet,
@@ -340,7 +345,7 @@ fn selected_interfaces(mode: &RequestedMode) -> Vec<String> {
             .into_iter()
             .filter(|iface| !iface.is_empty())
             .collect(),
-        RequestedMode::SingleInterface { interface } => {
+        RequestedMode::SingleInterface { interface, .. } => {
             if interface.is_empty() {
                 Vec::new()
             } else {
@@ -351,21 +356,38 @@ fn selected_interfaces(mode: &RequestedMode) -> Vec<String> {
     }
 }
 
+fn mtu_yaml_line(mtu: Option<u32>, indent: &str) -> String {
+    mtu.map(|value| format!("{indent}mtu: {value}\n"))
+        .unwrap_or_default()
+}
+
+fn managed_linux_bridge_yaml(to_internet: &str, to_network: &str, mtu: Option<u32>) -> String {
+    let ethernet_mtu = mtu_yaml_line(mtu, "      ");
+    let bridge_mtu = mtu_yaml_line(mtu, "      ");
+    format!(
+        "network:\n  version: 2\n  ethernets:\n    {to_internet}:\n      dhcp4: false\n      dhcp6: false\n{ethernet_mtu}    {to_network}:\n      dhcp4: false\n      dhcp6: false\n{ethernet_mtu}  bridges:\n    br0:\n{bridge_mtu}      interfaces:\n        - {to_internet}\n        - {to_network}\n"
+    )
+}
+
+fn managed_single_interface_yaml(interface: &str, mtu: Option<u32>) -> String {
+    let mtu_line = mtu_yaml_line(mtu, "      ");
+    format!(
+        "network:\n  version: 2\n  ethernets:\n    {interface}:\n      dhcp4: false\n      dhcp6: false\n{mtu_line}"
+    )
+}
+
 fn managed_preview_yaml(mode: &RequestedMode) -> (Option<String>, Option<String>) {
     match mode {
         RequestedMode::LinuxBridge {
             to_internet,
             to_network,
+            mtu,
         } if !to_internet.is_empty() && !to_network.is_empty() => (
-            Some(format!(
-                "network:\n  version: 2\n  ethernets:\n    {to_internet}:\n      dhcp4: false\n      dhcp6: false\n    {to_network}:\n      dhcp4: false\n      dhcp6: false\n  bridges:\n    br0:\n      interfaces:\n        - {to_internet}\n        - {to_network}\n"
-            )),
+            Some(managed_linux_bridge_yaml(to_internet, to_network, *mtu)),
             None,
         ),
-        RequestedMode::SingleInterface { interface } if !interface.is_empty() => (
-            Some(format!(
-                "network:\n  version: 2\n  ethernets:\n    {interface}:\n      dhcp4: false\n      dhcp6: false\n"
-            )),
+        RequestedMode::SingleInterface { interface, mtu } if !interface.is_empty() => (
+            Some(managed_single_interface_yaml(interface, *mtu)),
             None,
         ),
         RequestedMode::XdpBridge { .. } => (
@@ -598,6 +620,7 @@ pub(crate) fn adoption_rewrite_for_path(path: &Path, config: &Config) -> Result<
         RequestedMode::LinuxBridge {
             to_internet,
             to_network,
+            ..
         } => {
             let mut removed_bridge = false;
             doc.network.ethernets.remove(&to_internet);
@@ -618,7 +641,7 @@ pub(crate) fn adoption_rewrite_for_path(path: &Path, config: &Config) -> Result<
                 ));
             }
         }
-        RequestedMode::SingleInterface { interface } => {
+        RequestedMode::SingleInterface { interface, .. } => {
             if doc.network.ethernets.remove(&interface).is_none() {
                 return Err(format!(
                     "Unable to find interface {interface} in {} for adoption.",
@@ -658,6 +681,7 @@ fn assess_file(path: &Path, doc: &NetplanDocument, mode: &RequestedMode) -> File
         RequestedMode::LinuxBridge {
             to_internet,
             to_network,
+            ..
         } => {
             for iface in [to_internet, to_network] {
                 if let Some(cfg) = doc.network.ethernets.get(iface) {
@@ -724,7 +748,7 @@ fn assess_file(path: &Path, doc: &NetplanDocument, mode: &RequestedMode) -> File
                 }
             }
         }
-        RequestedMode::SingleInterface { interface } => {
+        RequestedMode::SingleInterface { interface, .. } => {
             if let Some(cfg) = doc.network.ethernets.get(interface) {
                 relevant.insert(interface.clone());
                 if cfg.dhcp_disabled() && !cfg.has_l3_config() {
@@ -1113,6 +1137,7 @@ mod tests {
                 use_xdp_bridge: false,
                 to_internet: "ens19".to_string(),
                 to_network: "ens20".to_string(),
+                mtu: None,
             }),
             single_interface: None,
             ..lqos_config::Config::default()
@@ -1126,6 +1151,7 @@ mod tests {
                 interface: "ens19".to_string(),
                 internet_vlan: 2,
                 network_vlan: 3,
+                mtu: None,
             }),
             ..lqos_config::Config::default()
         }
@@ -1142,6 +1168,102 @@ mod tests {
 
     fn queue_caps() -> BTreeMap<String, bool> {
         BTreeMap::from([("ens19".to_string(), true), ("ens20".to_string(), true)])
+    }
+
+    #[test]
+    fn managed_linux_bridge_preview_includes_mtu_on_members_and_bridge() {
+        let mut config = linux_bridge_config();
+        config.bridge.as_mut().expect("bridge").mtu = Some(9000);
+        let root = test_env("bridge-mtu-preview");
+
+        let inspection = inspect_network_mode_with_paths(
+            &config,
+            &root.join("netplan"),
+            &root.join("pending"),
+            &BTreeSet::from(["ens19".to_string(), "ens20".to_string()]),
+            &queue_caps(),
+        );
+        let preview = inspection
+            .managed_preview_yaml
+            .expect("managed preview should exist");
+
+        assert_eq!(
+            preview,
+            "network:\n  version: 2\n  ethernets:\n    ens19:\n      dhcp4: false\n      dhcp6: false\n      mtu: 9000\n    ens20:\n      dhcp4: false\n      dhcp6: false\n      mtu: 9000\n  bridges:\n    br0:\n      mtu: 9000\n      interfaces:\n        - ens19\n        - ens20\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_single_interface_preview_includes_mtu_on_trunk() {
+        let mut config = single_interface_config();
+        config
+            .single_interface
+            .as_mut()
+            .expect("single interface")
+            .mtu = Some(1500);
+
+        let root = test_env("single-mtu-preview");
+        let inspection = inspect_network_mode_with_paths(
+            &config,
+            &root.join("netplan"),
+            &root.join("pending"),
+            &BTreeSet::from(["ens19".to_string()]),
+            &BTreeMap::from([("ens19".to_string(), true)]),
+        );
+        let preview = inspection
+            .managed_preview_yaml
+            .expect("managed preview should exist");
+
+        assert_eq!(
+            preview,
+            "network:\n  version: 2\n  ethernets:\n    ens19:\n      dhcp4: false\n      dhcp6: false\n      mtu: 1500\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_previews_omit_mtu_when_unset() {
+        let root = test_env("unset-mtu-preview");
+        let inspection = inspect_network_mode_with_paths(
+            &linux_bridge_config(),
+            &root.join("netplan"),
+            &root.join("pending"),
+            &BTreeSet::from(["ens19".to_string(), "ens20".to_string()]),
+            &queue_caps(),
+        );
+        let preview = inspection
+            .managed_preview_yaml
+            .expect("managed preview should exist");
+
+        assert!(!preview.contains("mtu:"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn xdp_bridge_mode_keeps_managed_preview_disabled() {
+        let mut config = linux_bridge_config();
+        let bridge = config.bridge.as_mut().expect("bridge");
+        bridge.use_xdp_bridge = true;
+        bridge.mtu = Some(9000);
+
+        let root = test_env("xdp-mtu-preview");
+        let inspection = inspect_network_mode_with_paths(
+            &config,
+            &root.join("netplan"),
+            &root.join("pending"),
+            &BTreeSet::from(["ens19".to_string(), "ens20".to_string()]),
+            &queue_caps(),
+        );
+
+        assert!(inspection.managed_preview_yaml.is_none());
+        assert!(
+            inspection
+                .preview_note
+                .as_deref()
+                .is_some_and(|note| note.contains("manual workflow"))
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

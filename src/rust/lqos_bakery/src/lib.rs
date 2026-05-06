@@ -11294,6 +11294,7 @@ mod tests {
                     use_xdp_bridge: false,
                     to_internet: "lo".to_string(),
                     to_network: "lo".to_string(),
+                    mtu: None,
                 }),
                 ..lqos_config::Config::default()
             };
@@ -13142,6 +13143,7 @@ mod tests {
                 use_xdp_bridge: false,
                 to_internet: "__bakery-missing-wan__".to_string(),
                 to_network: "__bakery-missing-lan__".to_string(),
+                mtu: None,
             }),
             ..Config::default()
         };
