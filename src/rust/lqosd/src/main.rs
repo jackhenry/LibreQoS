@@ -383,7 +383,7 @@ fn main() -> Result<()> {
                                 let _ = throughput_tracker::flow_data::setup_flow_analysis();
                                 start_heimdall()?;
                                 spawn_queue_structure_monitor()?;
-                                shaped_devices_tracker::shaping_inputs_watcher()?;
+                                shaped_devices_tracker::topology_runtime_status_watcher()?;
                                 throughput_tracker::spawn_throughput_monitor(
                                     flow_tx,
                                     system_usage_tx.clone(),

@@ -1696,6 +1696,13 @@ pub fn publish_topology_runtime_status(
         ready,
         error,
     );
+    if TopologyRuntimeStatusFile::load(config)
+        .ok()
+        .as_ref()
+        .is_some_and(|current| current.semantic_equals_for_publish(&status))
+    {
+        return Ok(());
+    }
     status.save(config).with_context(|| {
         format!(
             "Unable to publish topology runtime status at {:?}",

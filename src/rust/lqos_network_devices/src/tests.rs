@@ -431,8 +431,8 @@ fn load_shaped_devices_uses_topology_import_when_runtime_inputs_are_empty() {
 
     let loaded = load_shaped_devices_for_config(&config)
         .expect("preferred shaped-device source should load");
-    assert_eq!(loaded.devices.len(), 1);
-    assert_eq!(loaded.devices[0].circuit_id, "import-circuit");
+    assert_eq!(loaded.shaped.devices.len(), 1);
+    assert_eq!(loaded.shaped.devices[0].circuit_id, "import-circuit");
 }
 
 #[test]
@@ -493,8 +493,8 @@ fn load_shaped_devices_uses_topology_import_when_runtime_is_not_ready() {
 
     let loaded =
         load_shaped_devices_for_config(&config).expect("topology import fallback should load");
-    assert_eq!(loaded.devices.len(), 1);
-    assert_eq!(loaded.devices[0].circuit_id, "import-circuit");
+    assert_eq!(loaded.shaped.devices.len(), 1);
+    assert_eq!(loaded.shaped.devices[0].circuit_id, "import-circuit");
 }
 
 #[test]
@@ -534,7 +534,7 @@ fn load_shaped_devices_stays_empty_when_topology_import_is_empty() {
 
     let loaded =
         load_shaped_devices_for_config(&config).expect("integration mode should stay empty");
-    assert!(loaded.devices.is_empty());
+    assert!(loaded.shaped.devices.is_empty());
 }
 
 #[test]
@@ -582,8 +582,8 @@ fn load_shaped_devices_ignores_stale_runtime_inputs_in_manual_mode() {
 
     let loaded =
         load_shaped_devices_for_config(&config).expect("manual mode should use shaped devices csv");
-    assert_eq!(loaded.devices.len(), 1);
-    assert_eq!(loaded.devices[0].circuit_id, "csv-circuit");
+    assert_eq!(loaded.shaped.devices.len(), 1);
+    assert_eq!(loaded.shaped.devices[0].circuit_id, "csv-circuit");
 }
 
 #[test]
@@ -610,5 +610,5 @@ fn load_shaped_devices_stays_empty_when_runtime_status_is_malformed() {
 
     let loaded =
         load_shaped_devices_for_config(&config).expect("malformed status should stay empty");
-    assert!(loaded.devices.is_empty());
+    assert!(loaded.shaped.devices.is_empty());
 }

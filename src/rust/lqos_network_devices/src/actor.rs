@@ -3,12 +3,17 @@ use crate::dynamic::{
 };
 use crate::dynamic_store::{load_dynamic_circuits_from_disk, persist_dynamic_circuits_to_disk};
 use crate::state;
-use crate::{DaemonHooks, ShapedDevicesCatalog, load_network_json, load_shaped_devices};
+use crate::{
+    DaemonHooks, LoadedShapedDevices, LoadedShapedDevicesSource, ShapedDevicesCatalog,
+    ShapedDevicesSnapshotProvenance, load_network_json, load_shaped_devices_with_source,
+};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender};
 use ip_network_table::IpNetworkTable;
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,11 +74,13 @@ pub(crate) fn request_reload_network_json(reason: &str) -> Result<()> {
 pub(crate) fn apply_shaped_devices_snapshot(
     reason: &str,
     shaped: lqos_config::ConfigShapedDevices,
+    provenance: ShapedDevicesSnapshotProvenance,
 ) -> Result<()> {
     let (reply_tx, reply_rx) = oneshot::channel();
     sender()?.send(NetworkDevicesCommand::ApplyShapedDevicesSnapshot {
         reason: reason.to_string(),
         shaped: Box::new(shaped),
+        provenance,
         reply: reply_tx,
     })?;
     reply_rx
@@ -128,6 +135,7 @@ enum NetworkDevicesCommand {
     ApplyShapedDevicesSnapshot {
         reason: String,
         shaped: Box<lqos_config::ConfigShapedDevices>,
+        provenance: ShapedDevicesSnapshotProvenance,
         reply: oneshot::Sender<Result<()>>,
     },
     ReportObservations {
@@ -145,8 +153,11 @@ enum NetworkDevicesCommand {
 
 fn actor_loop(rx: Receiver<NetworkDevicesCommand>, hooks: Option<Arc<dyn DaemonHooks>>) {
     debug!("lqos_network_devices actor starting");
+    let mut active_shaped_key = None;
 
-    if let Err(err) = reload_shaped_devices_inner("startup", hooks.as_deref()) {
+    if let Err(err) =
+        reload_shaped_devices_inner("startup", hooks.as_deref(), &mut active_shaped_key)
+    {
         warn!("Initial shaped-devices load failed: {err}");
     }
     if let Err(err) = reload_network_json_inner("startup", hooks.as_deref()) {
@@ -169,7 +180,11 @@ fn actor_loop(rx: Receiver<NetworkDevicesCommand>, hooks: Option<Arc<dyn DaemonH
 
                 match command {
                     NetworkDevicesCommand::ReloadShapedDevices { reason, reply } => {
-                        let result = reload_shaped_devices_inner(&reason, hooks.as_deref());
+                        let result = reload_shaped_devices_inner(
+                            &reason,
+                            hooks.as_deref(),
+                            &mut active_shaped_key,
+                        );
                         let _ = reply.send(result);
                     }
                     NetworkDevicesCommand::ReloadNetworkJson { reason, reply } => {
@@ -179,15 +194,18 @@ fn actor_loop(rx: Receiver<NetworkDevicesCommand>, hooks: Option<Arc<dyn DaemonH
                     NetworkDevicesCommand::ApplyShapedDevicesSnapshot {
                         reason,
                         shaped,
+                        provenance,
                         reply,
                     } => {
-                        debug!("Publishing shaped-devices snapshot reason={reason}");
-                        state::publish_shaped_devices(*shaped);
-                        prune_dynamic_circuits_superseded_by_shaped_devices_inner(hooks.as_deref());
-                        if let Some(hooks) = &hooks {
-                            hooks.on_shaped_devices_updated();
-                        }
-                        let _ = reply.send(Ok(()));
+                        let key = shaped_devices_key_for_snapshot(provenance, &shaped);
+                        let result = publish_shaped_devices_if_changed(
+                            &reason,
+                            *shaped,
+                            key,
+                            hooks.as_deref(),
+                            &mut active_shaped_key,
+                        );
+                        let _ = reply.send(result);
                     }
                     NetworkDevicesCommand::ReportObservations { observations } => {
                         handle_observations(&observations, hooks.as_deref());
@@ -222,6 +240,119 @@ fn recompute_hashes(device: &mut lqos_config::ShapedDevice) {
     device.circuit_hash = lqos_utils::hash_to_i64(&device.circuit_id);
     device.device_hash = lqos_utils::hash_to_i64(&device.device_id);
     device.parent_hash = lqos_utils::hash_to_i64(&device.parent_node);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShapedDevicesProvenanceKey {
+    RuntimeTopology {
+        shaping_generation: String,
+    },
+    TopologyImport {
+        devices_fingerprint: u64,
+    },
+    Csv {
+        devices_fingerprint: u64,
+    },
+    ExternalSnapshot {
+        devices_fingerprint: u64,
+    },
+}
+
+#[derive(Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ShapedDeviceSemanticKey {
+    circuit_id: String,
+    circuit_name: String,
+    device_id: String,
+    device_name: String,
+    parent_node: String,
+    parent_node_id: Option<String>,
+    anchor_node_id: Option<String>,
+    mac: String,
+    ipv4: Vec<(std::net::Ipv4Addr, u32)>,
+    ipv6: Vec<(std::net::Ipv6Addr, u32)>,
+    download_min_mbps_bits: u32,
+    upload_min_mbps_bits: u32,
+    download_max_mbps_bits: u32,
+    upload_max_mbps_bits: u32,
+    comment: String,
+    sqm_override: Option<String>,
+    circuit_hash: i64,
+    device_hash: i64,
+    parent_hash: i64,
+}
+
+fn shaped_device_semantic_key(device: &lqos_config::ShapedDevice) -> ShapedDeviceSemanticKey {
+    let mut ipv4 = device.ipv4.clone();
+    ipv4.sort_unstable();
+    let mut ipv6 = device.ipv6.clone();
+    ipv6.sort_unstable();
+
+    ShapedDeviceSemanticKey {
+        circuit_id: device.circuit_id.clone(),
+        circuit_name: device.circuit_name.clone(),
+        device_id: device.device_id.clone(),
+        device_name: device.device_name.clone(),
+        parent_node: device.parent_node.clone(),
+        parent_node_id: device.parent_node_id.clone(),
+        anchor_node_id: device.anchor_node_id.clone(),
+        mac: device.mac.clone(),
+        ipv4,
+        ipv6,
+        download_min_mbps_bits: device.download_min_mbps.to_bits(),
+        upload_min_mbps_bits: device.upload_min_mbps.to_bits(),
+        download_max_mbps_bits: device.download_max_mbps.to_bits(),
+        upload_max_mbps_bits: device.upload_max_mbps.to_bits(),
+        comment: device.comment.clone(),
+        sqm_override: device.sqm_override.clone(),
+        circuit_hash: device.circuit_hash,
+        device_hash: device.device_hash,
+        parent_hash: device.parent_hash,
+    }
+}
+
+fn shaped_devices_fingerprint(devices: &[lqos_config::ShapedDevice]) -> u64 {
+    let mut sorted = devices
+        .iter()
+        .map(shaped_device_semantic_key)
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    for key in sorted {
+        key.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn shaped_devices_key_for_loaded(loaded: &LoadedShapedDevices) -> ShapedDevicesProvenanceKey {
+    match &loaded.source {
+        LoadedShapedDevicesSource::RuntimeTopology {
+            shaping_generation,
+            ..
+        } => ShapedDevicesProvenanceKey::RuntimeTopology {
+            shaping_generation: shaping_generation.clone(),
+        },
+        LoadedShapedDevicesSource::TopologyImport => {
+            ShapedDevicesProvenanceKey::TopologyImport {
+                devices_fingerprint: shaped_devices_fingerprint(&loaded.shaped.devices),
+            }
+        }
+        LoadedShapedDevicesSource::Csv => ShapedDevicesProvenanceKey::Csv {
+            devices_fingerprint: shaped_devices_fingerprint(&loaded.shaped.devices),
+        },
+    }
+}
+
+fn shaped_devices_key_for_snapshot(
+    provenance: ShapedDevicesSnapshotProvenance,
+    shaped: &lqos_config::ConfigShapedDevices,
+) -> ShapedDevicesProvenanceKey {
+    match provenance {
+        ShapedDevicesSnapshotProvenance::ExternalSnapshot => {
+            ShapedDevicesProvenanceKey::ExternalSnapshot {
+                devices_fingerprint: shaped_devices_fingerprint(&shaped.devices),
+            }
+        }
+    }
 }
 
 fn reload_dynamic_circuits_inner(reason: &str) {
@@ -562,17 +693,45 @@ fn shaped_device_from_unknown_ip(
     device
 }
 
-fn reload_shaped_devices_inner(reason: &str, hooks: Option<&dyn DaemonHooks>) -> Result<()> {
+fn publish_shaped_devices_if_changed(
+    reason: &str,
+    shaped: lqos_config::ConfigShapedDevices,
+    key: ShapedDevicesProvenanceKey,
+    hooks: Option<&dyn DaemonHooks>,
+    active_key: &mut Option<ShapedDevicesProvenanceKey>,
+) -> Result<()> {
+    if active_key.as_ref() == Some(&key) {
+        debug!("Skipping unchanged shaped-devices snapshot reason={reason}");
+        return Ok(());
+    }
+
+    debug!("Publishing shaped-devices snapshot reason={reason}");
+    state::publish_shaped_devices(shaped);
+    *active_key = Some(key);
+    prune_dynamic_circuits_superseded_by_shaped_devices_inner(hooks);
+    if let Some(hooks) = hooks {
+        hooks.on_shaped_devices_updated();
+    }
+    Ok(())
+}
+
+fn reload_shaped_devices_inner(
+    reason: &str,
+    hooks: Option<&dyn DaemonHooks>,
+    active_key: &mut Option<ShapedDevicesProvenanceKey>,
+) -> Result<()> {
     for attempt in 1..=RELOAD_ATTEMPTS {
-        match load_shaped_devices() {
-            Ok(shaped) => {
+        match load_shaped_devices_with_source() {
+            Ok(loaded) => {
                 debug!("Loaded shaped devices reason={reason}");
-                state::publish_shaped_devices(shaped);
-                prune_dynamic_circuits_superseded_by_shaped_devices_inner(hooks);
-                if let Some(hooks) = hooks {
-                    hooks.on_shaped_devices_updated();
-                }
-                return Ok(());
+                let key = shaped_devices_key_for_loaded(&loaded);
+                return publish_shaped_devices_if_changed(
+                    reason,
+                    loaded.shaped,
+                    key,
+                    hooks,
+                    active_key,
+                );
             }
             Err(err) if attempt < RELOAD_ATTEMPTS => {
                 warn!(
@@ -681,4 +840,86 @@ fn reload_network_json_inner(reason: &str, hooks: Option<&dyn DaemonHooks>) -> R
         }
     }
     unreachable!("reload loop must return");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shaped_devices_fingerprint;
+
+    fn shaped_device(circuit_id: &str, device_id: &str) -> lqos_config::ShapedDevice {
+        let mut device = lqos_config::ShapedDevice {
+            circuit_id: circuit_id.to_string(),
+            circuit_name: circuit_id.to_string(),
+            device_id: device_id.to_string(),
+            device_name: device_id.to_string(),
+            parent_node: "Tower A".to_string(),
+            ipv4: vec![("192.0.2.1".parse().expect("valid IP"), 32)],
+            download_min_mbps: 10.0,
+            upload_min_mbps: 10.0,
+            download_max_mbps: 100.0,
+            upload_max_mbps: 100.0,
+            ..lqos_config::ShapedDevice::default()
+        };
+        device.circuit_hash = lqos_utils::hash_to_i64(&device.circuit_id);
+        device.device_hash = lqos_utils::hash_to_i64(&device.device_id);
+        device.parent_hash = lqos_utils::hash_to_i64(&device.parent_node);
+        device
+    }
+
+    #[test]
+    fn shaped_devices_fingerprint_ignores_row_order() {
+        let first = vec![
+            shaped_device("circuit-1", "device-1"),
+            shaped_device("circuit-2", "device-2"),
+        ];
+        let second = vec![
+            shaped_device("circuit-2", "device-2"),
+            shaped_device("circuit-1", "device-1"),
+        ];
+
+        assert_eq!(
+            shaped_devices_fingerprint(&first),
+            shaped_devices_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn shaped_devices_fingerprint_ignores_address_order() {
+        let first = vec![shaped_device("circuit-1", "device-1")];
+        let mut second = vec![shaped_device("circuit-1", "device-1")];
+        second[0].ipv4 = vec![
+            ("192.0.2.2".parse().expect("valid IPv4"), 32),
+            ("192.0.2.1".parse().expect("valid IPv4"), 32),
+        ];
+        second[0].ipv6 = vec![
+            ("2001:db8::2".parse().expect("valid IPv6"), 128),
+            ("2001:db8::1".parse().expect("valid IPv6"), 128),
+        ];
+        let mut first = first;
+        first[0].ipv4 = vec![
+            ("192.0.2.1".parse().expect("valid IPv4"), 32),
+            ("192.0.2.2".parse().expect("valid IPv4"), 32),
+        ];
+        first[0].ipv6 = vec![
+            ("2001:db8::1".parse().expect("valid IPv6"), 128),
+            ("2001:db8::2".parse().expect("valid IPv6"), 128),
+        ];
+
+        assert_eq!(
+            shaped_devices_fingerprint(&first),
+            shaped_devices_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn shaped_devices_fingerprint_detects_payload_changes() {
+        let first = vec![shaped_device("circuit-1", "device-1")];
+        let mut second = vec![shaped_device("circuit-1", "device-1")];
+        second[0].download_max_mbps = 200.0;
+
+        assert_ne!(
+            shaped_devices_fingerprint(&first),
+            shaped_devices_fingerprint(&second)
+        );
+    }
 }
