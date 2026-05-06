@@ -157,10 +157,20 @@ install -m 0644 /opt/libreqos/src/bin/lqos_api.service.example /etc/systemd/syst
 install -m 0644 /opt/libreqos/src/bin/lqos_setup.service.example /etc/systemd/system/lqos_setup.service
 /bin/rm -f /etc/systemd/system/lqos_netplan_helper.service || true
 /bin/systemctl daemon-reload || true
-/bin/systemctl stop lqos_node_manager || true # In case it's running from a previous release
-/bin/systemctl disable lqos_node_manager || true # In case it's running from a previous release
-/bin/systemctl stop lqos_netplan_helper || true
-/bin/systemctl disable lqos_netplan_helper || true
+
+unit_stop_disable_if_present() {
+local unit="$1"
+if /bin/systemctl cat "${unit}" >/dev/null 2>&1 \
+    || [ -e "/etc/systemd/system/${unit}" ] \
+    || [ -e "/lib/systemd/system/${unit}" ] \
+    || [ -e "/usr/lib/systemd/system/${unit}" ]; then
+    /bin/systemctl stop "${unit}" || true
+    /bin/systemctl disable "${unit}" || true
+fi
+}
+
+unit_stop_disable_if_present lqos_node_manager.service # In case it's running from a previous release
+unit_stop_disable_if_present lqos_netplan_helper.service
 case "$(/opt/libreqos/src/bin/lqos_setup postinst-action)" in
 activate_runtime)
   /opt/libreqos/src/bin/lqos_setup activate-runtime
