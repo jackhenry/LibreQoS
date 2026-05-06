@@ -1130,15 +1130,15 @@ impl OverrideStore {
     ///
     /// This function reads override files from the config's LibreQoS directory without
     /// reloading `/etc/lqos.conf`.
+    ///
+    /// Side effects: reads override files from disk and may create the operator
+    /// overrides file if it does not exist.
     pub fn load_effective_for_config(
         config: &lqos_config::Config,
         apply_stormguard: bool,
         apply_treeguard: bool,
     ) -> Result<OverrideFile> {
-        let lock = FileLock::new()?;
-        let merged = Self::load_effective_for_config_inner(config, apply_stormguard, apply_treeguard)?;
-        drop(lock);
-        Ok(merged)
+        Self::load_effective_for_config_inner(config, apply_stormguard, apply_treeguard)
     }
 
     fn load_effective_for_config_inner(
