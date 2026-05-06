@@ -1047,6 +1047,10 @@ fn handle_bus_requests(requests: &[BusRequest], responses: &mut Vec<BusResponse>
                 urgent::clear(*id);
                 BusResponse::Ack
             }
+            BusRequest::ClearUrgentIssueByIdentity { code, dedupe_key } => {
+                urgent::clear_by_identity(code, dedupe_key);
+                BusResponse::Ack
+            }
             BusRequest::ClearAllUrgentIssues => {
                 urgent::clear_all();
                 BusResponse::Ack
@@ -1388,5 +1392,35 @@ fn search_result_to_bus(entry: node_manager::SearchResult) -> lqos_bus::SearchRe
         node_manager::SearchResult::Site { idx, name } => {
             lqos_bus::SearchResultEntry::Site { idx, name }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lqos_bus::{UrgentSeverity, UrgentSource};
+
+    #[test]
+    fn bus_clear_urgent_issue_by_identity_reaches_urgent_store() {
+        let code = "TEST_BUS_XDP_IP_MAPPING_APPLY_FAILED";
+        urgent::clear_by_identity(code, code);
+        urgent::submit(
+            UrgentSource::LibreQoS,
+            UrgentSeverity::Error,
+            code.to_string(),
+            "mapping failed".to_string(),
+            None,
+            Some(code.to_string()),
+        );
+
+        let requests = [BusRequest::ClearUrgentIssueByIdentity {
+            code: code.to_string(),
+            dedupe_key: code.to_string(),
+        }];
+        let mut responses = Vec::new();
+        handle_bus_requests(&requests, &mut responses);
+
+        assert!(matches!(responses.as_slice(), [BusResponse::Ack]));
+        assert!(!urgent::list().iter().any(|issue| issue.code == code));
     }
 }
