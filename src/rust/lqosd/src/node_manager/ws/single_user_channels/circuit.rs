@@ -1,5 +1,6 @@
 use crate::node_manager::local_api::circuit_activity::{CircuitSummaryData, circuit_flow_counts};
 use crate::node_manager::ws::messages::{CircuitDevicesResult, WsResponse, encode_ws_message};
+use crate::node_manager::ws::single_user_channels::try_send_private_payload;
 use crate::node_manager::ws::ticker::all_circuits;
 use crate::rtt_exclusions;
 use crate::throughput_tracker::{circuit_current_qoo, circuit_current_rtt_p50_nanos};
@@ -121,7 +122,7 @@ pub(super) async fn circuit_watcher(
         };
 
         if let Ok(payload) = encode_ws_message(&response) {
-            if tx.send(payload).await.is_err() {
+            if !try_send_private_payload(&tx, payload, "CircuitWatcher") {
                 info!("CircuitWatcher channel is gone");
                 break;
             }

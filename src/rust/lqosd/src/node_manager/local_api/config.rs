@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::http::header;
 use default_net::get_interfaces;
-use lqos_bus::{BusRequest, BusResponse, bus_request};
+use lqos_bus::{BusRequest, BusResponse, bus_request_with_timeout};
 use lqos_config::{
     Config, ConfigShapedDevices, NetworkJson, ShapedDevice, UserRole, WebUser, WebUsers,
 };
@@ -17,13 +17,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Cursor, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const COBRAND_FILE_NAME: &str = "cobrand.png";
 const COBRAND_DISPLAY_HEIGHT_PX: u64 = 48;
 const COBRAND_MAX_DISPLAY_WIDTH_PX: u64 = 176;
 const COBRAND_MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+const CONFIG_BUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CobrandUploadValidationError {
@@ -803,9 +804,12 @@ pub async fn update_lqosd_config_data(
     let existing =
         lqos_config::load_config().map_err(|_| "Unable to load the current config".to_string())?;
     apply_secret_updates(existing.as_ref(), &mut config, &clear_secrets);
-    let mut responses = bus_request(vec![BusRequest::UpdateLqosdConfig(Box::new(config))])
-        .await
-        .map_err(|err| format!("Unable to update config: {err}"))?;
+    let mut responses = bus_request_with_timeout(
+        vec![BusRequest::UpdateLqosdConfig(Box::new(config))],
+        CONFIG_BUS_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|err| format!("Unable to update config: {err}"))?;
 
     match responses.pop() {
         Some(BusResponse::Ack) => Ok(()),

@@ -8,7 +8,7 @@ use crate::{
     ShapedDevicesSnapshotProvenance, load_network_json, load_shaped_devices_with_source,
 };
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 use ip_network_table::IpNetworkTable;
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
@@ -17,11 +17,11 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 const RELOAD_RETRY_DELAY_MS: u64 = 500;
 const RELOAD_ATTEMPTS: usize = 2;
+const ACTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DYNAMIC_CIRCUITS_MAINTENANCE_TICK_SECONDS: u64 = 60;
 const MAX_UNKNOWN_IP_PROMOTIONS_PER_OBSERVATION: usize = 32;
 
@@ -49,26 +49,51 @@ fn sender() -> Result<Sender<NetworkDevicesCommand>> {
         .ok_or_else(|| anyhow!("lqos_network_devices runtime actor is not running"))
 }
 
+fn send_actor_command(command: NetworkDevicesCommand, operation: &str) -> Result<()> {
+    sender()?
+        .send_timeout(command, ACTOR_COMMAND_TIMEOUT)
+        .map_err(|err| match err {
+            SendTimeoutError::Timeout(_) => {
+                anyhow!("{operation} timed out while queueing lqos_network_devices actor command")
+            }
+            SendTimeoutError::Disconnected(_) => {
+                anyhow!("{operation} failed because lqos_network_devices actor stopped")
+            }
+        })
+}
+
+fn receive_actor_reply<T>(reply_rx: Receiver<Result<T>>, operation: &str) -> Result<T> {
+    match reply_rx.recv_timeout(ACTOR_COMMAND_TIMEOUT) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            Err(anyhow!("{operation} timed out waiting for actor reply"))
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(anyhow!("{operation} reply channel closed")),
+    }
+}
+
 pub(crate) fn request_reload_shaped_devices(reason: &str) -> Result<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    sender()?.send(NetworkDevicesCommand::ReloadShapedDevices {
-        reason: reason.to_string(),
-        reply: reply_tx,
-    })?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| anyhow!("ShapedDevices reload reply channel closed"))?
+    let (reply_tx, reply_rx) = bounded(1);
+    send_actor_command(
+        NetworkDevicesCommand::ReloadShapedDevices {
+            reason: reason.to_string(),
+            reply: reply_tx,
+        },
+        "ShapedDevices reload",
+    )?;
+    receive_actor_reply(reply_rx, "ShapedDevices reload")
 }
 
 pub(crate) fn request_reload_network_json(reason: &str) -> Result<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    sender()?.send(NetworkDevicesCommand::ReloadNetworkJson {
-        reason: reason.to_string(),
-        reply: reply_tx,
-    })?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| anyhow!("NetworkJson reload reply channel closed"))?
+    let (reply_tx, reply_rx) = bounded(1);
+    send_actor_command(
+        NetworkDevicesCommand::ReloadNetworkJson {
+            reason: reason.to_string(),
+            reply: reply_tx,
+        },
+        "NetworkJson reload",
+    )?;
+    receive_actor_reply(reply_rx, "NetworkJson reload")
 }
 
 pub(crate) fn apply_shaped_devices_snapshot(
@@ -76,16 +101,17 @@ pub(crate) fn apply_shaped_devices_snapshot(
     shaped: lqos_config::ConfigShapedDevices,
     provenance: ShapedDevicesSnapshotProvenance,
 ) -> Result<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    sender()?.send(NetworkDevicesCommand::ApplyShapedDevicesSnapshot {
-        reason: reason.to_string(),
-        shaped: Box::new(shaped),
-        provenance,
-        reply: reply_tx,
-    })?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| anyhow!("Apply shaped devices reply channel closed"))?
+    let (reply_tx, reply_rx) = bounded(1);
+    send_actor_command(
+        NetworkDevicesCommand::ApplyShapedDevicesSnapshot {
+            reason: reason.to_string(),
+            shaped: Box::new(shaped),
+            provenance,
+            reply: reply_tx,
+        },
+        "Apply shaped devices",
+    )?;
+    receive_actor_reply(reply_rx, "Apply shaped devices")
 }
 
 pub(crate) fn report_observations(observations: &[CircuitObservation]) {
@@ -102,52 +128,54 @@ pub(crate) fn report_observations(observations: &[CircuitObservation]) {
 }
 
 pub(crate) fn upsert_dynamic_circuit(shaped_device: lqos_config::ShapedDevice) -> Result<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    sender()?.send(NetworkDevicesCommand::UpsertDynamicCircuit {
-        shaped_device: Box::new(shaped_device),
-        reply: reply_tx,
-    })?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| anyhow!("Upsert dynamic circuit reply channel closed"))?
+    let (reply_tx, reply_rx) = bounded(1);
+    send_actor_command(
+        NetworkDevicesCommand::UpsertDynamicCircuit {
+            shaped_device: Box::new(shaped_device),
+            reply: reply_tx,
+        },
+        "Upsert dynamic circuit",
+    )?;
+    receive_actor_reply(reply_rx, "Upsert dynamic circuit")
 }
 
 pub(crate) fn remove_dynamic_circuit(circuit_id: &str) -> Result<bool> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    sender()?.send(NetworkDevicesCommand::RemoveDynamicCircuit {
-        circuit_id: circuit_id.to_string(),
-        reply: reply_tx,
-    })?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| anyhow!("Remove dynamic circuit reply channel closed"))?
+    let (reply_tx, reply_rx) = bounded(1);
+    send_actor_command(
+        NetworkDevicesCommand::RemoveDynamicCircuit {
+            circuit_id: circuit_id.to_string(),
+            reply: reply_tx,
+        },
+        "Remove dynamic circuit",
+    )?;
+    receive_actor_reply(reply_rx, "Remove dynamic circuit")
 }
 
 enum NetworkDevicesCommand {
     ReloadShapedDevices {
         reason: String,
-        reply: oneshot::Sender<Result<()>>,
+        reply: Sender<Result<()>>,
     },
     ReloadNetworkJson {
         reason: String,
-        reply: oneshot::Sender<Result<()>>,
+        reply: Sender<Result<()>>,
     },
     ApplyShapedDevicesSnapshot {
         reason: String,
         shaped: Box<lqos_config::ConfigShapedDevices>,
         provenance: ShapedDevicesSnapshotProvenance,
-        reply: oneshot::Sender<Result<()>>,
+        reply: Sender<Result<()>>,
     },
     ReportObservations {
         observations: Vec<CircuitObservation>,
     },
     UpsertDynamicCircuit {
         shaped_device: Box<lqos_config::ShapedDevice>,
-        reply: oneshot::Sender<Result<()>>,
+        reply: Sender<Result<()>>,
     },
     RemoveDynamicCircuit {
         circuit_id: String,
-        reply: oneshot::Sender<Result<bool>>,
+        reply: Sender<Result<bool>>,
     },
 }
 
