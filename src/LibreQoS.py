@@ -51,12 +51,36 @@ from liblqos_python import is_lqosd_alive, clear_ip_mappings, delete_ip_mapping,
     shaping_cpu_count, \
     Bakery
 
-# Optional: urgent issue submission (available in newer liblqos_python)
+# Optional: urgent issue helpers (available in newer liblqos_python)
 try:
     from liblqos_python import submit_urgent_issue  # type: ignore
 except Exception:
     def submit_urgent_issue(*_args, **_kwargs):
         return False
+
+try:
+    from liblqos_python import clear_urgent_issue_by_identity  # type: ignore
+except ImportError:
+    _missing_clear_urgent_issue_by_identity_warned = False
+
+    def clear_urgent_issue_by_identity(*_args, **_kwargs):
+        global _missing_clear_urgent_issue_by_identity_warned
+        if not _missing_clear_urgent_issue_by_identity_warned:
+            logging.warning("Unable to clear recovered urgent issues: liblqos_python helper is unavailable")
+            _missing_clear_urgent_issue_by_identity_warned = True
+        return False
+
+try:
+    from liblqos_python import xdp_ip_mapping_ready  # type: ignore
+except ImportError:
+    _missing_xdp_ip_mapping_ready_warned = False
+
+    def xdp_ip_mapping_ready():
+        global _missing_xdp_ip_mapping_ready_warned
+        if not _missing_xdp_ip_mapping_ready_warned:
+            logging.warning("Unable to check XDP IP mapping readiness: liblqos_python helper is unavailable")
+            _missing_xdp_ip_mapping_ready_warned = True
+        return True
 
 try:
     from liblqos_python import calculate_topology_source_generation  # type: ignore
@@ -78,6 +102,11 @@ class ValidationFailure(RefreshFailure):
     pass
 
 
+XDP_IP_MAPPING_APPLY_FAILED = "XDP_IP_MAPPING_APPLY_FAILED"
+XDP_MAPPING_READY_TIMEOUT_SECONDS = 5.0
+XDP_MAPPING_READY_INTERVAL_SECONDS = 0.1
+
+
 def report_refresh_failure(code, message, context=None, dedupe_key=None):
     logging.error(message)
     print("ERROR: " + message)
@@ -97,6 +126,56 @@ def report_refresh_failure(code, message, context=None, dedupe_key=None):
     except Exception:
         pass
     raise RefreshFailure(message)
+
+
+def wait_for_xdp_ip_mapping_ready(
+    ready=xdp_ip_mapping_ready,
+    sleep=time.sleep,
+    now=time.monotonic,
+    timeout_seconds=XDP_MAPPING_READY_TIMEOUT_SECONDS,
+    interval_seconds=XDP_MAPPING_READY_INTERVAL_SECONDS,
+):
+    deadline = now() + timeout_seconds
+    while now() < deadline:
+        if ready():
+            return
+        sleep(interval_seconds)
+    raise TimeoutError("XDP IP mapping BPF maps are not ready")
+
+
+def apply_xdp_ip_mappings(
+    ip_map_batch,
+    context,
+    ready=xdp_ip_mapping_ready,
+    sleep=time.sleep,
+    report_failure=report_refresh_failure,
+    clear_recovered_issue=clear_urgent_issue_by_identity,
+):
+    try:
+        wait_for_xdp_ip_mapping_ready(ready=ready, sleep=sleep)
+    except (TimeoutError, OSError) as exc:
+        report_failure(
+            XDP_IP_MAPPING_APPLY_FAILED,
+            "Failed to apply XDP IP mappings: " + str(exc),
+            context,
+            XDP_IP_MAPPING_APPLY_FAILED,
+        )
+        return
+    try:
+        ip_map_batch.finish_ip_mappings()
+        ip_map_batch.submit()
+    except OSError as exc:
+        report_failure(
+            XDP_IP_MAPPING_APPLY_FAILED,
+            "Failed to apply XDP IP mappings: " + str(exc),
+            context,
+            XDP_IP_MAPPING_APPLY_FAILED,
+        )
+        return
+    try:
+        clear_recovered_issue(XDP_IP_MAPPING_APPLY_FAILED, XDP_IP_MAPPING_APPLY_FAILED)
+    except OSError as exc:
+        logging.warning("Unable to clear recovered XDP IP mapping urgent issue: %s", exc)
 
 R2Q = 10
 #MAX_R2Q = 200_000
@@ -2757,20 +2836,14 @@ def refreshShapers():
                 print("Observe mode active; skipping XDP-CPUMAP-TC IP filter apply after clearing mappings")
                 numXdpCommands = 0
             else:
-                ipMapBatch.finish_ip_mappings()
-                try:
-                    ipMapBatch.submit()
-                except Exception as e:
-                    report_refresh_failure(
-                        "XDP_IP_MAPPING_APPLY_FAILED",
-                        "Failed to apply XDP IP mappings: " + str(e),
-                        {
-                            "required_ip_mappings": requiredIpMappings,
-                            "queued_requests": numXdpCommands,
-                            "on_a_stick": on_a_stick(),
-                        },
-                        "XDP_IP_MAPPING_APPLY_FAILED",
-                    )
+                apply_xdp_ip_mappings(
+                    ipMapBatch,
+                    {
+                        "required_ip_mappings": requiredIpMappings,
+                        "queued_requests": numXdpCommands,
+                        "on_a_stick": on_a_stick(),
+                    },
+                )
             #for command in xdpCPUmapCommands:
             #	logging.info(command)
             #	commands = command.split(' ')

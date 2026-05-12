@@ -8,3 +8,12 @@ username = "admin"
 password = "password"
 use_ssl = false
 plaintext_login = true
+
+[[router]]
+name = "secondary"
+host = "100.64.0.2"
+port = 8728
+username = "admin"
+password = "password"
+use_ssl = false
+plaintext_login = true

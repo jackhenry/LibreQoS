@@ -123,7 +123,10 @@ export class WsClient {
 
     connect() {
         if (this.ws) {
-            return;
+            if (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN) {
+                return;
+            }
+            this._dropSocket("stale-socket");
         }
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -197,6 +200,11 @@ export class WsClient {
             });
             this.ws = null;
             this.handshake_done = false;
+            try {
+                socket.close();
+            } catch (_) {
+                // The browser may already have closed the socket.
+            }
             if (!this.versionReloading) {
                 this._scheduleReconnect();
             }
@@ -312,7 +320,7 @@ export class WsClient {
                 dashboardWsInteresting("subscribe-wire-interesting", [channel], {
                     desiredChannels: Array.from(this.desiredChannels.keys()),
                 });
-                this.ws.send(encoder.encode({ Subscribe: { channel } }));
+                this._sendControl({ Subscribe: { channel } });
             }
         }
         if (channels.length > 0) {
@@ -339,7 +347,7 @@ export class WsClient {
                     dashboardWsInteresting("unsubscribe-wire-interesting", [channel], {
                         desiredChannels: Array.from(this.desiredChannels.keys()),
                     });
-                    this.ws.send(encoder.encode({ Unsubscribe: { channel } }));
+                    this._sendControl({ Unsubscribe: { channel } });
                 }
             } else {
                 this.desiredChannels.set(channel, current - 1);
@@ -355,11 +363,16 @@ export class WsClient {
         if (!this.ws) {
             this.connect();
         }
-        if (!this.handshake_done) {
+        if (!this.handshake_done || !this._socketIsOpen()) {
             this.pending.push(normalized);
+            if (this.handshake_done && this.ws && !this._socketIsOpen()) {
+                this._retireSocket();
+            }
             return;
         }
-        this.ws.send(encoder.encode(normalized));
+        if (!this._sendControl(normalized)) {
+            this.pending.push(normalized);
+        }
     }
 
     on(event_name, handler) {
@@ -406,26 +419,56 @@ export class WsClient {
         dashboardWsDebug("handshake-complete", {
             desiredChannels: Array.from(this.desiredChannels.keys()),
         });
-        this.ws.send(
-            encoder.encode({
-                HelloReply: {
-                    ack: ACK_TEXT,
-                    token: get_user_token(),
-                },
-            }),
-        );
-        for (let i = 0; i < this.pending.length; i++) {
-            this.ws.send(encoder.encode(this.pending[i]));
+        if (!this._sendControl({
+            HelloReply: {
+                ack: ACK_TEXT,
+                token: get_user_token(),
+            },
+        })) {
+            return;
         }
+        const pending = this.pending;
         this.pending = [];
+        for (let i = 0; i < pending.length; i++) {
+            if (!this._sendControl(pending[i])) {
+                this.pending = pending.slice(i).concat(this.pending);
+                return;
+            }
+        }
         for (const channel of this.desiredChannels.keys()) {
             dashboardWsInteresting("subscribe-wire-interesting", [channel], {
                 desiredChannels: Array.from(this.desiredChannels.keys()),
                 fromHandshake: true,
             });
-            this.ws.send(encoder.encode({ Subscribe: { channel } }));
+            if (!this._sendControl({ Subscribe: { channel } })) {
+                return;
+            }
         }
         this.reconnectDelayMs = 1000;
+    }
+
+    _socketIsOpen() {
+        return this.ws && this.ws.readyState === WebSocket.OPEN;
+    }
+
+    _retireSocket() {
+        this._dropSocket("retire-socket");
+        this._scheduleReconnect();
+    }
+
+    _sendControl(request_obj) {
+        if (!this._socketIsOpen()) {
+            this._retireSocket();
+            return false;
+        }
+        try {
+            this.ws.send(encoder.encode(request_obj));
+            return true;
+        } catch (err) {
+            console.warn("Websocket send failed; reconnecting", err);
+            this._retireSocket();
+            return false;
+        }
     }
 
     _dispatch(msg) {

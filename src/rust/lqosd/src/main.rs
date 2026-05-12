@@ -10,6 +10,7 @@ mod ip_mapping;
 #[cfg(feature = "equinix_tests")]
 mod lqos_daht_test;
 pub mod lts2_sys;
+mod memory_watchdog;
 mod network_devices_hooks;
 mod node_manager;
 mod preflight_checks;
@@ -248,6 +249,7 @@ fn main() -> Result<()> {
 
     // Memory Debugging
     memory_debug();
+    memory_watchdog::start_memory_watchdog();
 
     let control_tx_for_webserver = control_tx_for_web.clone();
     let system_usage_tx_for_web = system_usage_tx.clone();
@@ -381,7 +383,7 @@ fn main() -> Result<()> {
                                 let _ = throughput_tracker::flow_data::setup_flow_analysis();
                                 start_heimdall()?;
                                 spawn_queue_structure_monitor()?;
-                                shaped_devices_tracker::shaping_inputs_watcher()?;
+                                shaped_devices_tracker::topology_runtime_status_watcher()?;
                                 throughput_tracker::spawn_throughput_monitor(
                                     flow_tx,
                                     system_usage_tx.clone(),
@@ -1045,6 +1047,10 @@ fn handle_bus_requests(requests: &[BusRequest], responses: &mut Vec<BusResponse>
                 urgent::clear(*id);
                 BusResponse::Ack
             }
+            BusRequest::ClearUrgentIssueByIdentity { code, dedupe_key } => {
+                urgent::clear_by_identity(code, dedupe_key);
+                BusResponse::Ack
+            }
             BusRequest::ClearAllUrgentIssues => {
                 urgent::clear_all();
                 BusResponse::Ack
@@ -1386,5 +1392,35 @@ fn search_result_to_bus(entry: node_manager::SearchResult) -> lqos_bus::SearchRe
         node_manager::SearchResult::Site { idx, name } => {
             lqos_bus::SearchResultEntry::Site { idx, name }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lqos_bus::{UrgentSeverity, UrgentSource};
+
+    #[test]
+    fn bus_clear_urgent_issue_by_identity_reaches_urgent_store() {
+        let code = "TEST_BUS_XDP_IP_MAPPING_APPLY_FAILED";
+        urgent::clear_by_identity(code, code);
+        urgent::submit(
+            UrgentSource::LibreQoS,
+            UrgentSeverity::Error,
+            code.to_string(),
+            "mapping failed".to_string(),
+            None,
+            Some(code.to_string()),
+        );
+
+        let requests = [BusRequest::ClearUrgentIssueByIdentity {
+            code: code.to_string(),
+            dedupe_key: code.to_string(),
+        }];
+        let mut responses = Vec::new();
+        handle_bus_requests(&requests, &mut responses);
+
+        assert!(matches!(responses.as_slice(), [BusResponse::Ack]));
+        assert!(!urgent::list().iter().any(|issue| issue.code == code));
     }
 }

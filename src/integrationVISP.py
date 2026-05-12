@@ -34,6 +34,7 @@ from integrationCommon import (
     apply_client_bandwidth_multiplier,
     isIntegrationOutputIpAllowed,
 )
+from integrationUtils import normalize_mac
 
 
 TOKEN_URL = "https://data.visp.net/token"
@@ -69,16 +70,6 @@ def _unit_to_mbps(value: Any, unit: Any) -> Optional[float]:
         return v * 1000.0
     # Unknown unit: assume Mbps (VISP mostly uses mbps)
     return v
-
-
-def _normalize_mac(mac: Any) -> str:
-    if mac is None:
-        return ""
-    s = str(mac).strip()
-    if not s:
-        return ""
-    # VISP sometimes returns MACs without separators. Keep uppercase hex.
-    return s.replace(":", "").replace("-", "").upper()
 
 
 def _safe_isp_id_from_token_payload(payload: Dict[str, Any]) -> Optional[int]:
@@ -505,7 +496,7 @@ def _extract_mac_candidates(row: Dict[str, Any]) -> List[str]:
     if not isinstance(equipment_data, dict):
         equipment_data = {}
     for key in ("Fiber MAC", "mac_address", "Ethernet MAC", "WAN MAC", "MAC Addr", "radio_mac"):
-        mac = _normalize_mac(equipment_data.get(key))
+        mac = normalize_mac(equipment_data.get(key))
         if mac and mac not in seen:
             seen.add(mac)
             candidates.append(mac)
@@ -921,7 +912,7 @@ def createShaper() -> None:
                 if eq_id > 0:
                     equipment_ids.add(eq_id)
                 for key in ("mac_address", "radio_mac"):
-                    mac = _normalize_mac(eq.get(key))
+                    mac = normalize_mac(eq.get(key))
                     if mac:
                         preferred_macs.add(mac)
             for ws in ws_list:
@@ -947,7 +938,7 @@ def createShaper() -> None:
                 if not ipv4s:
                     counters["skipped_no_ip"] += 1
                     continue
-                mac = _normalize_mac(ws.get("mac_address"))
+                mac = normalize_mac(ws.get("mac_address"))
                 if mac:
                     preferred_macs.add(mac)
                 add_service_record(
@@ -1032,7 +1023,7 @@ def createShaper() -> None:
                     ipv4s = list(ip_cache)
                 except Exception:
                     ipv4s = list(ip_cache)
-            mac = _normalize_mac(service_details.get("mac_address"))
+            mac = normalize_mac(service_details.get("mac_address"))
             if not mac and preferred_macs:
                 mac = sorted(preferred_macs)[0]
 

@@ -112,7 +112,29 @@ sudo RUST_LOG=info /opt/libreqos/src/bin/lqosd
 sudo journalctl -u lqos_scheduler --since "1 day ago" --no-pager > lqos_sched_log.txt
 ```
 
+Las instalaciones empaquetadas mantienen las dependencias Python de LibreQoS en `/opt/libreqos/venv`. Los servicios siguen ejecutándose como root, pero los paquetes Python no se mezclan con los paquetes administrados por apt. Si el scheduler informa módulos faltantes, o si la configuración del paquete se interrumpió al instalar dependencias Python, reconstruya el entorno virtual:
+
+```bash
+sudo /opt/libreqos/src/bin/rebuild_python_venv.sh
+sudo dpkg --configure -a
+sudo systemctl restart lqosd lqos_scheduler
+```
+
+Las instalaciones basadas en git deben usar `./build_rust.sh` después de actualizar. Ese script reconstruye el entorno virtual antes de actualizar los archivos de servicio o reiniciar servicios. Si systemd informa `status=203/EXEC` en `/opt/libreqos/venv/bin/python`, o una falla en la comprobación previa del scheduler, reconstruya el entorno virtual con el comando anterior y reinicie `lqos_scheduler`.
+
+Las instalaciones antiguas anteriores al entorno virtual pueden mostrar `ModuleNotFoundError` y recomendar comandos de `pip` del sistema. No repare instalaciones actuales con `pip` del sistema ni con `--break-system-packages`; esos paquetes no los usa el servicio `lqos_scheduler` respaldado por el entorno virtual. Actualice a un paquete que cree `/opt/libreqos/venv` y use el comando de reparación anterior.
+
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
+
+Si `journalctl -u lqosd` muestra `lqosd memory watchdog restarting daemon`, el daemon salió intencionalmente antes de que la presión de memoria del host llegara al camino OOM del kernel. Systemd debería reiniciar `lqosd` automáticamente. Capture esa línea de log antes de cambiar ajustes; incluye memoria disponible, RSS/swap de `lqosd`, cantidad de hilos, cantidad de flujos y contadores de tiempo que ayudan a diagnosticar el origen del crecimiento de memoria.
+
+El watchdog se puede ajustar con overrides de entorno de systemd:
+
+```bash
+sudo systemctl edit lqosd
+```
+
+Las variables comunes son `LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB`, `LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB` y `LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB`. Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` solo durante ventanas cortas de diagnóstico en las que esté observando activamente la presión de memoria.
 
 ### El estado del scheduler en WebUI aparece no saludable
 
@@ -155,26 +177,12 @@ Si `journalctl -u lqosd` muestra advertencias repetidas como `BeginIngest queue 
 
 Suele indicar que no se pudo agregar correctamente qdisc MQ en la NIC (colas RX/TX insuficientes). Verifique [NICs recomendadas](requirements-es.md).
 
-### Python ModuleNotFoundError en Ubuntu 24.04
-
-```bash
-pip uninstall binpacking --break-system-packages --yes
-sudo pip uninstall binpacking --break-system-packages --yes
-sudo pip install binpacking --break-system-packages
-pip uninstall apscheduler --break-system-packages --yes
-sudo pip uninstall apscheduler --break-system-packages --yes
-sudo pip install apscheduler --break-system-packages
-pip uninstall deepdiff --break-system-packages --yes
-sudo pip uninstall deepdiff --break-system-packages --yes
-sudo pip install deepdiff --break-system-packages
-```
-
 ### Todas las IPs de clientes aparecen como Unknown IPs
 
 ```bash
 cd /opt/libreqos/src
 sudo systemctl stop lqos_scheduler
-sudo python3 LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 Corrija errores en `ShapedDevices.csv` y/o `network.json`, luego:
@@ -243,7 +251,7 @@ WebUI muestra códigos legibles por máquina para triage rápido.
 | `MAPPED_CIRCUIT_LIMIT` | Bakery está forzando límite de circuitos mapeados. | Estado de licencia Insight y `journalctl -u lqosd` con requested/allowed/dropped. | Reducir circuitos mapeados o actualizar licencia/límites. |
 | `TC_U16_OVERFLOW` | IDs minor de clases/colas excedieron rango u16 de tc en una cola CPU. | `journalctl -u lqos_scheduler -u lqosd`, profundidad topológica y distribución por colas. | Aumentar paralelismo de colas y/o simplificar/rebalancear jerarquía. |
 | `TC_QDISC_CAPACITY` | Los qdisc autoasignados planificados exceden el presupuesto seguro por interfaz o el preflight conservador de seguridad de memoria de Bakery antes de aplicar. | Conteos estimados por interfaz, desglose por tipo de qdisc y campos de memoria en el contexto del urgent issue, `journalctl -u lqos_scheduler -u lqosd`, configuración `on_a_stick` y `monitor_only`. | Reducir la carga planificada de qdisc para esta ejecución (por ejemplo menos circuitos/dispositivos en la forma de prueba) antes de reintentar; no confiar en una aplicación parcial. |
-| `BAKERY_MEMORY_GUARD` | Un full reload chunked de Bakery fue detenido a mitad de aplicación porque la memoria disponible del host cayó por debajo del piso de seguridad. | `journalctl -u lqosd`, memoria disponible/total en el contexto del urgent issue y progreso reciente de aplicación de Bakery. | Tratar la ejecución como fallida, reducir presión de memoria o huella de colas y reintentar solo cuando el host esté estable. |
+| `BAKERY_MEMORY_GUARD` | Una recarga completa por fragmentos de Bakery fue detenida a mitad de aplicación porque la memoria disponible del host cayó por debajo del piso de seguridad escalado. | `journalctl -u lqosd`, memoria disponible/total en el contexto del urgent issue y progreso reciente de aplicación de Bakery. | Tratar la ejecución como fallida, reducir presión de memoria o huella de colas y reintentar solo cuando el host esté estable. |
 | `XDP_IP_MAPPING_CAPACITY` | Los mapeos IP requeridos exceden la capacidad actual del mapa XDP en el kernel. | Forma de `ShapedDevices.csv`, mezcla IPv4/IPv6, supuesto de un dispositivo frente a varios dispositivos, `journalctl -u lqos_scheduler -u lqosd`. | Reducir mapeos requeridos de inmediato (por ejemplo menos dispositivos o prueba IPv4-only), o aumentar la capacidad del mapa del kernel en un cambio coordinado. |
 | `XDP_IP_MAPPING_APPLY_FAILED` | Uno o más inserts de mapeo IP fallaron durante la aplicación. | `journalctl -u lqos_scheduler -u lqosd` para ejemplos resumidos y conteos de fallo. | Corregir la causa del fallo y volver a ejecutar; no confiar en shaping parcial. |
 

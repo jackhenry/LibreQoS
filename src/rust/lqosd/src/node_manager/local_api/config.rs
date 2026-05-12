@@ -786,6 +786,7 @@ fn persist_shaped_devices(mut devices: Vec<ShapedDevice>) -> Result<(), String> 
     lqos_network_devices::apply_shaped_devices_snapshot(
         "node_manager:persist_shaped_devices",
         copied,
+        lqos_network_devices::ShapedDevicesSnapshotProvenance::ExternalSnapshot,
     )
     .map_err(|e| format!("Unable to publish ShapedDevices.csv snapshot: {e}"))?;
 

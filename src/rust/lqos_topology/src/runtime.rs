@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use lqos_bus::{BusRequest, BusResponse, bus_request_with_timeout};
 use lqos_config::{
     TopologyAttachmentEndpointStatus, TopologyAttachmentHealthEntry,
-    TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus,
+    TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus, TopologyCanonicalStateFile,
     compute_topology_source_generation, load_config,
 };
 use lqos_overrides::TopologyOverridesFile;
 use lqos_probe::{ProbeClass, ProbeRequest};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -317,6 +319,61 @@ fn refresh_health_state(
     Ok(true)
 }
 
+fn hash_health_status(status: TopologyAttachmentHealthStatus, hasher: &mut impl Hasher) {
+    match status {
+        TopologyAttachmentHealthStatus::Healthy => 0_u8.hash(hasher),
+        TopologyAttachmentHealthStatus::Suppressed => 1_u8.hash(hasher),
+        TopologyAttachmentHealthStatus::ProbeUnavailable => 2_u8.hash(hasher),
+        TopologyAttachmentHealthStatus::Disabled => 3_u8.hash(hasher),
+    }
+}
+
+fn hash_health_effective_entry(entry: &TopologyAttachmentHealthEntry, hasher: &mut impl Hasher) {
+    entry.attachment_pair_id.hash(hasher);
+    entry.attachment_id.hash(hasher);
+    entry.child_node_id.hash(hasher);
+    entry.parent_node_id.hash(hasher);
+    entry.local_probe_ip.hash(hasher);
+    entry.remote_probe_ip.hash(hasher);
+    hash_health_status(entry.status, hasher);
+    entry.probeable.hash(hasher);
+    entry.enabled.hash(hasher);
+    entry.suppressed_until_unix.hash(hasher);
+}
+
+fn health_effective_signature(health_state: &TopologyAttachmentHealthStateFile) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for entry in &health_state.attachments {
+        hash_health_effective_entry(entry, &mut hasher);
+    }
+    hasher.finish()
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeBuildGate {
+    last_source_generation: Option<String>,
+    last_overrides_generation: Option<u64>,
+    last_health_effective_signature: Option<u64>,
+    cached_probe_specs: Vec<AttachmentProbeSpec>,
+    publish_completed: bool,
+    next_error_retry_after_unix: Option<u64>,
+}
+
+fn topology_overrides_generation(config: &lqos_config::Config) -> u64 {
+    let path = TopologyOverridesFile::path_for_config(config);
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    if let Ok(contents) = std::fs::read(&path) {
+        match serde_json::from_slice::<TopologyOverridesFile>(&contents)
+            .and_then(|overrides| serde_json::to_vec(&overrides))
+        {
+            Ok(canonical) => canonical.hash(&mut hasher),
+            Err(_) => contents.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct RoundHints {
     probes_enabled: bool,
@@ -325,28 +382,61 @@ struct RoundHints {
 async fn run_round(
     health_state: &mut TopologyAttachmentHealthStateFile,
     last_effective: &mut HashMap<String, Option<String>>,
+    gate: &mut RuntimeBuildGate,
 ) -> Result<RoundHints> {
     let config = load_config().context("Unable to load config for topology runtime")?;
     let source_generation = compute_topology_source_generation(config.as_ref())
         .context("Unable to compute topology source generation")?;
-    let canonical = load_canonical_topology_state(config.as_ref());
-    let overrides =
-        TopologyOverridesFile::load().context("Unable to load topology overrides file")?;
-    let prepared = prepare_runtime_topology_editor_state_from_canonical(&canonical, &overrides);
-    let specs = probe_specs_from_state(&prepared, &overrides);
+    let overrides_generation = topology_overrides_generation(config.as_ref());
+    let source_changed = gate.last_source_generation.as_deref() != Some(source_generation.as_str());
+    let overrides_changed = gate.last_overrides_generation != Some(overrides_generation);
+    let mut loaded_inputs: Option<(TopologyCanonicalStateFile, TopologyOverridesFile)> = None;
+    if source_changed || overrides_changed || gate.cached_probe_specs.is_empty() {
+        let canonical = load_canonical_topology_state(config.as_ref());
+        let overrides =
+            TopologyOverridesFile::load().context("Unable to load topology overrides file")?;
+        let prepared = prepare_runtime_topology_editor_state_from_canonical(&canonical, &overrides);
+        gate.cached_probe_specs = probe_specs_from_state(&prepared, &overrides);
+        loaded_inputs = Some((canonical, overrides));
+    }
+    let specs = &gate.cached_probe_specs;
     let probes_enabled = specs.iter().any(|spec| spec.enabled);
     if probes_enabled {
-        match probe_specs(&specs, Duration::from_millis(750)).await {
+        match probe_specs(specs, Duration::from_millis(750)).await {
             Ok(probe_results) => {
-                refresh_health_state(config.as_ref(), health_state, &specs, &probe_results)?;
+                refresh_health_state(config.as_ref(), health_state, specs, &probe_results)?;
             }
             Err(err) => {
                 warn!("Topology probe round could not query shared probe manager: {err:#}");
             }
         }
     } else {
-        refresh_health_state(config.as_ref(), health_state, &specs, &HashMap::new())?;
+        refresh_health_state(config.as_ref(), health_state, specs, &HashMap::new())?;
     }
+
+    let next_signature = health_effective_signature(health_state);
+    let retry_due = gate
+        .next_error_retry_after_unix
+        .is_some_and(|deadline| now_unix().is_some_and(|now| now >= deadline));
+    let retry_pending = gate.next_error_retry_after_unix.is_some() && !retry_due;
+    let source_or_health_changed = source_changed
+        || overrides_changed
+        || gate.last_health_effective_signature.as_ref() != Some(&next_signature);
+    let should_publish =
+        source_or_health_changed || (!retry_pending && (!gate.publish_completed || retry_due));
+    if !should_publish {
+        return Ok(RoundHints { probes_enabled });
+    }
+
+    let (canonical, overrides) = match loaded_inputs {
+        Some(inputs) => inputs,
+        None => {
+            let canonical = load_canonical_topology_state(config.as_ref());
+            let overrides =
+                TopologyOverridesFile::load().context("Unable to load topology overrides file")?;
+            (canonical, overrides)
+        }
+    };
 
     let artifacts = build_effective_topology_artifacts_from_canonical_with_runtime_queue_context(
         config.as_ref(),
@@ -372,8 +462,21 @@ async fn run_round(
                 "Unable to publish failed topology runtime status after publish error: {status_err:#}"
             );
         }
+        let health = &config.integration_common.topology_attachment_health;
+        let retry_delay = health
+            .refresh_debounce_seconds
+            .max(health.probe_interval_seconds.max(1));
+        gate.last_source_generation = Some(source_generation.clone());
+        gate.last_overrides_generation = Some(overrides_generation);
+        gate.last_health_effective_signature = Some(next_signature);
+        gate.next_error_retry_after_unix = now_unix().map(|now| now.saturating_add(retry_delay));
         return Err(err);
     }
+    gate.last_source_generation = Some(source_generation.clone());
+    gate.last_overrides_generation = Some(overrides_generation);
+    gate.last_health_effective_signature = Some(next_signature);
+    gate.publish_completed = true;
+    gate.next_error_retry_after_unix = None;
 
     for node in &artifacts.effective.nodes {
         let next = node.effective_attachment_id.clone();
@@ -398,9 +501,12 @@ async fn run_round(
 pub async fn start_topology() {
     let mut health_state = load_starting_health();
     let mut last_effective = HashMap::<String, Option<String>>::new();
+    let mut build_gate = RuntimeBuildGate::default();
 
     loop {
-        let round_hints = match run_round(&mut health_state, &mut last_effective).await {
+        let round_hints = match run_round(&mut health_state, &mut last_effective, &mut build_gate)
+            .await
+        {
             Ok(hints) => hints,
             Err(err) => {
                 if let Ok(config) = load_config()
@@ -436,5 +542,104 @@ pub async fn start_topology() {
             })
             .unwrap_or(1);
         tokio::time::sleep(Duration::from_secs(sleep_seconds)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TopologyAttachmentHealthEntry, health_effective_signature, topology_overrides_generation,
+    };
+    use lqos_config::{Config, TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus};
+    use lqos_overrides::TopologyOverridesFile;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
+    }
+
+    fn health_entry() -> TopologyAttachmentHealthEntry {
+        TopologyAttachmentHealthEntry {
+            attachment_pair_id: "pair-1".to_string(),
+            attachment_id: Some("attachment-1".to_string()),
+            child_node_id: Some("child-1".to_string()),
+            parent_node_id: Some("parent-1".to_string()),
+            local_probe_ip: Some("192.0.2.1".to_string()),
+            remote_probe_ip: Some("192.0.2.2".to_string()),
+            status: TopologyAttachmentHealthStatus::Healthy,
+            probeable: true,
+            enabled: true,
+            consecutive_misses: 1,
+            consecutive_successes: 2,
+            last_success_unix: Some(10),
+            endpoint_status: vec![],
+            ..TopologyAttachmentHealthEntry::default()
+        }
+    }
+
+    #[test]
+    fn health_effective_signature_ignores_probe_counters_and_timestamps() {
+        let first = TopologyAttachmentHealthStateFile {
+            generated_unix: Some(1),
+            attachments: vec![health_entry()],
+            ..TopologyAttachmentHealthStateFile::default()
+        };
+        let mut second_entry = health_entry();
+        second_entry.consecutive_misses = 4;
+        second_entry.consecutive_successes = 5;
+        second_entry.last_success_unix = Some(20);
+        second_entry.last_failure_unix = Some(21);
+        let second = TopologyAttachmentHealthStateFile {
+            generated_unix: Some(2),
+            attachments: vec![second_entry],
+            ..TopologyAttachmentHealthStateFile::default()
+        };
+
+        assert_eq!(
+            health_effective_signature(&first),
+            health_effective_signature(&second)
+        );
+    }
+
+    #[test]
+    fn health_effective_signature_tracks_suppression_status() {
+        let first = TopologyAttachmentHealthStateFile {
+            attachments: vec![health_entry()],
+            ..TopologyAttachmentHealthStateFile::default()
+        };
+        let mut suppressed = health_entry();
+        suppressed.status = TopologyAttachmentHealthStatus::Suppressed;
+        suppressed.suppressed_until_unix = Some(123);
+        let second = TopologyAttachmentHealthStateFile {
+            attachments: vec![suppressed],
+            ..TopologyAttachmentHealthStateFile::default()
+        };
+
+        assert_ne!(
+            health_effective_signature(&first),
+            health_effective_signature(&second)
+        );
+    }
+
+    #[test]
+    fn topology_overrides_generation_tracks_manual_override_file_changes() {
+        let lqos_directory = unique_temp_dir("lqos-topology-runtime-overrides");
+        fs::create_dir_all(&lqos_directory).expect("temp lqos directory should exist");
+        let config = Config {
+            lqos_directory: lqos_directory.to_string_lossy().to_string(),
+            ..Config::default()
+        };
+        let path = TopologyOverridesFile::path_for_config(&config);
+
+        let before = topology_overrides_generation(&config);
+        fs::write(&path, "{\"schemaVersion\":1}\n").expect("override file should write");
+        let after = topology_overrides_generation(&config);
+
+        assert_ne!(before, after);
     }
 }

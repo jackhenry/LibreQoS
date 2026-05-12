@@ -170,7 +170,7 @@ fn system_interfaces() -> BTreeSet<String> {
     default_net::get_interfaces()
         .into_iter()
         .map(|iface| iface.name)
-        .collect()
+        .collect::<BTreeSet<_>>()
 }
 
 fn supports_multi_queue(interface: &str) -> bool {
@@ -195,7 +195,14 @@ fn supports_multi_queue(interface: &str) -> bool {
 
 /// Inspect the requested network mode using the helper's configured paths.
 pub fn inspect_with_paths(paths: &HelperPaths, config: &Config) -> NetworkModeInspection {
-    let system_ifaces = system_interfaces();
+    inspect_with_paths_and_interfaces(paths, config, system_interfaces())
+}
+
+fn inspect_with_paths_and_interfaces(
+    paths: &HelperPaths,
+    config: &Config,
+    system_ifaces: BTreeSet<String>,
+) -> NetworkModeInspection {
     let queue_caps = system_ifaces
         .iter()
         .map(|iface| (iface.clone(), supports_multi_queue(iface)))
@@ -751,6 +758,15 @@ pub fn apply_transaction(
     pending_children: &mut PendingChildren,
     request: ApplyRequest,
 ) -> Result<ApplyResponse> {
+    apply_transaction_with_interfaces(paths, pending_children, request, system_interfaces())
+}
+
+fn apply_transaction_with_interfaces(
+    paths: &HelperPaths,
+    pending_children: &mut PendingChildren,
+    request: ApplyRequest,
+    system_ifaces: BTreeSet<String>,
+) -> Result<ApplyResponse> {
     normalize_pending_children(paths, pending_children)?;
     if !list_pending_records(paths)?.is_empty() {
         bail!("A pending network change already exists. Confirm or revert it first.");
@@ -761,7 +777,7 @@ pub fn apply_transaction(
     } else {
         Config::default()
     };
-    let inspection = inspect_with_paths(paths, &request.config);
+    let inspection = inspect_with_paths_and_interfaces(paths, &request.config, system_ifaces);
     validate_apply_request(&request, &inspection, &previous_config)?;
 
     let preview_yaml = inspection.managed_preview_yaml.as_ref().ok_or_else(|| {
@@ -1013,7 +1029,7 @@ esac
             .find(|iface| iface.as_str() != "lo")
             .cloned()
             .or_else(|| interfaces.iter().next().cloned())
-            .expect("test host should expose at least one interface");
+            .unwrap_or_else(|| "ens19".to_string());
         let secondary = interfaces
             .iter()
             .find(|iface| iface.as_str() != primary && iface.as_str() != "lo")
@@ -1024,8 +1040,17 @@ esac
                     .find(|iface| iface.as_str() != primary)
                     .cloned()
             })
-            .expect("test host should expose a second distinct interface");
+            .unwrap_or_else(|| "ens20".to_string());
         (primary, secondary)
+    }
+
+    fn test_system_interfaces() -> BTreeSet<String> {
+        let interfaces = system_interfaces();
+        if interfaces.is_empty() {
+            BTreeSet::from(["ens19".to_string(), "ens20".to_string()])
+        } else {
+            interfaces
+        }
     }
 
     fn linux_bridge_config() -> Config {
@@ -1035,6 +1060,7 @@ esac
                 use_xdp_bridge: false,
                 to_internet,
                 to_network,
+                mtu: None,
             }),
             single_interface: None,
             ..Config::default()
@@ -1058,7 +1084,13 @@ esac
             confirm_dangerous_changes: true,
         };
 
-        let apply = apply_transaction(&paths, &mut pending, request).expect("apply should succeed");
+        let apply = apply_transaction_with_interfaces(
+            &paths,
+            &mut pending,
+            request,
+            test_system_interfaces(),
+        )
+        .expect("apply should succeed");
         assert!(apply.ok);
         assert!(apply.operation.is_some());
 
@@ -1082,7 +1114,13 @@ esac
             mode: ApplyMode::Apply,
             confirm_dangerous_changes: true,
         };
-        let apply = apply_transaction(&paths, &mut pending, request).expect("second apply");
+        let apply = apply_transaction_with_interfaces(
+            &paths,
+            &mut pending,
+            request,
+            test_system_interfaces(),
+        )
+        .expect("second apply");
         let operation_id = apply
             .operation
             .as_ref()
@@ -1112,10 +1150,11 @@ esac
             interface: test_interfaces().0,
             internet_vlan: 2,
             network_vlan: 3,
+            mtu: None,
         });
         next.bridge = None;
 
-        let apply = apply_transaction(
+        let apply = apply_transaction_with_interfaces(
             &paths,
             &mut pending,
             ApplyRequest {
@@ -1125,6 +1164,7 @@ esac
                 mode: ApplyMode::Apply,
                 confirm_dangerous_changes: true,
             },
+            test_system_interfaces(),
         )
         .expect("apply should succeed");
         let backup_id = apply
@@ -1147,6 +1187,7 @@ esac
                     interface: test_interfaces().1,
                     internet_vlan: 10,
                     network_vlan: 11,
+                    mtu: None,
                 }),
                 bridge: None,
                 ..Config::default()
@@ -1181,7 +1222,7 @@ esac
         let existing = linux_bridge_config();
         write_config(&paths.config_path, &existing);
 
-        let apply = apply_transaction(
+        let apply = apply_transaction_with_interfaces(
             &paths,
             &mut pending,
             ApplyRequest {
@@ -1191,6 +1232,7 @@ esac
                 mode: ApplyMode::Apply,
                 confirm_dangerous_changes: true,
             },
+            test_system_interfaces(),
         )
         .expect("apply should succeed");
         let operation_id = apply
@@ -1228,10 +1270,11 @@ esac
             interface: test_interfaces().0,
             internet_vlan: 2,
             network_vlan: 3,
+            mtu: None,
         });
         next.bridge = None;
 
-        let apply = apply_transaction(
+        let apply = apply_transaction_with_interfaces(
             &paths,
             &mut pending,
             ApplyRequest {
@@ -1241,6 +1284,7 @@ esac
                 mode: ApplyMode::Apply,
                 confirm_dangerous_changes: true,
             },
+            test_system_interfaces(),
         )
         .expect("apply should succeed");
         let operation_id = apply
@@ -1295,7 +1339,7 @@ esac
         let existing = linux_bridge_config();
         write_config(&paths.config_path, &existing);
 
-        let err = apply_transaction(
+        let err = apply_transaction_with_interfaces(
             &paths,
             &mut pending,
             ApplyRequest {
@@ -1305,6 +1349,7 @@ esac
                 mode: ApplyMode::Apply,
                 confirm_dangerous_changes: true,
             },
+            test_system_interfaces(),
         )
         .expect_err("apply should fail");
 

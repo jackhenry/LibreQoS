@@ -4,12 +4,13 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use fxhash::{FxHashMap, FxHashSet};
 use lqos_bus::{BusResponse, Circuit};
-use lqos_config::{
-    NetworkJsonNode, NetworkJsonTransport, TopologyShapingInputsFile, load_config,
-    topology_runtime_status_path,
-};
 #[cfg(test)]
-use lqos_config::{TopologyRuntimeStatusFile, topology_shaping_inputs_path};
+use lqos_config::load_active_runtime_shaping_inputs;
+use lqos_config::{
+    NetworkJsonNode, NetworkJsonTransport, TopologyRuntimeShapingPayloadIdentity,
+    TopologyRuntimeStatusFile, TopologyShapingInputsFile,
+    load_active_runtime_shaping_inputs_from_status, load_config, topology_runtime_status_path,
+};
 use lqos_queue_tracker::EFFECTIVE_NODE_RATES;
 use lqos_utils::file_watcher::FileWatcher;
 use lqos_utils::hash_to_i64;
@@ -18,8 +19,6 @@ use lqos_utils::units::{DownUpOrder, down_up_retransmit_sample};
 use lqos_utils::unix_time::time_since_boot;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -42,6 +41,8 @@ pub static CIRCUIT_LIVE_LAST_REFRESH_SECS: AtomicU64 = AtomicU64::new(0);
 pub static CIRCUIT_LIVE_REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 pub static EFFECTIVE_CIRCUIT_PARENTS: Lazy<ArcSwap<FxHashMap<String, RuntimeCircuitParent>>> =
     Lazy::new(|| ArcSwap::new(Arc::new(FxHashMap::default())));
+static LAST_TOPOLOGY_STATUS_IDENTITY: Lazy<Mutex<Option<TopologyRuntimeShapingPayloadIdentity>>> =
+    Lazy::new(|| Mutex::new(None));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCircuitParent {
@@ -104,38 +105,18 @@ fn publish_shaping_inputs(shaping_inputs: TopologyShapingInputsFile) {
     invalidate_executive_cache_snapshot();
 }
 
-#[cfg(test)]
-fn active_runtime_shaping_inputs_path(config: &lqos_config::Config) -> Result<Option<PathBuf>> {
-    let status = TopologyRuntimeStatusFile::load(config)?;
-    if !status.ready {
-        return Ok(None);
-    }
-    let path = status.shaping_inputs_path.trim();
-    if path.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(path)))
+fn topology_status_identity(
+    status: &TopologyRuntimeStatusFile,
+) -> TopologyRuntimeShapingPayloadIdentity {
+    status.shaping_payload_identity()
 }
 
-#[cfg(test)]
-fn load_active_runtime_shaping_inputs(
-    config: &lqos_config::Config,
-) -> Result<Option<TopologyShapingInputsFile>> {
-    if let Some(active_path) = active_runtime_shaping_inputs_path(config)?
-        && active_path.exists()
-    {
-        let raw = std::fs::read_to_string(&active_path)?;
-        let shaping_inputs = serde_json::from_str(&raw)?;
-        return Ok(Some(shaping_inputs));
-    }
+fn topology_status_identity_changed(identity: &TopologyRuntimeShapingPayloadIdentity) -> bool {
+    LAST_TOPOLOGY_STATUS_IDENTITY.lock().as_ref() != Some(identity)
+}
 
-    let fallback_path = topology_shaping_inputs_path(config);
-    if !fallback_path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(&fallback_path)?;
-    let shaping_inputs = serde_json::from_str(&raw)?;
-    Ok(Some(shaping_inputs))
+fn remember_topology_status_identity(identity: TopologyRuntimeShapingPayloadIdentity) {
+    *LAST_TOPOLOGY_STATUS_IDENTITY.lock() = Some(identity);
 }
 
 #[cfg(test)]
@@ -257,21 +238,8 @@ fn integration_ingress_enabled(config: &lqos_config::Config) -> bool {
 fn load_ready_runtime_shaping_inputs(
     config: &lqos_config::Config,
 ) -> Result<Option<TopologyShapingInputsFile>> {
-    let Some(active_path) = active_runtime_shaping_inputs_path(config)? else {
-        return Ok(None);
-    };
-    if !active_path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(&active_path)
-        .with_context(|| format!("Unable to read shaping inputs at {}", active_path.display()))?;
-    let shaping_inputs = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "Unable to decode shaping inputs JSON at {}",
-            active_path.display()
-        )
-    })?;
-    Ok(Some(shaping_inputs))
+    load_active_runtime_shaping_inputs(config)
+        .context("Unable to load active runtime shaping inputs")
 }
 
 #[cfg(test)]
@@ -311,16 +279,30 @@ fn load_shaped_devices_from_preferred_source(
         ConfigShapedDevices::load_for_config(config).context("Unable to load ShapedDevices.csv")?;
     Ok((shaped_devices, ShapedDevicesLoadSource::ShapedDevicesCsv))
 }
-fn load_shaping_inputs() {
+fn load_topology_runtime_status_payload() {
     let Ok(config) = load_config() else {
-        warn!("Unable to load LibreQoS config while loading shaping_inputs.json");
-        publish_shaping_inputs(TopologyShapingInputsFile::default());
+        warn!("Unable to load LibreQoS config while loading topology runtime status");
         return;
     };
-    match lqos_network_devices::load_runtime_shaping_inputs_for_config(config.as_ref()) {
+    let status = match TopologyRuntimeStatusFile::load(config.as_ref()) {
+        Ok(status) => status,
+        Err(err) => {
+            warn!(
+                "Unable to load topology_runtime_status.json: {err}; keeping last-known-good effective parent cache"
+            );
+            return;
+        }
+    };
+    let identity = topology_status_identity(&status);
+    if !topology_status_identity_changed(&identity) {
+        debug!("Topology runtime status changed without shaping payload identity change");
+        return;
+    }
+    match load_active_runtime_shaping_inputs_from_status(config.as_ref(), &status) {
         Ok(Some(shaping_inputs)) => {
             debug!("Loaded shaping inputs from active runtime status");
             publish_shaping_inputs(shaping_inputs);
+            remember_topology_status_identity(identity);
         }
         Ok(None) => {
             if lqos_config::integration_ingress_enabled(config.as_ref()) {
@@ -329,9 +311,11 @@ fn load_shaping_inputs() {
                 debug!(
                     "No active runtime shaping inputs published; keeping last-known-good effective parent cache"
                 );
+                remember_topology_status_identity(identity);
             } else {
                 debug!("Integration ingress disabled; clearing effective parent cache");
                 publish_shaping_inputs(TopologyShapingInputsFile::default());
+                remember_topology_status_identity(identity);
             }
         }
         Err(err) => {
@@ -342,31 +326,31 @@ fn load_shaping_inputs() {
     }
 }
 
-pub fn shaping_inputs_watcher() -> Result<()> {
+pub fn topology_runtime_status_watcher() -> Result<()> {
     std::thread::Builder::new()
-        .name("Shaping Inputs Watcher".to_string())
+        .name("Topology Runtime Status Watcher".to_string())
         .spawn(|| {
-            debug!("Watching for shaping_inputs.json changes");
-            if let Err(e) = watch_for_shaping_inputs_changing() {
-                error!("Error watching for shaping_inputs.json changes: {:?}", e);
+            debug!("Watching for topology_runtime_status.json changes");
+            if let Err(e) = watch_for_topology_runtime_status_changing() {
+                error!("Error watching topology_runtime_status.json: {:?}", e);
             }
         })?;
     Ok(())
 }
 
-fn watch_for_shaping_inputs_changing() -> Result<()> {
+fn watch_for_topology_runtime_status_changing() -> Result<()> {
     let Ok(config) = load_config() else {
-        error!("Unable to load LibreQoS config to watch shaping_inputs.json");
+        error!("Unable to load LibreQoS config to watch topology_runtime_status.json");
         return Err(anyhow::Error::msg(
-            "Unable to load LibreQoS config for shaping_inputs.json",
+            "Unable to load LibreQoS config for topology_runtime_status.json",
         ));
     };
     let watch_path = topology_runtime_status_path(config.as_ref());
 
     let mut watcher = FileWatcher::new("topology_runtime_status.json", watch_path);
-    watcher.set_file_exists_callback(load_shaping_inputs);
-    watcher.set_file_created_callback(load_shaping_inputs);
-    watcher.set_file_changed_callback(load_shaping_inputs);
+    watcher.set_file_exists_callback(load_topology_runtime_status_payload);
+    watcher.set_file_created_callback(load_topology_runtime_status_payload);
+    watcher.set_file_changed_callback(load_topology_runtime_status_payload);
     loop {
         let result = watcher.watch();
         info!("topology_runtime_status.json watcher returned: {result:?}");
