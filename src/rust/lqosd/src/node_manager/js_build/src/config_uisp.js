@@ -6,6 +6,30 @@ import {
     secretWillExistAfterSave,
 } from "./config/config_helper";
 
+function currentTopologyMode() {
+    return (
+        window.config?.topology?.compile_mode
+        ?? document.getElementById("uispStrategy").value.trim()
+    );
+}
+
+function rootSiteRequiredForMode(mode) {
+    return mode === "full" || mode === "full2";
+}
+
+function updateRootSiteRequirement() {
+    const required = rootSiteRequiredForMode(currentTopologyMode());
+    const siteInput = document.getElementById("uispSite");
+    const siteLabel = document.getElementById("uispSiteLabel");
+    const siteHelp = document.getElementById("uispSiteHelp");
+
+    siteInput.required = required;
+    siteLabel.textContent = required ? "Root UISP Site" : "Root UISP Site (Optional)";
+    siteHelp.textContent = required
+        ? "Required for full topology mode. Enter the exact UISP site name at the root of the network."
+        : "Optional in this topology mode. Leave blank to let LibreQoS choose the import root.";
+}
+
 function validateConfig() {
     // Validate required fields when enabled
     if (document.getElementById("enableUisp").checked) {
@@ -27,8 +51,8 @@ function validateConfig() {
         }
 
         const site = document.getElementById("uispSite").value.trim();
-        if (!site) {
-            alert("UISP Site is required when UISP integration is enabled");
+        if (rootSiteRequiredForMode(currentTopologyMode()) && !site) {
+            alert("Root UISP Site is required when full topology mode is selected");
             return false;
         }
 
@@ -88,7 +112,6 @@ function updateConfig() {
     // Parse comma-separated strings into arrays
     const existingUisp = { ...(window.config.uisp_integration || {}) };
     delete existingUisp.enable_squashing;
-    delete existingUisp.use_ptmp_as_parent;
 
     const excludeSites = document.getElementById("uispExcludeSites").value.trim();
     const excludeSitesArray = excludeSites ? excludeSites.split(',').map(s => s.trim()) : [];
@@ -149,6 +172,7 @@ loadConfig(() => {
         document.getElementById("uispSite").value = uisp.site ?? "";
         document.getElementById("uispStrategy").value = window.config.topology?.compile_mode ?? uisp.strategy ?? "ap_site";
         document.getElementById("uispSuspendedStrategy").value = uisp.suspended_strategy ?? "none";
+        updateRootSiteRequirement();
 
         // Numeric fields
         document.getElementById("uispAirmaxCapacity").value = uisp.airmax_capacity ?? 1.0;
@@ -170,6 +194,8 @@ loadConfig(() => {
             statusId: "uispTokenStatus",
             clearButtonId: "clearUispToken",
         });
+
+        document.getElementById("uispStrategy").addEventListener("change", updateRootSiteRequirement);
 
         // Add save button click handler
         document.getElementById('saveButton').addEventListener('click', () => {

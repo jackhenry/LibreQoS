@@ -20,7 +20,9 @@ mod topology;
 mod tests;
 
 use anyhow::{Context, Result};
-use lqos_config::{Config, ConfigShapedDevices, NetworkJson, TopologyShapingInputsFile};
+use lqos_config::{
+    Config, ConfigShapedDevices, NetworkJson, TopologyShapingInputsFile,
+};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -29,6 +31,27 @@ pub use combined_catalog::NetworkDevicesCatalog;
 pub use dynamic::{CircuitObservation, DynamicCircuit};
 pub use hash_cache::ShapedDeviceHashCache;
 pub use topology::{ResolvedParentNode, resolve_parent_node, resolve_parent_node_reference};
+
+/// Provenance for caller-provided shaped-device snapshots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShapedDevicesSnapshotProvenance {
+    /// Snapshot came from an external caller that already constructed a complete payload.
+    ExternalSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LoadedShapedDevicesSource {
+    RuntimeTopology {
+        shaping_generation: String,
+    },
+    TopologyImport,
+    Csv,
+}
+
+pub(crate) struct LoadedShapedDevices {
+    pub(crate) shaped: ConfigShapedDevices,
+    pub(crate) source: LoadedShapedDevicesSource,
+}
 
 /// Hooks that `lqosd` can provide to run side effects after updates.
 pub trait DaemonHooks: Send + Sync + 'static {
@@ -67,13 +90,18 @@ pub fn load_runtime_shaping_inputs_for_config(
     runtime_inputs::load_ready_runtime_shaping_inputs(config)
 }
 
-fn load_shaped_devices_for_config(config: &lqos_config::Config) -> Result<ConfigShapedDevices> {
+fn load_shaped_devices_for_config(config: &lqos_config::Config) -> Result<LoadedShapedDevices> {
     if lqos_config::integration_ingress_enabled(config) {
         if let Some(shaping_inputs) = load_runtime_shaping_inputs_for_config(config)? {
             let shaped_devices =
                 runtime_inputs::shaped_devices_from_runtime_inputs(&shaping_inputs);
             if !shaped_devices.devices.is_empty() {
-                return Ok(shaped_devices);
+                return Ok(LoadedShapedDevices {
+                    shaped: shaped_devices,
+                    source: LoadedShapedDevicesSource::RuntimeTopology {
+                        shaping_generation: shaping_inputs.shaping_generation,
+                    },
+                });
             }
             debug!(
                 "Active runtime shaping inputs contained 0 shaped devices; checking other integration sources"
@@ -83,13 +111,19 @@ fn load_shaped_devices_for_config(config: &lqos_config::Config) -> Result<Config
             debug!(
                 "topology_import.json is missing or contains 0 shaped devices; keeping integration mode empty until topology is published"
             );
-            return Ok(ConfigShapedDevices::default());
+            return Ok(LoadedShapedDevices {
+                shaped: ConfigShapedDevices::default(),
+                source: LoadedShapedDevicesSource::TopologyImport,
+            });
         }
         match lqos_topology_compile::TopologyImportFile::load(config) {
             Ok(Some(topology_import)) => {
                 let shaped_devices = topology_import.into_imported_bundle().shaped_devices;
                 if !shaped_devices.devices.is_empty() {
-                    return Ok(shaped_devices);
+                    return Ok(LoadedShapedDevices {
+                        shaped: shaped_devices,
+                        source: LoadedShapedDevicesSource::TopologyImport,
+                    });
                 }
                 debug!(
                     "topology_import.json advertised shaped devices but loaded empty; keeping integration mode empty until topology is published"
@@ -106,16 +140,28 @@ fn load_shaped_devices_for_config(config: &lqos_config::Config) -> Result<Config
                 );
             }
         }
-        return Ok(ConfigShapedDevices::default());
+        return Ok(LoadedShapedDevices {
+            shaped: ConfigShapedDevices::default(),
+            source: LoadedShapedDevicesSource::TopologyImport,
+        });
     }
-    ConfigShapedDevices::load_for_config(config).context("Unable to load ShapedDevices.csv")
+    Ok(LoadedShapedDevices {
+        shaped: ConfigShapedDevices::load_for_config(config)
+            .context("Unable to load ShapedDevices.csv")?,
+        source: LoadedShapedDevicesSource::Csv,
+    })
 }
 
 /// Loads shaped-device configuration from disk.
 ///
-/// When an integration-backed topology ingress is enabled, this loads shaped devices from the
-/// active `topology_import.json` bundle. Otherwise, it loads `ShapedDevices.csv`.
+/// When integration-backed topology ingress is enabled, this prefers ready runtime shaping inputs,
+/// then `topology_import.json`, then an empty snapshot until the topology runtime publishes.
+/// Manual mode loads `ShapedDevices.csv`.
 pub fn load_shaped_devices() -> Result<ConfigShapedDevices> {
+    Ok(load_shaped_devices_with_source()?.shaped)
+}
+
+pub(crate) fn load_shaped_devices_with_source() -> Result<LoadedShapedDevices> {
     let config = lqos_config::load_config().context("Unable to load /etc/lqos.conf")?;
     load_shaped_devices_for_config(config.as_ref())
 }
@@ -183,8 +229,12 @@ pub fn request_reload_network_json(reason: &str) -> Result<()> {
 }
 
 /// Publishes a caller-provided shaped-devices snapshot through the runtime actor.
-pub fn apply_shaped_devices_snapshot(reason: &str, shaped: ConfigShapedDevices) -> Result<()> {
-    actor::apply_shaped_devices_snapshot(reason, shaped)
+pub fn apply_shaped_devices_snapshot(
+    reason: &str,
+    shaped: ConfigShapedDevices,
+    provenance: ShapedDevicesSnapshotProvenance,
+) -> Result<()> {
+    actor::apply_shaped_devices_snapshot(reason, shaped, provenance)
 }
 
 /// Reports kernel observations that may indicate dynamic circuit activity.

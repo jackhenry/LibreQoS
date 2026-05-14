@@ -1,4 +1,6 @@
 import importlib
+import csv
+import io
 import sys
 import types
 import unittest
@@ -22,6 +24,7 @@ def install_splynx_stubs():
     lqlib.exception_cpes = lambda: []
     lqlib.promote_to_root_list = lambda: []
     lqlib.client_bandwidth_multiplier = lambda: 1.0
+    lqlib.get_libreqos_directory = lambda: "/opt/libreqos/src"
     lqlib.write_compiled_topology_from_python_graph_payload = lambda *_args, **_kwargs: None
     lqlib.splynx_api_key = lambda: ""
     lqlib.splynx_api_secret = lambda: ""
@@ -128,20 +131,32 @@ class TestIntegrationSplynxStableIds(unittest.TestCase):
             )
         )
 
-    def test_full_mode_uses_stable_generated_unattached_site(self):
-        self.assertEqual(
-            integrationSplynx.splynx_generated_unattached_parent_id("full"),
-            "splynx_generated_unattached_site",
-        )
-        self.assertEqual(
-            integrationSplynx.splynx_generated_unattached_site_network_id(),
-            "libreqos:generated:splynx:site:unattached",
+    def test_unresolved_splynx_parent_exports_empty_parent_node(self):
+        net = integrationCommon.NetworkGraph()
+        integrationSplynx.createClientAndDevice(
+            net,
+            serviceItem={
+                "id": 93,
+                "customer_id": 29547,
+                "tariff_id": 32,
+                "mac": "2CC81BBDC9AB",
+            },
+            cust_id_to_name={29547: "Charles Massey and Alex Soto"},
+            downloadForTariffID={32: 330.0},
+            uploadForTariffID={32: 330.0},
+            parent_node_id=None,
+            ipv4_list=["66.185.224.210"],
+            ipv6_list=[],
         )
 
-    def test_non_full_modes_do_not_force_generated_unattached_site(self):
-        self.assertIsNone(integrationSplynx.splynx_generated_unattached_parent_id("ap_site"))
-        self.assertIsNone(integrationSplynx.splynx_generated_unattached_parent_id("ap_only"))
-        self.assertIsNone(integrationSplynx.splynx_generated_unattached_parent_id("flat"))
+        net.prepareTree()
+        shaped_devices_csv, circuit_anchors = net.buildShapedDevicesArtifacts()
+        rows = list(csv.DictReader(io.StringIO(shaped_devices_csv)))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Parent Node"], "")
+        self.assertEqual(rows[0]["Parent Node ID"], "")
+        self.assertEqual(circuit_anchors["anchors"], [])
 
     def test_create_infrastructure_nodes_normalizes_parent_ids(self):
         net = integrationCommon.NetworkGraph()

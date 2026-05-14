@@ -54,6 +54,7 @@ function validateConfig() {
 function updateConfig() {
     // Update only the integration_common section
     window.config.integration_common = {
+        ...(window.config.integration_common || {}),
         circuit_name_as_address: document.getElementById("circuitNameAsAddress").checked,
         use_mikrotik_ipv6: document.getElementById("useMikrotikIpv6").checked,
         queue_refresh_interval_mins: parseInt(document.getElementById("queueRefreshInterval").value),

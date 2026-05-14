@@ -5,19 +5,61 @@ use crate::{
     BUS_SOCKET_PATH, BusReply, BusRequest, BusResponse,
     bus::client::{MAGIC_NUMBER, MAGIC_RESPONSE},
 };
-use std::{ffi::CString, fs::remove_file};
+use std::{ffi::CString, fs::remove_file, time::Duration};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
+    task::spawn_blocking,
+    time::timeout,
 };
 use tracing::{debug, error, info, warn};
 
 use super::BUS_SOCKET_DIRECTORY;
 use super::protocol::{decode_session_cbor, encode_reply_cbor, read_frame, write_frame};
 
+const BUS_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn dropped_reply_response_count(reply: &BusReply) -> usize {
     reply.responses.len()
+}
+
+fn timeout_reply(request_count: usize) -> BusReply {
+    BusReply {
+        responses: (0..request_count)
+            .map(|_| BusResponse::Fail("Bus request handler timed out".to_string()))
+            .collect(),
+    }
+}
+
+async fn handle_requests_with_deadline(
+    handle_bus_requests: fn(&[BusRequest], &mut Vec<BusResponse>),
+    requests: Vec<BusRequest>,
+) -> BusReply {
+    let request_count = requests.len();
+    let handler = spawn_blocking(move || {
+        let mut response = BusReply {
+            responses: Vec::with_capacity(request_count),
+        };
+        handle_bus_requests(&requests, &mut response.responses);
+        response
+    });
+
+    match timeout(BUS_HANDLER_TIMEOUT, handler).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            warn!("Bus request handler task failed: {err}");
+            BusReply {
+                responses: (0..request_count)
+                    .map(|_| BusResponse::Fail("Bus request handler failed".to_string()))
+                    .collect(),
+            }
+        }
+        Err(_) => {
+            warn!("Bus request handler timed out after {BUS_HANDLER_TIMEOUT:?}");
+            timeout_reply(request_count)
+        }
+    }
 }
 
 /// Implements a Tokio-friendly server using Unix Sockets and the bus protocol.
@@ -113,8 +155,7 @@ impl UnixSocketServer {
               ret = bus_rx.recv() => {
                 // We received a channel-based message
                 if let Some((reply_channel, msg)) = ret {
-                  let mut response = BusReply { responses: Vec::with_capacity(8) };
-                  handle_bus_requests(&[msg], &mut response.responses);
+                  let response = handle_requests_with_deadline(handle_bus_requests, vec![msg]).await;
                   if let Err(reply) = reply_channel.send(response) {
                       warn!(
                           dropped_response_count = dropped_reply_response_count(&reply),
@@ -182,8 +223,9 @@ impl UnixSocketServer {
                         debug!("Received request: {:?}", request);
 
                         // Handle the request and build the response
-                        let mut response = BusReply { responses: Vec::with_capacity(8) };
-                        handle_bus_requests(&request.requests, &mut response.responses);
+                        let response =
+                            handle_requests_with_deadline(handle_bus_requests, request.requests)
+                                .await;
 
                         // Encode the response
                         let Ok(encoded_response) = encode_reply_cbor(&response) else {

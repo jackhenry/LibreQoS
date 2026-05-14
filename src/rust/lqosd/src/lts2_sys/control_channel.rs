@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use futures_util::{StreamExt, sink::SinkExt};
+use futures_util::{StreamExt, sink::SinkExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 use tokio::net::TcpStream;
@@ -23,6 +23,11 @@ pub use messages::{
 };
 
 const SHAPER_VERSION_STRING: &str = include_str!("../../../../VERSION_STRING");
+const CONTROL_CHANNEL_QUEUE_DEPTH: usize = 256;
+const CONNECTION_COMMAND_QUEUE_DEPTH: usize = 1024;
+const SOCKET_SENDER_QUEUE_DEPTH: usize = 32;
+
+type ControlSocketWriter = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 fn current_shaper_version() -> Option<String> {
     let version = SHAPER_VERSION_STRING.trim();
@@ -133,7 +138,7 @@ pub struct ControlChannelBuilder {
 
 pub fn init_control_channel() -> Result<ControlChannelBuilder> {
     // Doing this two-step: make the channel here and then spawn the task
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let (tx, rx) = tokio::sync::mpsc::channel(CONTROL_CHANNEL_QUEUE_DEPTH);
     Ok(ControlChannelBuilder { tx, rx })
 }
 
@@ -148,7 +153,7 @@ pub async fn start_control_channel(builder: ControlChannelBuilder) -> Result<()>
 
 async fn control_channel_loop(mut builder: ControlChannelBuilder) -> Result<()> {
     // Handle the persistent channel to Insight here
-    let (tx, rx) = tokio::sync::mpsc::channel::<ConnectionCommand>(1024);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ConnectionCommand>(CONNECTION_COMMAND_QUEUE_DEPTH);
     tokio::spawn(persistent_connection(rx));
 
     while let Some(cmd) = builder.rx.recv().await {
@@ -273,6 +278,72 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(30);
 // Prevent unbounded growth while waiting for Welcome
 const MAX_PENDING_CHATBOT_MESSAGES: usize = 256;
 
+fn encode_ws_binary(
+    message: &messages::WsMessage,
+    label: &'static str,
+) -> std::result::Result<Message, ()> {
+    let Ok((_, _, bytes)) = message.to_bytes() else {
+        error!("Failed to serialize {label} message");
+        return Err(());
+    };
+    Ok(Message::Binary(bytes))
+}
+
+async fn send_ws_message_now(
+    write: &mut ControlSocketWriter,
+    message: Message,
+    label: &'static str,
+) -> std::result::Result<(), ()> {
+    let Ok(Ok(_)) = timeout(TCP_TIMEOUT, write.send(message)).await else {
+        error!("Failed to send {label} message");
+        return Err(());
+    };
+    Ok(())
+}
+
+async fn send_ingest_batch(
+    write: &mut ControlSocketWriter,
+    serial: usize,
+    chunks: Vec<Vec<u8>>,
+) -> std::result::Result<usize, ()> {
+    let n_chunks = chunks.len();
+    let byte_count = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
+
+    let begin = messages::WsMessage::BeginIngest {
+        unique_id: serial as u64,
+        n_chunks: n_chunks as u64,
+    };
+    send_ws_message_now(
+        write,
+        encode_ws_binary(&begin, "BeginIngest")?,
+        "BeginIngest",
+    )
+    .await?;
+
+    for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+        let ingest_chunk = messages::WsMessage::IngestChunk {
+            unique_id: serial as u64,
+            chunk: chunk_index as u64,
+            n_chunks: n_chunks as u64,
+            data: chunk,
+        };
+        send_ws_message_now(
+            write,
+            encode_ws_binary(&ingest_chunk, "IngestChunk")?,
+            "IngestChunk",
+        )
+        .await?;
+    }
+
+    let end = messages::WsMessage::EndIngest {
+        unique_id: serial as u64,
+        n_chunks: n_chunks as u64,
+    };
+    send_ws_message_now(write, encode_ws_binary(&end, "EndIngest")?, "EndIngest").await?;
+
+    Ok(byte_count)
+}
+
 async fn persistent_connection(
     mut rx: tokio::sync::mpsc::Receiver<ConnectionCommand>,
 ) -> std::result::Result<(), String> {
@@ -303,7 +374,7 @@ async fn persistent_connection(
             // Split the socket
             let (mut write, mut read) = socket.split();
             let (socket_sender_tx, mut socket_sender_rx) =
-                tokio::sync::mpsc::channel::<Message>(32);
+                tokio::sync::mpsc::channel::<Message>(SOCKET_SENDER_QUEUE_DEPTH);
             let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
             let mut license_interval = tokio::time::interval(Duration::from_secs(60 * 15)); // 15 minutes
             let mut pending_history: HashMap<
@@ -363,61 +434,11 @@ async fn persistent_connection(
                                     info!("Not permitted to send chunks yet");
                                     continue 'message_pump;
                                 }
-                                let n_chunks = chunks.len();
-                                let byte_count = chunks.iter().map(|c| c.len()).sum::<usize>();
-
-                                // Send BeginIngest
-                                let Ok((_, _, bytes)) = messages::WsMessage::BeginIngest { unique_id: serial as u64, n_chunks: n_chunks as u64 }.to_bytes() else {
-                                    error!("Failed to serialize BeginIngest message");
+                                let Ok(byte_count) =
+                                    send_ingest_batch(&mut write, serial, chunks).await
+                                else {
                                     break 'message_pump;
                                 };
-                                if let Err(e) = socket_sender_tx.try_send(Message::Binary(bytes)) {
-                                    match e {
-                                        TrySendError::Full(_) => {
-                                            warn!("Send unavailable: BeginIngest queue full; dropping message");
-                                        }
-                                        TrySendError::Closed(_) => {
-                                            error!("Failed to send BeginIngest message: channel closed");
-                                            break 'message_pump;
-                                        }
-                                    }
-                                }
-
-                                // Submit Each Chunk
-                                for (i, chunk) in chunks.into_iter().enumerate() {
-                                    let Ok((_, _, bytes)) = messages::WsMessage::IngestChunk { unique_id: serial as u64, chunk: i as u64, n_chunks: n_chunks as u64, data: chunk }.to_bytes() else {
-                                        error!("Failed to serialize IngestChunk message");
-                                        break 'message_pump;
-                                    };
-                                    if let Err(e) = socket_sender_tx.try_send(Message::Binary(bytes)) {
-                                        match e {
-                                            TrySendError::Full(_) => {
-                                                warn!("Send unavailable: IngestChunk queue full; dropping chunk");
-                                            }
-                                            TrySendError::Closed(_) => {
-                                                error!("Failed to send IngestChunk message: channel closed");
-                                                break 'message_pump;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Send EndIngest
-                                let Ok((_, _, bytes)) = messages::WsMessage::EndIngest { unique_id: serial as u64, n_chunks: n_chunks as u64 }.to_bytes() else {
-                                    error!("Failed to serialize EndIngest message");
-                                    break 'message_pump;
-                                };
-                                if let Err(e) = socket_sender_tx.try_send(Message::Binary(bytes)) {
-                                    match e {
-                                        TrySendError::Full(_) => {
-                                            warn!("Send unavailable: EndIngest queue full; dropping message");
-                                        }
-                                        TrySendError::Closed(_) => {
-                                            error!("Failed to send EndIngest message: channel closed");
-                                            break 'message_pump;
-                                        }
-                                    }
-                                }
                                 debug!("Submitted {} bytes for ingestion", byte_count);
                             }
                             Some(ConnectionCommand::FetchHistory { request, responder }) => {
@@ -1735,4 +1756,36 @@ async fn tree_snapshot_streaming(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_ws_binary_round_trips_begin_ingest() {
+        let encoded = encode_ws_binary(
+            &messages::WsMessage::BeginIngest {
+                unique_id: 42,
+                n_chunks: 7,
+            },
+            "BeginIngest",
+        )
+        .expect("BeginIngest should encode");
+
+        let Message::Binary(bytes) = encoded else {
+            panic!("BeginIngest should encode to a binary websocket frame");
+        };
+
+        match messages::WsMessage::from_bytes(&bytes).expect("BeginIngest should decode") {
+            messages::WsMessage::BeginIngest {
+                unique_id,
+                n_chunks,
+            } => {
+                assert_eq!(unique_id, 42);
+                assert_eq!(n_chunks, 7);
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
 }

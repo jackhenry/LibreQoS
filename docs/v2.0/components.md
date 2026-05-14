@@ -33,6 +33,7 @@ flowchart LR
 ### lqos_scheduler
 
 - lqos_scheduler performs continuous refreshes of LibreQoS' shapers, including pulling from any enabled CRM Integrations (UISP, Splynx, Netzur).
+- Packaged installs run scheduler Python from the root-owned virtual environment at `/opt/libreqos/venv`.
 - Actions:
   - On start: Run a full setup of queues
     - Current builds wait briefly for `lqosd` to finish binding the local bus before the first scheduler run.
@@ -91,19 +92,19 @@ sudo systemctl stop lqos_scheduler
 For one-time runs of LibreQoS.py, use
 
 ```shell
-sudo ./LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 - To use the debug mode with more verbose output, use:
 
 ```shell
-sudo ./LibreQoS.py --debug
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py --debug
 ```
 
 To confirm that lqos_scheduler (scheduler.py) is able to work correctly, run:
 
 ```shell
-sudo python3 scheduler.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/scheduler.py
 ```
 
 If an integration fails during a scheduler run, current builds keep the scheduler alive, surface a shortened output preview in scheduler status/error reporting, and save the full captured output to a timestamped `/tmp/lqos_scheduler_<integration>_*.log` file.

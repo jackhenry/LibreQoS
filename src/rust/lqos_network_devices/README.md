@@ -11,8 +11,8 @@ Centralized, shared access to LibreQoS topology inputs:
 In daemon mode, this crate starts:
 
 - A single-thread actor that owns reload/apply commands.
-- Watchers for the config directory and topology-state directory that coalesce
-  filesystem events and request reloads.
+- Watchers for the config directory, topology-state directory, and shaping-state
+  directory that coalesce filesystem events and request reloads.
 
 Callers access state through public accessor functions; the underlying channel sender is kept in a
 private static.
@@ -27,7 +27,7 @@ private static.
 - `with_network_json_write(|net_json| ...)`: mutable access to in-memory `NetworkJson` (used by runtime counters).
 - `resolve_parent_node_reference(parent_node, parent_node_id)`: canonicalize shaped-device parent references against `network.json`.
 - `request_reload_shaped_devices(reason)` / `request_reload_network_json(reason)`: ask actor to reload from disk.
-- `apply_shaped_devices_snapshot(reason, shaped)`: publish a caller-provided shaped-devices snapshot via actor.
+- `apply_shaped_devices_snapshot(reason, shaped, provenance)`: publish a caller-provided shaped-devices snapshot via actor.
 - `swap_shaped_devices_snapshot(reason, shaped_arc)`: replace shaped-devices snapshot without actor (intended for tests).
 
 ## `ShapedDevicesCatalog` helpers
@@ -48,16 +48,18 @@ Runtime throughput tracking mutates the in-memory `NetworkJson` via `with_networ
 
 ## Access & update catalog
 
-Current (2026-04) call sites and update patterns:
+Call sites and update patterns:
 
 - Daemon startup: `lqosd` calls `start_daemon_mode()` once at boot and provides `DaemonHooks`.
 - Shaped-device updates:
-  - Directory watcher requests reload when `topology_runtime_status.json`,
-    `ShapedDevices.csv`, or `ShapedDevices.insight.csv` changes.
-  - Reload precedence is: ready runtime shaping inputs, then `topology_import.json`,
-    then `ShapedDevices.csv`.
+  - Directory watcher requests reload when `shaping_inputs.json`,
+    `topology_import.json`, `ShapedDevices.csv`, or `ShapedDevices.insight.csv` changes.
+  - `topology_runtime_status.json` is readiness metadata and does not trigger a shaped-device reload by itself.
+  - In integration-ingress mode, reload precedence is: ready runtime shaping inputs,
+    then `topology_import.json`, then an empty snapshot until the topology runtime publishes.
+  - In manual mode, reloads use `ShapedDevices.csv` or `ShapedDevices.insight.csv`.
   - Node manager admin edits write `ShapedDevices.csv` and immediately publish the new snapshot via
-    `apply_shaped_devices_snapshot()`.
+    `apply_shaped_devices_snapshot()` with external-snapshot provenance.
 - Network topology updates:
   - Directory watcher requests reload when `network.json`, `network.insight.json`, or
     `network.effective.json` changes, including the runtime topology-state copy.

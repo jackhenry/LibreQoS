@@ -2,27 +2,39 @@ import { get_ws_client } from "../pubsub/ws";
 
 const wsClient = get_ws_client();
 const secretBindings = [];
+const CONFIG_SAVE_TIMEOUT_MS = 10000;
 
-export function sendWsRequest(responseEvent, request, onComplete, onError) {
+export function sendWsRequest(responseEvent, request, onComplete, onError, options = {}) {
     let done = false;
-    const responseHandler = (msg) => {
+    let timeoutId = null;
+    const finish = (callback, msg) => {
         if (done) return;
         done = true;
+        if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+        }
         wsClient.off(responseEvent, responseHandler);
         wsClient.off("Error", errorHandler);
-        onComplete(msg);
+        if (callback) {
+            callback(msg);
+        }
+    };
+    const responseHandler = (msg) => {
+        finish(onComplete, msg);
     };
     const errorHandler = (msg) => {
-        if (done) return;
-        done = true;
-        wsClient.off(responseEvent, responseHandler);
-        wsClient.off("Error", errorHandler);
-        if (onError) {
-            onError(msg);
-        }
+        finish(onError, msg);
     };
     wsClient.on(responseEvent, responseHandler);
     wsClient.on("Error", errorHandler);
+    if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+        timeoutId = setTimeout(() => {
+            finish(onError, {
+                message: options.timeoutMessage || `Timed out waiting for ${responseEvent}`,
+            });
+        }, options.timeoutMs);
+    }
     wsClient.send(request);
 }
 
@@ -34,11 +46,17 @@ function ensureOptionalConfigSections(config) {
     if (!config.splynx_integration || typeof config.splynx_integration !== "object") {
         config.splynx_integration = {};
     }
+    if (!config.integration_common || typeof config.integration_common !== "object") {
+        config.integration_common = {};
+    }
     if (!config.topology || typeof config.topology !== "object") {
         config.topology = {};
     }
     if (!config.ssl || typeof config.ssl !== "object") {
         config.ssl = {};
+    }
+    if (!config.uisp_integration || typeof config.uisp_integration !== "object") {
+        config.uisp_integration = {};
     }
 
     if (!config.sonar_integration || typeof config.sonar_integration !== "object") {
@@ -154,6 +172,17 @@ export function loadConfig(onComplete, onError) {
 
 export function saveConfig(onComplete, onError) {
     const clearSecrets = window.configSecretClears || {};
+    const reportError = (msg) => {
+        const errorMsg = (msg && msg.message) ? msg.message : "Request failed";
+        const detail = (msg && typeof msg === "object")
+            ? { ...msg, message: errorMsg }
+            : { message: errorMsg };
+        if (onError) {
+            onError(detail);
+        } else {
+            alert("Error saving configuration: " + errorMsg);
+        }
+    };
     sendWsRequest(
         "UpdateConfigResult",
         {
@@ -163,29 +192,29 @@ export function saveConfig(onComplete, onError) {
             },
         },
         (msg) => {
-            if (msg && msg.ok) {
-                secretBindings.forEach((binding) => {
-                    const sectionState = secretFieldMap(window.configSecretState || {}, binding.section);
-                    const inputValue = binding.input.value.trim();
-                    sectionState[binding.field] = clearSecrets?.[binding.section]?.[binding.field]
-                        ? false
-                        : (inputValue.length > 0 || sectionState[binding.field]);
-                    if (window.config?.[binding.section] && typeof window.config[binding.section] === "object") {
-                        window.config[binding.section][binding.field] = "";
-                    }
-                    binding.input.value = "";
-                    setSecretClear(binding.section, binding.field, false);
-                    binding.updateStatus();
-                });
+            if (!msg || !msg.ok) {
+                reportError(msg);
+                return;
             }
+            secretBindings.forEach((binding) => {
+                const sectionState = secretFieldMap(window.configSecretState || {}, binding.section);
+                const inputValue = binding.input.value.trim();
+                sectionState[binding.field] = clearSecrets?.[binding.section]?.[binding.field]
+                    ? false
+                    : (inputValue.length > 0 || sectionState[binding.field]);
+                if (window.config?.[binding.section] && typeof window.config[binding.section] === "object") {
+                    window.config[binding.section][binding.field] = "";
+                }
+                binding.input.value = "";
+                setSecretClear(binding.section, binding.field, false);
+                binding.updateStatus();
+            });
             if (onComplete) onComplete(msg);
         },
-        (msg) => {
-            if (onError) {
-                onError(msg);
-            } else {
-                alert("That didn't work");
-            }
+        reportError,
+        {
+            timeoutMs: CONFIG_SAVE_TIMEOUT_MS,
+            timeoutMessage: "Timed out waiting for the config save result. The websocket may have disconnected.",
         },
     );
 }

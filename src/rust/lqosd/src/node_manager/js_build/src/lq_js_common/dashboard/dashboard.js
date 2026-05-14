@@ -5,6 +5,9 @@ import {heading5Icon} from "../helpers/content_builders";
 import {openDashboardEditor} from "./dashboard_editor";
 
 const DIAGNOSTIC_CHANNELS = new Set(["Cpu", "Ram", "RttHistogram"]);
+const DASHBOARD_DATA_STALE_MS = 15000;
+const DASHBOARD_SUBSCRIPTION_REFRESH_COOLDOWN_MS = 30000;
+const DASHBOARD_WATCHDOG_INTERVAL_MS = 5000;
 
 export class Dashboard {
     // Takes the target DIV in which to build the dashboard,
@@ -51,6 +54,9 @@ export class Dashboard {
         this.channelDisposers = new Map();
         this.subscribedChannels = new Set();
         this.lastMessages = new Map();
+        this.lastDashboardMessageAt = Date.now();
+        this.lastSubscriptionRefreshAt = 0;
+        this.watchdogTimer = null;
 
         // Auto Refresh Handling
         this.paused = false;
@@ -256,10 +262,12 @@ export class Dashboard {
         }
         this.#queueImmediateDashlets(renderableDashlets);
         this.#syncWebSocketChannels();
+        this.#startWatchdog();
         this.#replayCachedMessages(renderableDashlets);
     }
 
     destroy() {
+        this.#stopWatchdog();
         this.#disposeWebSocketChannels();
         if (window.__lqosDashboardDashletHook) {
             delete window.__lqosDashboardDashletHook;
@@ -680,12 +688,52 @@ export class Dashboard {
         });
     }
 
+    #startWatchdog() {
+        this.#stopWatchdog();
+        this.lastDashboardMessageAt = Date.now();
+        this.watchdogTimer = window.setInterval(() => {
+            this.#checkDashboardDataFlow();
+        }, DASHBOARD_WATCHDOG_INTERVAL_MS);
+    }
+
+    #stopWatchdog() {
+        if (this.watchdogTimer !== null) {
+            window.clearInterval(this.watchdogTimer);
+            this.watchdogTimer = null;
+        }
+    }
+
+    #checkDashboardDataFlow() {
+        if (this.paused || this.subscribedChannels.size === 0) {
+            return;
+        }
+        const now = Date.now();
+        const ageMs = now - this.lastDashboardMessageAt;
+        if (ageMs < DASHBOARD_DATA_STALE_MS) {
+            return;
+        }
+        if (now - this.lastSubscriptionRefreshAt < DASHBOARD_SUBSCRIPTION_REFRESH_COOLDOWN_MS) {
+            return;
+        }
+        const activeChannels = Array.from(this.subscribedChannels);
+        this.lastSubscriptionRefreshAt = now;
+        this.lastDashboardMessageAt = now;
+        this.#debug("stale-data-refresh", {
+            ageMs,
+            channels: activeChannels,
+            wsConnected: !!this.wsClient.ws,
+            handshakeDone: !!this.wsClient.handshake_done,
+        });
+        this.wsClient.refreshSubscriptions("dashboard-data-stale");
+    }
+
     #handleWebSocketMessage(msg) {
         if (!msg || !msg.event || this.paused) {
             return;
         }
 
         this.lastMessages.set(msg.event, msg);
+        this.lastDashboardMessageAt = Date.now();
         this.tickCounter++;
         this.tickCounter %= this.cadence;
         const renderableDashlets = this.#renderableDashlets();

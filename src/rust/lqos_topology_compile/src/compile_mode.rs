@@ -50,11 +50,6 @@ struct CircuitProjection {
     node_name: String,
 }
 
-const GENERATED_UNATTACHED_SITE_ID: &str = "libreqos:generated:site:unattached";
-const GENERATED_UNATTACHED_SITE_NAME: &str = "LibreQoS Unattached [Site]";
-const GENERATED_UNATTACHED_AP_ID: &str = "libreqos:generated:ap:unattached";
-const GENERATED_UNATTACHED_AP_NAME: &str = "LibreQoS Unattached [AP]";
-
 fn empty_parent_candidates(source: &str) -> TopologyParentCandidatesFile {
     TopologyParentCandidatesFile {
         source: source.to_string(),
@@ -328,85 +323,6 @@ where
             });
     }
     circuits
-}
-
-fn unresolved_circuits(
-    imported: &ImportedTopologyBundle,
-    projection: &HashMap<String, CircuitProjection>,
-) -> Vec<(String, String)> {
-    let mut unresolved = Vec::new();
-    let mut seen = HashSet::new();
-    for device in &imported.shaped_devices.devices {
-        if projection.contains_key(&device.circuit_id) || !seen.insert(device.circuit_id.clone()) {
-            continue;
-        }
-        unresolved.push((device.circuit_id.clone(), device.circuit_name.clone()));
-    }
-    unresolved
-}
-
-fn generated_ap_node() -> ExportedNode {
-    ExportedNode {
-        id: GENERATED_UNATTACHED_AP_ID.to_string(),
-        name: GENERATED_UNATTACHED_AP_NAME.to_string(),
-        kind: "AP".to_string(),
-        parent_id: None,
-        download_mbps: None,
-        upload_mbps: None,
-    }
-}
-
-fn generated_site_node() -> ExportedNode {
-    ExportedNode {
-        id: GENERATED_UNATTACHED_SITE_ID.to_string(),
-        name: GENERATED_UNATTACHED_SITE_NAME.to_string(),
-        kind: "Site".to_string(),
-        parent_id: None,
-        download_mbps: None,
-        upload_mbps: None,
-    }
-}
-
-fn exported_unattached_fallback_node(
-    nodes_by_id: &HashMap<String, ExportedNode>,
-) -> Option<ExportedNode> {
-    let mut preferred_site = None;
-    let mut preferred_ap = None;
-    for node in nodes_by_id.values() {
-        let id = node.id.to_ascii_lowercase();
-        let name = node.name.to_ascii_lowercase();
-        let is_unattached = id.contains("unattach")
-            || name.contains("unattach")
-            || id.contains("orphan")
-            || name.contains("orphan");
-        if !is_unattached {
-            continue;
-        }
-        if node.kind.eq_ignore_ascii_case("site") {
-            preferred_site = Some(node.clone());
-            break;
-        }
-        if preferred_ap.is_none() && node.kind.eq_ignore_ascii_case("ap") {
-            preferred_ap = Some(node.clone());
-        }
-    }
-    preferred_site.or(preferred_ap)
-}
-
-fn attach_unresolved_to_projection(
-    projection: &mut HashMap<String, CircuitProjection>,
-    unresolved: Vec<(String, String)>,
-    fallback_node: &ExportedNode,
-) {
-    for (circuit_id, _circuit_name) in unresolved {
-        projection.insert(
-            circuit_id,
-            CircuitProjection {
-                node_id: fallback_node.id.clone(),
-                node_name: fallback_node.name.clone(),
-            },
-        );
-    }
 }
 
 fn set_number(map: &mut Map<String, Value>, key: &str, value: Option<u64>, fallback: u64) {
@@ -706,8 +622,6 @@ fn compile_full_like(
 ) -> Result<CompiledTopologyBundle> {
     let source = compiled_source(&imported.source, mode);
     let ingress_identity = compiled_ingress_identity(&imported, mode);
-    let (exported_nodes_by_id, _) = exported_index(&imported.compatibility_network_json);
-    let unresolved_fallback = exported_unattached_fallback_node(&exported_nodes_by_id);
     let mut editor = sanitized_editor_state(&source, imported.generated_unix, &imported);
     editor.ingress_identity = ingress_identity.clone();
     let mut canonical = TopologyCanonicalStateFile::from_editor_and_network(
@@ -723,18 +637,6 @@ fn compile_full_like(
         .unwrap_or_else(|| empty_parent_candidates(&source));
     parent_candidates.source = source.clone();
     parent_candidates.ingress_identity = ingress_identity.clone();
-    let mut shaped_devices = imported.shaped_devices.devices;
-    if let Some(fallback) = unresolved_fallback {
-        for device in &mut shaped_devices {
-            let missing_parent = device.parent_node.trim().is_empty()
-                && device.parent_node_id.is_none()
-                && device.anchor_node_id.is_none();
-            if missing_parent {
-                device.parent_node = fallback.name.clone();
-                device.parent_node_id = Some(fallback.id.clone());
-            }
-        }
-    }
     Ok(CompiledTopologyBundle {
         source: source.clone(),
         generated_unix: imported.generated_unix,
@@ -743,7 +645,7 @@ fn compile_full_like(
         editor,
         parent_candidates,
         compatibility_network_json: imported.compatibility_network_json,
-        shaped_devices: make_shaped_devices(shaped_devices),
+        shaped_devices: make_shaped_devices(imported.shaped_devices.devices),
         circuit_anchors: CircuitAnchorsFile {
             schema_version: imported.circuit_anchors.schema_version,
             source,
@@ -767,10 +669,9 @@ fn compile_flat(imported: ImportedTopologyBundle) -> CompiledTopologyBundle {
 
 fn compile_ap_only(imported: ImportedTopologyBundle) -> Result<CompiledTopologyBundle> {
     let source = compiled_source(&imported.source, TopologyCompileMode::ApOnly);
-    let mut projection = circuit_projection_map(&imported, |nodes_by_id, node_id| {
+    let projection = circuit_projection_map(&imported, |nodes_by_id, node_id| {
         nearest_kind(nodes_by_id, node_id, "AP")
     });
-    let unresolved = unresolved_circuits(&imported, &projection);
     let (nodes_by_id, _) = native_projection_index(&imported);
     let mut root = BTreeMap::<String, Value>::new();
     let mut seen = HashSet::new();
@@ -783,11 +684,6 @@ fn compile_ap_only(imported: ImportedTopologyBundle) -> Result<CompiledTopologyB
         };
         root.insert(node.name.clone(), ap_object(node, None));
     }
-    if !unresolved.is_empty() {
-        let fallback_ap = generated_ap_node();
-        attach_unresolved_to_projection(&mut projection, unresolved, &fallback_ap);
-        root.insert(fallback_ap.name.clone(), ap_object(&fallback_ap, None));
-    }
     Ok(projected_outputs(
         imported,
         projection,
@@ -799,10 +695,9 @@ fn compile_ap_only(imported: ImportedTopologyBundle) -> Result<CompiledTopologyB
 
 fn compile_ap_site(imported: ImportedTopologyBundle) -> Result<CompiledTopologyBundle> {
     let source = compiled_source(&imported.source, TopologyCompileMode::ApSite);
-    let mut projection = circuit_projection_map(&imported, |nodes_by_id, node_id| {
+    let projection = circuit_projection_map(&imported, |nodes_by_id, node_id| {
         nearest_kind(nodes_by_id, node_id, "AP")
     });
-    let unresolved = unresolved_circuits(&imported, &projection);
     let (nodes_by_id, _) = native_projection_index(&imported);
     let mut groups = BTreeMap::<String, (ExportedNode, BTreeMap<String, Value>)>::new();
     let mut synthetic_counter = 0usize;
@@ -833,21 +728,6 @@ fn compile_ap_site(imported: ImportedTopologyBundle) -> Result<CompiledTopologyB
         entry.1.insert(
             ap.name.clone(),
             ap_object(&ap, Some(site_entry.name.as_str())),
-        );
-    }
-    if !unresolved.is_empty() {
-        let fallback_site = generated_site_node();
-        let fallback_ap = ExportedNode {
-            parent_id: Some(fallback_site.id.clone()),
-            ..generated_ap_node()
-        };
-        attach_unresolved_to_projection(&mut projection, unresolved, &fallback_ap);
-        let entry = groups
-            .entry(fallback_site.id.clone())
-            .or_insert_with(|| (fallback_site.clone(), BTreeMap::new()));
-        entry.1.insert(
-            fallback_ap.name.clone(),
-            ap_object(&fallback_ap, Some(fallback_site.name.as_str())),
         );
     }
     let mut root = BTreeMap::<String, Value>::new();
@@ -892,10 +772,7 @@ pub fn compile_topology(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GENERATED_UNATTACHED_AP_ID, GENERATED_UNATTACHED_AP_NAME, GENERATED_UNATTACHED_SITE_NAME,
-        TopologyCompileMode, compile_topology,
-    };
+    use super::{TopologyCompileMode, compile_topology};
     use crate::bundle::ImportedTopologyBundle;
     use lqos_config::{
         CircuitAnchor, CircuitAnchorsFile, ConfigShapedDevices, ShapedDevice,
@@ -1044,22 +921,24 @@ mod tests {
     }
 
     #[test]
-    fn ap_only_drops_unresolved_orphan_parents() {
+    fn ap_only_leaves_unresolved_orphan_parents_unattached() {
         let compiled = compile_topology(imported_bundle(), TopologyCompileMode::ApOnly)
             .expect("ap_only compilation should succeed");
-        assert_eq!(compiled.circuit_anchors.anchors.len(), 3);
-        assert!(compiled.compatibility_network_json[GENERATED_UNATTACHED_AP_NAME].is_object());
+        assert_eq!(compiled.circuit_anchors.anchors.len(), 2);
+        assert!(
+            compiled
+                .compatibility_network_json
+                .get("LibreQoS Unattached [AP]")
+                .is_none()
+        );
         let device = compiled
             .shaped_devices
             .devices
             .iter()
             .find(|device| device.circuit_id == "circuit-3")
             .expect("unresolved circuit should still be emitted");
-        assert_eq!(
-            device.parent_node_id.as_deref(),
-            Some(GENERATED_UNATTACHED_AP_ID)
-        );
-        assert_eq!(device.parent_node, GENERATED_UNATTACHED_AP_NAME);
+        assert!(device.parent_node.is_empty());
+        assert!(device.parent_node_id.is_none());
     }
 
     #[test]
@@ -1079,27 +958,15 @@ mod tests {
             .expect("site should have children");
         assert!(children.get("AP North").is_some());
         assert!(children.get("AP South").is_some());
-        let fallback_site = root[GENERATED_UNATTACHED_SITE_NAME]
-            .as_object()
-            .expect("fallback site should be present for unresolved circuits");
-        let fallback_children = fallback_site["children"]
-            .as_object()
-            .expect("fallback site should have children");
-        assert!(
-            fallback_children
-                .get(GENERATED_UNATTACHED_AP_NAME)
-                .is_some()
-        );
+        assert!(root.get("LibreQoS Unattached [Site]").is_none());
         let device = compiled
             .shaped_devices
             .devices
             .iter()
             .find(|device| device.circuit_id == "circuit-3")
             .expect("unresolved circuit should still be emitted");
-        assert_eq!(
-            device.parent_node_id.as_deref(),
-            Some(GENERATED_UNATTACHED_AP_ID)
-        );
+        assert!(device.parent_node.is_empty());
+        assert!(device.parent_node_id.is_none());
     }
 
     #[test]
@@ -1359,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_assigns_blank_parent_circuits_to_exported_unattached_site() {
+    fn full_mode_leaves_blank_parent_circuits_unattached() {
         let mut imported = imported_bundle();
         imported.compatibility_network_json = json!({
             "Site Alpha": {
@@ -1411,11 +1278,8 @@ mod tests {
             .find(|device| device.circuit_id == "circuit-3")
             .expect("unresolved circuit should still be emitted");
 
-        assert_eq!(device.parent_node, "LibreQoS Unattached [Site]");
-        assert_eq!(
-            device.parent_node_id.as_deref(),
-            Some("libreqos:generated:splynx:site:unattached")
-        );
+        assert!(device.parent_node.is_empty());
+        assert!(device.parent_node_id.is_none());
     }
 
     #[test]

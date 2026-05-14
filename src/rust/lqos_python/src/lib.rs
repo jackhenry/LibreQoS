@@ -942,6 +942,7 @@ fn liblqos_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_ip_mapping, m)?)?;
     m.add_function(wrap_pyfunction!(validate_shaped_devices, m)?)?;
     m.add_function(wrap_pyfunction!(wait_for_bus_ready, m)?)?;
+    m.add_function(wrap_pyfunction!(xdp_ip_mapping_ready, m)?)?;
     m.add_function(wrap_pyfunction!(is_libre_already_running, m)?)?;
     m.add_function(wrap_pyfunction!(create_lock_file, m)?)?;
     m.add_function(wrap_pyfunction!(free_lock_file, m)?)?;
@@ -987,7 +988,6 @@ fn liblqos_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(uisp_suspended_strategy, m)?)?;
     m.add_function(wrap_pyfunction!(airmax_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(ltu_capacity, m)?)?;
-    m.add_function(wrap_pyfunction!(use_ptmp_as_parent, m)?)?;
     m.add_function(wrap_pyfunction!(uisp_base_url, m)?)?;
     m.add_function(wrap_pyfunction!(uisp_auth_token, m)?)?;
     m.add_function(wrap_pyfunction!(splynx_api_key, m)?)?;
@@ -1085,6 +1085,7 @@ fn liblqos_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scheduler_error, m)?)?;
     m.add_function(wrap_pyfunction!(scheduler_output, m)?)?;
     m.add_function(wrap_pyfunction!(submit_urgent_issue, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_urgent_issue_by_identity, m)?)?;
     m.add_function(wrap_pyfunction!(xdp_ip_mapping_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(is_insight_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(log_info, m)?)?;
@@ -1378,6 +1379,13 @@ impl BatchedCommands {
 #[pyfunction]
 fn xdp_ip_mapping_capacity() -> PyResult<usize> {
     Ok(lqos_sys::ip_mapping_capacity())
+}
+
+/// Returns whether the pinned BPF maps required for XDP IP mapping updates are ready.
+#[pyfunction]
+fn xdp_ip_mapping_ready() -> PyResult<bool> {
+    lqos_sys::ip_mapping_subsystem_ready()
+        .map_err(|e| PyOSError::new_err(format!("Unable to inspect XDP IP mapping maps: {e}")))
 }
 
 /// Requests Rust-side validation of `ShapedDevices.csv`
@@ -2240,8 +2248,10 @@ fn committed_bandwidth_multiplier() -> PyResult<f32> {
 /// A UISP exception CPE entry paired with its forced parent.
 pub struct PyExceptionCpe {
     /// Child CPE site or device identifier.
+    #[pyo3(get)]
     pub cpe: String,
     /// Parent identifier assigned to the exception CPE.
+    #[pyo3(get)]
     pub parent: String,
 }
 
@@ -2288,12 +2298,6 @@ fn airmax_capacity() -> PyResult<f32> {
 fn ltu_capacity() -> PyResult<f32> {
     let config = lqos_config::load_config().unwrap();
     Ok(config.uisp_integration.ltu_capacity)
-}
-
-#[pyfunction]
-fn use_ptmp_as_parent() -> PyResult<bool> {
-    let config = lqos_config::load_config().unwrap();
-    Ok(config.uisp_integration.use_ptmp_as_parent)
 }
 
 #[pyfunction]
@@ -3565,12 +3569,26 @@ impl Bakery {
                 estimated_memory_bytes: detail.estimated_memory_bytes,
             })
             .collect::<Vec<_>>();
+        let qdisc_counts_fit = estimate
+            .interfaces
+            .values()
+            .all(|count| *count <= estimate.safe_budget);
+        let preflight_status = match (qdisc_counts_fit, estimate.memory_ok) {
+            (true, true) => "fits preflight",
+            (false, true) => "exceeds qdisc-count preflight",
+            (true, false) => "passed qdisc-count preflight but failed memory preflight",
+            (false, false) => "exceeds qdisc-count preflight and failed memory preflight",
+        };
         let memory_summary = if let Some(snapshot) = estimate.memory_snapshot.as_ref() {
+            let required_available_bytes = estimate
+                .memory_guard_min_available_bytes
+                .saturating_add(estimate.estimated_total_memory_bytes);
             format!(
-                "estimated qdisc memory {} bytes with {} bytes currently available and safety floor {} bytes",
+                "estimated qdisc memory {} bytes; available memory {} bytes; required minimum {} bytes (safety floor {} bytes plus estimate)",
                 estimate.estimated_total_memory_bytes,
                 snapshot.available_bytes,
-                lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES
+                required_available_bytes,
+                estimate.memory_guard_min_available_bytes
             )
         } else {
             format!(
@@ -3580,8 +3598,7 @@ impl Bakery {
         };
         let summary = if interface_reports.is_empty() {
             format!(
-                "Planned queue model {} preflight. No shaping interfaces were queued; {memory_summary}.",
-                if is_ok { "fits" } else { "exceeds" },
+                "Planned queue model {preflight_status}. No shaping interfaces were queued; {memory_summary}.",
             )
         } else {
             let interface_summary = interface_reports
@@ -3603,10 +3620,8 @@ impl Bakery {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "Planned queue model {} preflight. {interface_summary}; safe budget {}, kernel limit {}; {memory_summary}.",
-                if is_ok { "fits" } else { "exceeds" },
-                estimate.safe_budget,
-                estimate.hard_limit,
+                "Planned queue model {preflight_status}. {interface_summary}; safe budget {}, kernel limit {}; {memory_summary}.",
+                estimate.safe_budget, estimate.hard_limit,
             )
         };
         let _ = run_query(vec![BusRequest::BakeryReportPreflight {
@@ -3619,7 +3634,7 @@ impl Bakery {
                 .memory_snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.available_bytes),
-            memory_guard_min_available_bytes: lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES,
+            memory_guard_min_available_bytes: estimate.memory_guard_min_available_bytes,
             memory_ok: estimate.memory_ok,
             interfaces: interface_reports,
         }]);
@@ -3652,7 +3667,7 @@ impl Bakery {
         result.set_item("memory_ok", estimate.memory_ok)?;
         result.set_item(
             "memory_guard_min_available_bytes",
-            lqos_bakery::BAKERY_MEMORY_GUARD_MIN_AVAILABLE_BYTES,
+            estimate.memory_guard_min_available_bytes,
         )?;
         if let Some(snapshot) = estimate.memory_snapshot {
             result.set_item("memory_total_bytes", snapshot.total_bytes)?;
@@ -3857,6 +3872,52 @@ fn submit_urgent_issue(
         }
     }
     Ok(false)
+}
+
+/// Clear urgent issues matching a code and dedupe key.
+#[pyfunction]
+fn clear_urgent_issue_by_identity(_py: Python, code: String, dedupe_key: String) -> PyResult<bool> {
+    if let Ok(reply) = run_query(vec![BusRequest::ClearUrgentIssueByIdentity {
+        code: code.clone(),
+        dedupe_key: dedupe_key.clone(),
+    }]) {
+        for resp in reply.iter() {
+            if let BusResponse::Ack = resp {
+                return Ok(true);
+            }
+        }
+    }
+
+    let Ok(reply) = run_query(vec![BusRequest::GetUrgentIssues]) else {
+        return Ok(false);
+    };
+    let mut ids_to_clear = Vec::new();
+    for resp in reply.iter() {
+        if let BusResponse::UrgentIssues(issues) = resp {
+            ids_to_clear.extend(
+                issues
+                    .iter()
+                    .filter(|issue| {
+                        issue.code == code
+                            && issue.dedupe_key.as_deref().unwrap_or(&issue.code) == dedupe_key
+                    })
+                    .map(|issue| issue.id),
+            );
+        }
+    }
+
+    if ids_to_clear.is_empty() {
+        return Ok(false);
+    }
+
+    let requests = ids_to_clear
+        .into_iter()
+        .map(BusRequest::ClearUrgentIssue)
+        .collect::<Vec<_>>();
+    let Ok(reply) = run_query(requests) else {
+        return Ok(false);
+    };
+    Ok(reply.iter().any(|resp| matches!(resp, BusResponse::Ack)))
 }
 
 /// Log an informational message via the lqosd bus (appears in lqosd logs).

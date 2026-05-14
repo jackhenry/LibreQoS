@@ -33,6 +33,8 @@ La mayoría de los cambios operativos diarios se hacen en la WebUI. Por defecto 
 
 Las versiones actuales usan una disposición coherente en las páginas General, RTT, Queues, TreeGuard, Network Mode, Integration Defaults, Network Layout, Insight, páginas de integración por proveedor, IP Ranges, Flow Tracking y Shaped Devices. Integration Defaults también incluye la política compartida de margen para puertos Ethernet usada por integraciones que pueden detectar la velocidad negociada hacia el suscriptor.
 
+Las páginas de configuración que ofrecen selectores de topología usan la topología activa en tiempo de ejecución, por lo que los despliegues gestionados por una integración no necesitan un `network.json` mantenido manualmente para esas listas.
+
 ### Dónde en la WebUI
 
 - Ajustes generales: `Configuration -> General`

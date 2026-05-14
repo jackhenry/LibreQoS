@@ -22,8 +22,10 @@ do
     esac
 done
 
+VENV_PYTHON="/opt/libreqos/venv/bin/python"
+
 # Check Pre-Requisites
-sudo apt install python3-pip clang gcc gcc-multilib llvm libelf-dev git nano curl screen llvm pkg-config linux-tools-common linux-tools-`uname -r` libbpf-dev libssl-dev curl
+sudo apt install python3-pip python3-venv clang gcc gcc-multilib llvm libelf-dev git nano curl screen llvm pkg-config linux-tools-common linux-tools-`uname -r` libbpf-dev libssl-dev curl
 
 if ! rustup -V &> /dev/null
 then
@@ -148,7 +150,7 @@ done
 
 # Update the lqos_api binary
 echo "Updating lqos_api binary..."
-bash ./update_api.sh || echo "Warning: Failed to update lqos_api (continuing)."
+bash ./update_api.sh --no-restart || echo "Warning: Failed to update lqos_api (continuing)."
 
 set_libreqos_operator_permissions() {
     local runtime_paths=()
@@ -183,6 +185,16 @@ service_is_active() {
     systemctl is-active --quiet "$n.service"
 }
 
+service_is_enabled() {
+    local n=$1
+    systemctl is-enabled --quiet "$n.service" 2>/dev/null
+}
+
+service_is_failed() {
+    local n=$1
+    systemctl is-failed --quiet "$n.service" 2>/dev/null
+}
+
 refresh_service_unit() {
     local unit_name=$1
     local src="./bin/${unit_name}.service.example"
@@ -214,7 +226,30 @@ clear_pinned_maps_before_lqosd_restart() {
     fi
 }
 
+rebuild_python_venv() {
+    local script_path="./bin/rebuild_python_venv.sh"
+    if [ ! -x "$script_path" ]; then
+        echo "Expected $script_path to exist and be executable before refreshing Python services."
+        exit 1
+    fi
+
+    echo "Rebuilding /opt/libreqos/venv before restarting Python services."
+    if ! sudo "$script_path"; then
+        echo "Failed to rebuild /opt/libreqos/venv. Skipping service refresh/restarts."
+        exit 1
+    fi
+
+    if [ ! -x "$VENV_PYTHON" ]; then
+        echo "Expected $VENV_PYTHON to exist and be executable after rebuilding the Python venv."
+        echo "Skipping service refresh/restarts."
+        exit 1
+    fi
+}
+
 SERVICE_UNITS_UPDATED=0
+
+rebuild_python_venv
+
 refresh_service_unit lqosd
 refresh_service_unit lqos_scheduler
 refresh_service_unit lqos_api
@@ -250,12 +285,13 @@ else
         echo "lqosd is active as a service. Restarting it. You may need to enter your sudo password."
         sudo systemctl restart lqosd
     fi
-    if service_is_active lqos_scheduler; then
-        echo "lqos_scheduler is active as a service. Restarting it. You may need to enter your sudo password."
+    if service_is_active lqos_scheduler || service_is_failed lqos_scheduler || service_is_enabled lqos_scheduler; then
+        echo "lqos_scheduler is installed as an active, failed, or enabled service. Restarting it. You may need to enter your sudo password."
+        sudo systemctl reset-failed lqos_scheduler || true
         sudo systemctl restart lqos_scheduler
     fi
-    if service_is_active lqos_api; then
-        echo "lqos_api is active as a service. Restarting it. You may need to enter your sudo password."
+    if service_is_active lqos_api || service_is_failed lqos_api || service_is_enabled lqos_api; then
+        echo "lqos_api is installed as an active, failed, or enabled service. Restarting it. You may need to enter your sudo password."
         sudo systemctl restart lqos_api
     fi
     if service_is_active lqos_setup; then
@@ -267,6 +303,7 @@ fi
 echo "-----------------------------------------------------------------"
 echo "Don't forget to setup /etc/lqos.conf!"
 echo "Template .service files can be found in bin/"
+echo "Debian package installs create/update /opt/libreqos/venv for Python dependencies."
 echo "If src/deb-requirements-constraints.txt exists, Debian package installs use it to constrain Python dependencies."
 echo "Use ./systemd_hotfix.sh to evaluate or install the Ubuntu 24.04 networkd hotfix from the LibreQoS APT repo at https://repo.libreqos.com."
 echo "The hotfix installer now offers to schedule a reboot after it finishes."

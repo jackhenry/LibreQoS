@@ -539,6 +539,14 @@ pub enum BusRequest {
     /// Clear a specific urgent issue by ID
     ClearUrgentIssue(u64),
 
+    /// Clear urgent issues matching a code and dedupe key
+    ClearUrgentIssueByIdentity {
+        /// Machine-readable issue code
+        code: String,
+        /// Dedupe key used when the issue was submitted
+        dedupe_key: String,
+    },
+
     /// Clear all urgent issues
     ClearAllUrgentIssues,
 

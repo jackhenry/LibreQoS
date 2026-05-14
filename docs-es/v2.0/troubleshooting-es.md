@@ -119,11 +119,35 @@ sudo RUST_LOG=info /opt/libreqos/src/bin/lqosd
 sudo journalctl -u lqos_scheduler --since "1 day ago" --no-pager > lqos_sched_log.txt
 ```
 
+Las instalaciones empaquetadas mantienen las dependencias Python de LibreQoS en `/opt/libreqos/venv`. Los servicios siguen ejecutándose como root, pero los paquetes Python no se mezclan con los paquetes administrados por apt. Si el scheduler informa módulos faltantes, o si la configuración del paquete se interrumpió al instalar dependencias Python, reconstruya el entorno virtual:
+
+```bash
+sudo /opt/libreqos/src/bin/rebuild_python_venv.sh
+sudo dpkg --configure -a
+sudo systemctl restart lqosd lqos_scheduler
+```
+
+Las instalaciones basadas en git deben usar `./build_rust.sh` después de actualizar. Ese script reconstruye el entorno virtual antes de actualizar los archivos de servicio o reiniciar servicios. Si systemd informa `status=203/EXEC` en `/opt/libreqos/venv/bin/python`, o una falla en la comprobación previa del scheduler, reconstruya el entorno virtual con el comando anterior y reinicie `lqos_scheduler`.
+
+Las instalaciones antiguas anteriores al entorno virtual pueden mostrar `ModuleNotFoundError` y recomendar comandos de `pip` del sistema. No repare instalaciones actuales con `pip` del sistema ni con `--break-system-packages`; esos paquetes no los usa el servicio `lqos_scheduler` respaldado por el entorno virtual. Actualice a un paquete que cree `/opt/libreqos/venv` y use el comando de reparación anterior.
+
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
+
+Si `journalctl -u lqosd` muestra `lqosd memory watchdog restarting daemon`, el daemon salió intencionalmente antes de que la presión de memoria del host llegara al camino OOM del kernel. Systemd debería reiniciar `lqosd` automáticamente. Capture esa línea de log antes de cambiar ajustes; incluye memoria disponible, RSS/swap de `lqosd`, cantidad de hilos, cantidad de flujos y contadores de tiempo que ayudan a diagnosticar el origen del crecimiento de memoria.
+
+El watchdog se puede ajustar con overrides de entorno de systemd:
+
+```bash
+sudo systemctl edit lqosd
+```
+
+Las variables comunes son `LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB`, `LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB` y `LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB`. Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` solo durante ventanas cortas de diagnóstico en las que esté observando activamente la presión de memoria.
 
 ### El estado del scheduler en WebUI aparece no saludable
 
 Versiones recientes muestran estado/readiness del scheduler en WebUI.
+Si el modal del scheduler indica que se agotó el tiempo al cargar detalles, las versiones actuales mantienen visible la última instantánea buena del scheduler con su antigüedad en lugar de convertir ese problema de transporte en un error del scheduler. Trate primero esa advertencia como un problema de comunicación entre WebUI y `lqosd`, y confirme la salud real del scheduler en los logs antes de asumir que falló el shaping.
+Si falla un subproceso de integración pero el shaping puede continuar con la última topología válida, el scheduler puede seguir mostrando estado ready, pero el último error de integración permanece visible en el estado del scheduler hasta la siguiente integración exitosa.
 
 Si aparece caído/desactualizado:
 
@@ -141,30 +165,31 @@ sudo systemctl restart lqosd lqos_scheduler
 
 Si oscila entre ready/error, valide credenciales y timeouts de integración en `/etc/lqos.conf`.
 
+Si el shaping de arranque comienza antes de que topology runtime publique la generación actual de `shaping_inputs.json`, las versiones actuales mantienen el scheduler en un estado de espera de arranque y reintentan el shaping inicial cada pocos segundos. Un mensaje breve como `still building outputs for the current source generation` justo después de reiniciar normalmente significa que LibreQoS todavía está terminando el ciclo de importación y publicación de runtime, no que el shaping quede detenido hasta la siguiente actualización de 30 minutos.
+
+Si una actualización programada de integración cae mientras topology runtime todavía está publicando salidas para la nueva generación de fuente, las versiones actuales mantienen el scheduler en estado de espera para esa generación y reintentan automáticamente el shaping programado en cuanto topology runtime termina. Trate `Scheduled shaping refresh deferred` como una espera transitoria solo cuando el mensaje indique que topology runtime todavía está construyendo salidas para la generación actual. Si en cambio indica que topology runtime falló para la generación actual, revise directamente esa falla de runtime.
+
+Si el arranque del scheduler permanece demasiado tiempo en esa espera, o entra en estado degradado con un mensaje indicando que topology runtime falló para la generación actual, revise:
+
+```bash
+cat /opt/libreqos/state/topology/topology_runtime_status.json
+ls -lh /opt/libreqos/state/topology/topology_effective_state.json /opt/libreqos/state/topology/network.effective.json /opt/libreqos/state/shaping/shaping_inputs.json
+journalctl -u lqos_scheduler --since "30 minutes ago"
+journalctl -u lqosd --since "30 minutes ago"
+```
+
+Si `journalctl -u lqosd` muestra advertencias repetidas como `BeginIngest queue full`, `IngestChunk queue full` o `EndIngest queue full` durante el arranque o justo después de una importación de topología, los builds anteriores estaban descartando tramas de ingesta hacia Insight porque la cola local del canal de control era demasiado pequeña para ráfagas grandes. Los builds actuales aplican backpressure sobre el socket de Insight para esos lotes de ingesta, por lo que esas advertencias ya no deberían aparecer durante ráfagas cortas de arranque o importación. Si siguen apareciendo después de actualizar, revise primero la presión de CPU de `lqosd` y la conectividad reciente del canal de control antes de asumir que el shaping está fallando.
+
 ### RTNETLINK answers: Invalid argument
 
 Suele indicar que no se pudo agregar correctamente qdisc MQ en la NIC (colas RX/TX insuficientes). Verifique [NICs recomendadas](requirements-es.md).
-
-### Python ModuleNotFoundError en Ubuntu 24.04
-
-```bash
-pip uninstall binpacking --break-system-packages --yes
-sudo pip uninstall binpacking --break-system-packages --yes
-sudo pip install binpacking --break-system-packages
-pip uninstall apscheduler --break-system-packages --yes
-sudo pip uninstall apscheduler --break-system-packages --yes
-sudo pip install apscheduler --break-system-packages
-pip uninstall deepdiff --break-system-packages --yes
-sudo pip uninstall deepdiff --break-system-packages --yes
-sudo pip install deepdiff --break-system-packages
-```
 
 ### Todas las IPs de clientes aparecen como Unknown IPs
 
 ```bash
 cd /opt/libreqos/src
 sudo systemctl stop lqos_scheduler
-sudo python3 LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 Corrija errores en `ShapedDevices.csv` y/o `network.json`, luego:
@@ -233,7 +258,7 @@ WebUI muestra códigos legibles por máquina para triage rápido.
 | `MAPPED_CIRCUIT_LIMIT` | Bakery está forzando límite de circuitos mapeados. | Estado de licencia Insight y `journalctl -u lqosd` con requested/allowed/dropped. | Reducir circuitos mapeados o actualizar licencia/límites. |
 | `TC_U16_OVERFLOW` | IDs minor de clases/colas excedieron rango u16 de tc en una cola CPU. | `journalctl -u lqos_scheduler -u lqosd`, profundidad topológica y distribución por colas. | Aumentar paralelismo de colas y/o simplificar/rebalancear jerarquía. |
 | `TC_QDISC_CAPACITY` | Los qdisc autoasignados planificados exceden el presupuesto seguro por interfaz o el preflight conservador de seguridad de memoria de Bakery antes de aplicar. | Conteos estimados por interfaz, desglose por tipo de qdisc y campos de memoria en el contexto del urgent issue, `journalctl -u lqos_scheduler -u lqosd`, configuración `on_a_stick` y `monitor_only`. | Reducir la carga planificada de qdisc para esta ejecución (por ejemplo menos circuitos/dispositivos en la forma de prueba) antes de reintentar; no confiar en una aplicación parcial. |
-| `BAKERY_MEMORY_GUARD` | Un full reload chunked de Bakery fue detenido a mitad de aplicación porque la memoria disponible del host cayó por debajo del piso de seguridad. | `journalctl -u lqosd`, memoria disponible/total en el contexto del urgent issue y progreso reciente de aplicación de Bakery. | Tratar la ejecución como fallida, reducir presión de memoria o huella de colas y reintentar solo cuando el host esté estable. |
+| `BAKERY_MEMORY_GUARD` | Una recarga completa por fragmentos de Bakery fue detenida a mitad de aplicación porque la memoria disponible del host cayó por debajo del piso de seguridad escalado. | `journalctl -u lqosd`, memoria disponible/total en el contexto del urgent issue y progreso reciente de aplicación de Bakery. | Tratar la ejecución como fallida, reducir presión de memoria o huella de colas y reintentar solo cuando el host esté estable. |
 | `XDP_IP_MAPPING_CAPACITY` | Los mapeos IP requeridos exceden la capacidad actual del mapa XDP en el kernel. | Forma de `ShapedDevices.csv`, mezcla IPv4/IPv6, supuesto de un dispositivo frente a varios dispositivos, `journalctl -u lqos_scheduler -u lqosd`. | Reducir mapeos requeridos de inmediato (por ejemplo menos dispositivos o prueba IPv4-only), o aumentar la capacidad del mapa del kernel en un cambio coordinado. |
 | `XDP_IP_MAPPING_APPLY_FAILED` | Uno o más inserts de mapeo IP fallaron durante la aplicación. | `journalctl -u lqos_scheduler -u lqosd` para ejemplos resumidos y conteos de fallo. | Corregir la causa del fallo y volver a ejecutar; no confiar en shaping parcial. |
 

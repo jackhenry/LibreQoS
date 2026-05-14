@@ -26,12 +26,14 @@ disable_offload = [ "gso", "tso", "lro", "sg", "gro" ]
 use_xdp_bridge = true
 to_internet = "eth0"
 to_network = "eth1"
+# mtu = 1500
 
 # OR:
 #[single_interface]
 #interface = "eth0"
 #internet_vlan = 2
 #network_vlan = 3
+# mtu = 1500
 
 #[ssl]
 #enabled = false

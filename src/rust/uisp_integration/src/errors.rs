@@ -11,8 +11,8 @@ pub enum UispIntegrationError {
     UnknownIntegrationStrategy,
     #[error("Error contacting UISP")]
     UispConnectError,
-    #[error("Root site not found")]
-    NoRootSite,
+    #[error("Root site not found: {0}")]
+    NoRootSite(String),
     #[error("Unknown Site Type")]
     UnknownSiteType,
     #[error("CSV Error")]

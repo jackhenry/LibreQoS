@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::lts2_sys::control_channel::ControlChannelCommand;
 use crate::node_manager::auth::{LoginResult, login_from_token};
 use crate::node_manager::local_api::{
     circuit, circuit_count, config, cpu_affinity, dashboard_themes, device_counts, directories,
@@ -55,6 +57,22 @@ mod ticker;
 
 const WS_VERSION: &str = include_str!("../../../../VERSION_STRING");
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const CONTROL_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+
+async fn send_control_command(
+    control_tx: &tokio::sync::mpsc::Sender<ControlChannelCommand>,
+    command: ControlChannelCommand,
+) -> bool {
+    match tokio::time::timeout(CONTROL_CHANNEL_SEND_TIMEOUT, control_tx.send(command)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            warn!("Timed out queueing websocket control-channel command");
+            false
+        }
+    }
+}
 
 /// Provides an Axum router for the websocket system. Exposes a single /ws route that supports
 /// pubsub subscriptions and private commands.
@@ -182,19 +200,29 @@ async fn handle_socket(
                 // Received a websocket message
                 match inbound {
                     Some(Ok(msg)) => {
-                        let should_close = receive_channel_message(
-                            msg,
-                            channels.clone(),
-                            tx.clone(),
-                            &mut subscribed_channels,
-                            &mut handshake_complete,
-                            &mut WsRequestState {
-                                private_state: &mut private_state,
-                                login: &mut login,
-                                shaper_query: shaper_query.clone(),
-                            },
+                        let should_close = match tokio::time::timeout(
+                            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                            receive_channel_message(
+                                msg,
+                                channels.clone(),
+                                tx.clone(),
+                                &mut subscribed_channels,
+                                &mut handshake_complete,
+                                &mut WsRequestState {
+                                    private_state: &mut private_state,
+                                    login: &mut login,
+                                    shaper_query: shaper_query.clone(),
+                                },
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(should_close) => should_close,
+                            Err(_) => {
+                                warn!("Websocket request timed out; closing connection");
+                                true
+                            }
+                        };
                         if should_close {
                             break;
                         }
@@ -212,6 +240,11 @@ async fn handle_socket(
             }
         }
     }
+    for channel in subscribed_channels.drain() {
+        channels.unsubscribe(channel, tx.clone()).await;
+    }
+    drop(private_state);
+    drop(tx);
     outbound_handle.abort();
     let _ = outbound_handle.await;
     info!("Websocket disconnected");
@@ -660,32 +693,37 @@ async fn receive_channel_message(
                 return true;
             }
         }
-        WsRequest::UrgentStatus => {
+        WsRequest::UrgentStatus { request_id } => {
             let response = WsResponse::UrgentStatus {
                 data: urgent::urgent_status_data(),
+                request_id,
             };
             if send_ws_response(&tx, response).await {
                 return true;
             }
         }
-        WsRequest::UrgentList => {
+        WsRequest::UrgentList { request_id } => {
             let response = WsResponse::UrgentList {
                 data: urgent::urgent_list_data(),
+                request_id,
             };
             if send_ws_response(&tx, response).await {
                 return true;
             }
         }
-        WsRequest::UrgentClear { id } => {
+        WsRequest::UrgentClear { id, request_id } => {
             let ok = urgent::urgent_clear_id(id);
-            let response = WsResponse::UrgentClearResult { ok };
+            let response = WsResponse::UrgentClearResult { ok, request_id };
             if send_ws_response(&tx, response).await {
                 return true;
             }
         }
-        WsRequest::UrgentClearAll => {
+        WsRequest::UrgentClearAll { request_id } => {
             urgent::urgent_clear_all_data();
-            let response = WsResponse::UrgentClearAllResult { ok: true };
+            let response = WsResponse::UrgentClearAllResult {
+                ok: true,
+                request_id,
+            };
             if send_ws_response(&tx, response).await {
                 return true;
             }
@@ -742,14 +780,13 @@ async fn receive_channel_message(
             _ => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketList {
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketList {
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -766,8 +803,11 @@ async fn receive_channel_message(
                         tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(tickets))) => {
-                            if send_ws_response(&tx, WsResponse::SupportTicketListResult { tickets })
-                                .await
+                            if send_ws_response(
+                                &tx,
+                                WsResponse::SupportTicketListResult { tickets },
+                            )
+                            .await
                             {
                                 return true;
                             }
@@ -816,15 +856,14 @@ async fn receive_channel_message(
             _ => {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketGet {
-                            ticket_id,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketGet {
+                        ticket_id,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -899,18 +938,17 @@ async fn receive_channel_message(
             } else {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketCreate {
-                            subject,
-                            priority,
-                            body,
-                            commentor,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketCreate {
+                        subject,
+                        priority,
+                        body,
+                        commentor,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -923,12 +961,15 @@ async fn receive_channel_message(
                         return true;
                     }
                 } else {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
-                        .await;
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(ticket))) => {
-                            if send_ws_response(&tx, WsResponse::SupportTicketCreateResult { ticket })
-                                .await
+                            if send_ws_response(
+                                &tx,
+                                WsResponse::SupportTicketCreateResult { ticket },
+                            )
+                            .await
                             {
                                 return true;
                             }
@@ -988,18 +1029,17 @@ async fn receive_channel_message(
                     .unwrap_or(0);
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let control_tx = request_state.private_state.control_tx();
-                if control_tx
-                    .send(
-                        crate::lts2_sys::control_channel::ControlChannelCommand::SupportTicketAddComment {
-                            ticket_id,
-                            commentor,
-                            body,
-                            date,
-                            responder: reply_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
+                if !send_control_command(
+                    &control_tx,
+                    ControlChannelCommand::SupportTicketAddComment {
+                        ticket_id,
+                        commentor,
+                        body,
+                        date,
+                        responder: reply_tx,
+                    },
+                )
+                .await
                 {
                     if send_ws_response(
                         &tx,
@@ -1012,8 +1052,8 @@ async fn receive_channel_message(
                         return true;
                     }
                 } else {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
-                        .await;
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await;
                     match result {
                         Ok(Ok(Ok(()))) => {
                             if send_ws_response(
@@ -1579,8 +1619,7 @@ async fn receive_channel_message(
                 config::update_lqosd_config_data(*request_state.login, cfg, clear_secrets).await;
             let (ok, message) = match result {
                 Ok(()) => (true, "Ok".to_string()),
-                Err(StatusCode::FORBIDDEN) => (false, "Unauthorized".to_string()),
-                Err(_) => (false, "Error".to_string()),
+                Err(message) => (false, message),
             };
             let response = WsResponse::UpdateConfigResult { ok, message };
             if send_ws_response(&tx, response).await {
@@ -2487,7 +2526,9 @@ fn payload_hint(payload: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::decode_ws_request;
+    use crate::node_manager::local_api::urgent::{UrgentList, UrgentStatus};
     use crate::node_manager::ws::messages::WsRequest;
+    use crate::node_manager::ws::messages::{WsResponse, encode_ws_message};
     use serde_cbor::Value as CborValue;
     use std::collections::BTreeMap;
 
@@ -2550,6 +2591,163 @@ mod tests {
             ]),
         )]))
         .expect("valid update payload")
+    }
+
+    fn encode_response_value(response: &WsResponse) -> CborValue {
+        let payload = encode_ws_message(response).expect("response should encode");
+        serde_cbor::from_slice(payload.as_ref()).expect("response should decode as CBOR value")
+    }
+
+    fn response_request_id(response: &WsResponse, event_name: &str) -> Option<u64> {
+        let CborValue::Map(entries) = encode_response_value(response) else {
+            panic!("response should encode as a CBOR map");
+        };
+        let event_key = text("event");
+        let request_id_key = text("request_id");
+        assert_eq!(entries.get(&event_key), Some(&text(event_name)));
+        match entries.get(&request_id_key) {
+            Some(CborValue::Integer(value)) => {
+                Some(u64::try_from(*value).expect("request_id is u64"))
+            }
+            Some(other) => panic!("unexpected request_id value: {other:?}"),
+            None => None,
+        }
+    }
+
+    fn response_has_request_id(response: &WsResponse) -> bool {
+        let CborValue::Map(entries) = encode_response_value(response) else {
+            panic!("response should encode as a CBOR map");
+        };
+        entries.contains_key(&text("request_id"))
+    }
+
+    #[test]
+    fn decodes_urgent_status_with_request_id() {
+        let payload = serde_cbor::to_vec(&map(vec![(
+            "UrgentStatus",
+            map(vec![("request_id", integer(42))]),
+        )]))
+        .expect("valid urgent status payload");
+
+        let request = decode_ws_request(&payload).expect("urgent status request should decode");
+        match request {
+            WsRequest::UrgentStatus { request_id } => assert_eq!(request_id, Some(42)),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_urgent_list_without_request_id() {
+        let payload = serde_cbor::to_vec(&map(vec![("UrgentList", map(vec![]))]))
+            .expect("valid urgent list payload");
+
+        let request = decode_ws_request(&payload).expect("urgent list request should decode");
+        match request {
+            WsRequest::UrgentList { request_id } => assert_eq!(request_id, None),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_urgent_clear_with_request_id() {
+        let payload = serde_cbor::to_vec(&map(vec![(
+            "UrgentClear",
+            map(vec![("id", integer(7)), ("request_id", integer(42))]),
+        )]))
+        .expect("valid urgent clear payload");
+
+        let request = decode_ws_request(&payload).expect("urgent clear request should decode");
+        match request {
+            WsRequest::UrgentClear { id, request_id } => {
+                assert_eq!(id, 7);
+                assert_eq!(request_id, Some(42));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_urgent_clear_all_without_request_id() {
+        let payload = serde_cbor::to_vec(&map(vec![("UrgentClearAll", map(vec![]))]))
+            .expect("valid urgent clear all payload");
+
+        let request = decode_ws_request(&payload).expect("urgent clear all request should decode");
+        match request {
+            WsRequest::UrgentClearAll { request_id } => assert_eq!(request_id, None),
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn urgent_responses_echo_request_id() {
+        assert_eq!(
+            response_request_id(
+                &WsResponse::UrgentStatus {
+                    data: UrgentStatus {
+                        has_urgent: true,
+                        count: 1,
+                    },
+                    request_id: Some(42),
+                },
+                "UrgentStatus",
+            ),
+            Some(42),
+        );
+        assert_eq!(
+            response_request_id(
+                &WsResponse::UrgentList {
+                    data: UrgentList { items: Vec::new() },
+                    request_id: Some(43),
+                },
+                "UrgentList",
+            ),
+            Some(43),
+        );
+        assert_eq!(
+            response_request_id(
+                &WsResponse::UrgentClearResult {
+                    ok: true,
+                    request_id: Some(44),
+                },
+                "UrgentClearResult",
+            ),
+            Some(44),
+        );
+        assert_eq!(
+            response_request_id(
+                &WsResponse::UrgentClearAllResult {
+                    ok: true,
+                    request_id: Some(45),
+                },
+                "UrgentClearAllResult",
+            ),
+            Some(45),
+        );
+    }
+
+    #[test]
+    fn urgent_responses_omit_missing_request_id() {
+        assert!(!response_has_request_id(&WsResponse::UrgentStatus {
+            data: UrgentStatus {
+                has_urgent: false,
+                count: 0,
+            },
+            request_id: None,
+        }));
+        assert!(!response_has_request_id(&WsResponse::UrgentList {
+            data: UrgentList { items: Vec::new() },
+            request_id: None,
+        }));
+        assert!(!response_has_request_id(&WsResponse::UrgentClearResult {
+            ok: true,
+            request_id: None,
+        }));
+        assert!(!response_has_request_id(
+            &WsResponse::UrgentClearAllResult {
+                ok: true,
+                request_id: None,
+            }
+        ));
     }
 
     #[test]

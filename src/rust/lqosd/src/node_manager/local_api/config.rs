@@ -7,21 +7,24 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::http::header;
 use default_net::get_interfaces;
-use lqos_bus::{BusRequest, bus_request};
-use lqos_config::{Config, ConfigShapedDevices, ShapedDevice, UserRole, WebUser, WebUsers};
+use lqos_bus::{BusRequest, BusResponse, bus_request_with_timeout};
+use lqos_config::{
+    Config, ConfigShapedDevices, NetworkJson, ShapedDevice, UserRole, WebUser, WebUsers,
+};
 use lqos_utils::hash_to_i64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Cursor, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const COBRAND_FILE_NAME: &str = "cobrand.png";
 const COBRAND_DISPLAY_HEIGHT_PX: u64 = 48;
 const COBRAND_MAX_DISPLAY_WIDTH_PX: u64 = 176;
 const COBRAND_MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+const CONFIG_BUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CobrandUploadValidationError {
@@ -524,10 +527,10 @@ pub fn list_nics_data(login: LoginResult) -> Result<Vec<(String, String, String)
 
 pub fn network_json_data() -> Value {
     if let Ok(config) = lqos_config::load_config() {
-        let path = std::path::Path::new(&config.lqos_directory).join("network.json");
-        if path.exists() {
-            let raw = std::fs::read_to_string(path).expect("Unable to read network json");
-            let json: Value = serde_json::from_str(&raw).expect("Unable to read network json");
+        let path = NetworkJson::path_for_config(config.as_ref());
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(json) = serde_json::from_str(&raw)
+        {
             return json;
         }
     }
@@ -783,6 +786,7 @@ fn persist_shaped_devices(mut devices: Vec<ShapedDevice>) -> Result<(), String> 
     lqos_network_devices::apply_shaped_devices_snapshot(
         "node_manager:persist_shaped_devices",
         copied,
+        lqos_network_devices::ShapedDevicesSnapshotProvenance::ExternalSnapshot,
     )
     .map_err(|e| format!("Unable to publish ShapedDevices.csv snapshot: {e}"))?;
 
@@ -793,16 +797,26 @@ pub async fn update_lqosd_config_data(
     login: LoginResult,
     mut config: Config,
     clear_secrets: ConfigSecretClearRequest,
-) -> Result<(), StatusCode> {
+) -> Result<(), String> {
     if login != LoginResult::Admin {
-        return Err(StatusCode::FORBIDDEN);
+        return Err("Unauthorized".to_string());
     }
-    let existing = lqos_config::load_config().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing =
+        lqos_config::load_config().map_err(|_| "Unable to load the current config".to_string())?;
     apply_secret_updates(existing.as_ref(), &mut config, &clear_secrets);
-    bus_request(vec![BusRequest::UpdateLqosdConfig(Box::new(config))])
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(())
+    let mut responses = bus_request_with_timeout(
+        vec![BusRequest::UpdateLqosdConfig(Box::new(config))],
+        CONFIG_BUS_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|err| format!("Unable to update config: {err}"))?;
+
+    match responses.pop() {
+        Some(BusResponse::Ack) => Ok(()),
+        Some(BusResponse::Fail(message)) => Err(message),
+        Some(other) => Err(format!("Unexpected config update response: {other:?}")),
+        None => Err("No response received for config update".to_string()),
+    }
 }
 
 /// Persists both `network.json` and `ShapedDevices.csv` for administrative

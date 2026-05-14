@@ -37,7 +37,7 @@ pub use bus::{
     BUS_SOCKET_PATH, BakeryCapacityReportInterface, BlackboardSystem, BusClientError, BusReply,
     BusRequest, BusResponse, BusSession, CakeDiffTinTransit, CakeDiffTransit, CakeTransit,
     LibreqosBusClient, QueueStoreTransit, SchedulerProgressReport, TopFlowType, UnixSocketServer,
-    UrgentSeverity, UrgentSource, bus_request,
+    UrgentSeverity, UrgentSource, bus_request, bus_request_with_timeout,
 };
 pub use tc_handle::TcHandle;
 

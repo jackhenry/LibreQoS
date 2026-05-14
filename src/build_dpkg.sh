@@ -12,7 +12,7 @@ PACKAGE=libreqos
 VERSION=$(cat ./VERSION_STRING).$BUILD_DATE
 PKGVERSION="${PACKAGE}_${VERSION}"
 DPKG_DIR=dist/$PKGVERSION-1_amd64
-APT_DEPENDENCIES="python3-pip, nano, curl, ca-certificates"
+APT_DEPENDENCIES="python3-pip, python3-venv, nano, curl, ca-certificates"
 DEBIAN_DIR=$DPKG_DIR/DEBIAN
 LQOS_DIR=$DPKG_DIR/opt/libreqos/src
 LQOS_STATE_DIR=$DPKG_DIR/opt/libreqos/state
@@ -27,6 +27,7 @@ LQOS_FILES=(
   integrationNetzur.py
   integrationRestHttp.py
   integrationSonar.py
+  integrationUtils.py
   integrationSplynx.py
   integrationVISP.py
   integrationWISPGate.py
@@ -55,6 +56,7 @@ LQOS_BIN_FILES=(
   lqosd.service.example
   lqos_api.service.example
   lqos_setup.service.example
+  rebuild_python_venv.sh
 )
 
 RUSTPROGS=(
@@ -142,16 +144,10 @@ else
 fi
 }
 
-# Install Python Dependencies
-pushd /opt/libreqos > /dev/null
-# - Setup Python dependencies as a post-install task. Use --ignore-installed so
-#   pip does not try to uninstall Debian-managed packages that do not ship a
-#   pip RECORD file (for example blinker on Ubuntu 24.04).
-if [ -s src/deb-requirements-constraints.txt ]; then
-PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --ignore-installed -c src/deb-requirements-constraints.txt -r src/requirements.txt
-else
-PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --ignore-installed -r src/requirements.txt
-fi
+# - Setup Python dependencies in a root-owned virtual environment. LibreQoS
+#   services still run as root, but Python packages no longer mix with
+#   apt-managed system site-packages.
+/opt/libreqos/src/bin/rebuild_python_venv.sh
 
 # Ensure folder permissions are correct post-install
 set_libreqos_operator_permissions
@@ -163,10 +159,20 @@ install -m 0644 /opt/libreqos/src/bin/lqos_api.service.example /etc/systemd/syst
 install -m 0644 /opt/libreqos/src/bin/lqos_setup.service.example /etc/systemd/system/lqos_setup.service
 /bin/rm -f /etc/systemd/system/lqos_netplan_helper.service || true
 /bin/systemctl daemon-reload || true
-/bin/systemctl stop lqos_node_manager || true # In case it's running from a previous release
-/bin/systemctl disable lqos_node_manager || true # In case it's running from a previous release
-/bin/systemctl stop lqos_netplan_helper || true
-/bin/systemctl disable lqos_netplan_helper || true
+
+unit_stop_disable_if_present() {
+local unit="$1"
+if /bin/systemctl cat "${unit}" >/dev/null 2>&1 \
+    || [ -e "/etc/systemd/system/${unit}" ] \
+    || [ -e "/lib/systemd/system/${unit}" ] \
+    || [ -e "/usr/lib/systemd/system/${unit}" ]; then
+    /bin/systemctl stop "${unit}" || true
+    /bin/systemctl disable "${unit}" || true
+fi
+}
+
+unit_stop_disable_if_present lqos_node_manager.service # In case it's running from a previous release
+unit_stop_disable_if_present lqos_netplan_helper.service
 case "$(/opt/libreqos/src/bin/lqos_setup postinst-action)" in
 activate_runtime)
   /opt/libreqos/src/bin/lqos_setup activate-runtime
@@ -193,7 +199,6 @@ HOTFIX
   exit 1
   ;;
 esac
-popd > /dev/null
 EOF
 
 # Uninstall Script
@@ -238,6 +243,8 @@ done
 for file in "${LQOS_BIN_FILES[@]}"; do
   cp "bin/$file" "$LQOS_DIR/bin"
 done
+
+chmod a+x "$LQOS_DIR/bin/rebuild_python_venv.sh"
 
 # Copy the remove pinned maps
 cp rust/remove_pinned_maps.sh "$LQOS_DIR"/rust

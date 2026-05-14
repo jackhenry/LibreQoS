@@ -1,8 +1,9 @@
 use crate::node_manager::ws::messages::{PingState, WsResponse, encode_ws_message};
+use crate::node_manager::ws::single_user_channels::try_send_private_payload;
 use lqos_probe::{ProbeClass, ProbeClient};
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info};
+use tracing::debug;
 
 const UI_MONITOR_PROBE_MAX_AGE: Duration = Duration::from_millis(250);
 
@@ -32,13 +33,15 @@ pub(super) async fn ping_monitor(
             }
         };
 
-        for ((ip, label), observation) in ip_addresses.iter().zip(observations.into_iter()) {
+        'observations: for ((ip, label), observation) in ip_addresses.iter().zip(observations) {
             if observation.reachable {
                 let ping_time = observation
                     .rtt_ms
                     .map(|rtt_ms| Duration::from_secs_f64(rtt_ms / 1000.0))
                     .unwrap_or_else(|| Duration::from_secs(0));
-                send_alive(tx.clone(), ip.clone(), ping_time, label.clone()).await;
+                if !send_alive(&tx, ip.clone(), ping_time, label.clone()) {
+                    break 'observations;
+                }
             } else {
                 if let Some(error) = observation.error.as_deref() {
                     debug!(
@@ -46,7 +49,9 @@ pub(super) async fn ping_monitor(
                         observation.normalized_target, error
                     );
                 }
-                send_timeout(tx.clone(), ip.clone()).await;
+                if !send_timeout(&tx, ip.clone()) {
+                    break 'observations;
+                }
             }
         }
 
@@ -55,7 +60,7 @@ pub(super) async fn ping_monitor(
             result: PingState::ChannelTest,
         };
         if let Ok(payload) = encode_ws_message(&channel_test) {
-            if tx.send(payload).await.is_err() {
+            if !try_send_private_payload(&tx, payload, "PingMonitor") {
                 debug!("Channel is gone");
                 break;
             }
@@ -65,24 +70,22 @@ pub(super) async fn ping_monitor(
     }
 }
 
-async fn send_timeout(tx: tokio::sync::mpsc::Sender<std::sync::Arc<Vec<u8>>>, ip: String) {
+fn send_timeout(tx: &tokio::sync::mpsc::Sender<std::sync::Arc<Vec<u8>>>, ip: String) -> bool {
     let result = WsResponse::PingMonitor {
         ip,
         result: PingState::NoResponse,
     };
-    if let Ok(payload) = encode_ws_message(&result)
-        && tx.send(payload).await.is_err()
-    {
-        info!("Channel is gone");
-    }
+    encode_ws_message(&result)
+        .map(|payload| try_send_private_payload(tx, payload, "PingMonitor"))
+        .unwrap_or(false)
 }
 
-async fn send_alive(
-    tx: tokio::sync::mpsc::Sender<std::sync::Arc<Vec<u8>>>,
+fn send_alive(
+    tx: &tokio::sync::mpsc::Sender<std::sync::Arc<Vec<u8>>>,
     ip: String,
     ping_time: Duration,
     label: String,
-) {
+) -> bool {
     let result = WsResponse::PingMonitor {
         ip,
         result: PingState::Ping {
@@ -90,9 +93,7 @@ async fn send_alive(
             label,
         },
     };
-    if let Ok(payload) = encode_ws_message(&result)
-        && tx.send(payload).await.is_err()
-    {
-        info!("Channel is gone");
-    }
+    encode_ws_message(&result)
+        .map(|payload| try_send_private_payload(tx, payload, "PingMonitor"))
+        .unwrap_or(false)
 }

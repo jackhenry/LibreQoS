@@ -15,7 +15,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use surge_ping::{Client, Config as PingConfig, ICMP, IcmpPacket, PingIdentifier, PingSequence};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::time::timeout;
 use tracing::warn;
+
+const PROBE_DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_WORKER_GRACE: Duration = Duration::from_secs(1);
+const PROBE_MANAGER_REPLY_GRACE: Duration = Duration::from_secs(5);
+const PROBE_BATCH_CONCURRENCY_ESTIMATE: usize = 256;
 
 /// Logical consumer class for a probe request.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Allocative)]
@@ -135,18 +141,23 @@ impl ProbeClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        let wait_timeout = probe_batch_wait_timeout(&requests);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(ProbeCommand::ProbeBatch {
-                requests,
-                max_age,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| ProbeClientError::ManagerUnavailable)?;
-        reply_rx
-            .await
-            .map_err(|_| ProbeClientError::ManagerUnavailable)
+        timeout(wait_timeout, async {
+            self.tx
+                .send(ProbeCommand::ProbeBatch {
+                    requests,
+                    max_age,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| ProbeClientError::ManagerUnavailable)?;
+            reply_rx
+                .await
+                .map_err(|_| ProbeClientError::ManagerUnavailable)
+        })
+        .await
+        .map_err(|_| ProbeClientError::TimedOut)?
     }
 
     /// Probes a batch of targets for reachability.
@@ -192,6 +203,9 @@ pub enum ProbeClientError {
     /// The manager returned no observations for the request.
     #[error("shared probe manager returned no observations")]
     EmptyResponse,
+    /// The manager did not answer before the caller's deadline.
+    #[error("shared probe manager timed out")]
+    TimedOut,
 }
 
 /// Background shared probe manager.
@@ -211,6 +225,27 @@ impl ProbeManager {
         });
         ProbeClient { tx }
     }
+}
+
+fn probe_worker_timeout(request_timeout: Duration) -> Duration {
+    PROBE_DNS_RESOLUTION_TIMEOUT
+        .saturating_add(request_timeout)
+        .saturating_add(PROBE_WORKER_GRACE)
+}
+
+fn probe_batch_wait_timeout(requests: &[ProbeRequest]) -> Duration {
+    let worker_timeout = requests
+        .iter()
+        .map(|request| probe_worker_timeout(request.timeout))
+        .max()
+        .unwrap_or(PROBE_MANAGER_REPLY_GRACE);
+    let wave_count = requests
+        .len()
+        .max(1)
+        .div_ceil(PROBE_BATCH_CONCURRENCY_ESTIMATE) as u32;
+    worker_timeout
+        .saturating_mul(wave_count)
+        .saturating_add(PROBE_MANAGER_REPLY_GRACE)
 }
 
 #[derive(Clone, Debug)]
@@ -313,7 +348,23 @@ impl ProbeManagerState {
             let semaphore = self.semaphore.clone();
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.ok();
-                let observation = execute_probe(&request, &key.normalized_target).await;
+                let observation = match timeout(
+                    probe_worker_timeout(request.timeout),
+                    execute_probe(&request, &key.normalized_target),
+                )
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(_) => ProbeCacheEntry {
+                        normalized_target: key.normalized_target.clone(),
+                        resolved_ip: None,
+                        kind: request.kind,
+                        observed_at_unix_ms: now_unix_ms(),
+                        reachable: false,
+                        rtt_ms: None,
+                        error: Some("probe worker timed out".to_string()),
+                    },
+                };
                 (key, observation)
             });
         }
@@ -344,7 +395,7 @@ impl ProbeManagerState {
 
         results
             .into_iter()
-            .zip(requests.into_iter())
+            .zip(requests)
             .map(|(result, request)| {
                 result.unwrap_or_else(|| {
                     failed_observation(
@@ -529,9 +580,15 @@ async fn resolve_target(normalized_target: &str) -> Result<(IpAddr, String), Str
         return Ok((ip, ip.to_string()));
     }
 
-    let mut addrs = tokio::net::lookup_host((normalized_target, 80))
-        .await
-        .map_err(|err| format!("unable to resolve target '{normalized_target}': {err}"))?;
+    let lookup = timeout(
+        PROBE_DNS_RESOLUTION_TIMEOUT,
+        tokio::net::lookup_host((normalized_target, 80)),
+    )
+    .await
+    .map_err(|_| format!("timed out resolving target '{normalized_target}'"))?;
+
+    let mut addrs =
+        lookup.map_err(|err| format!("unable to resolve target '{normalized_target}': {err}"))?;
     let Some(addr) = addrs.next() else {
         return Err(format!("unable to resolve target '{normalized_target}'"));
     };
@@ -540,7 +597,11 @@ async fn resolve_target(normalized_target: &str) -> Result<(IpAddr, String), Str
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeKind, ProbeRequest, duration_to_millis, normalize_target};
+    use super::{
+        PROBE_DNS_RESOLUTION_TIMEOUT, PROBE_MANAGER_REPLY_GRACE, PROBE_WORKER_GRACE, ProbeKind,
+        ProbeRequest, duration_to_millis, normalize_target, probe_batch_wait_timeout,
+        probe_worker_timeout,
+    };
     use std::time::Duration;
 
     #[test]
@@ -575,5 +636,41 @@ mod tests {
         );
         assert_eq!(reachability.kind, ProbeKind::Reachability);
         assert_eq!(rtt.kind, ProbeKind::RoundTripTime);
+    }
+
+    #[test]
+    fn probe_deadlines_include_dns_probe_and_reply_grace() {
+        let request = ProbeRequest::reachability(
+            "example.com",
+            super::ProbeClass::UiMonitor,
+            Duration::from_millis(750),
+        );
+        assert_eq!(
+            probe_worker_timeout(request.timeout),
+            PROBE_DNS_RESOLUTION_TIMEOUT + Duration::from_millis(750) + PROBE_WORKER_GRACE
+        );
+        assert_eq!(
+            probe_batch_wait_timeout(&[request]),
+            PROBE_DNS_RESOLUTION_TIMEOUT
+                + Duration::from_millis(750)
+                + PROBE_WORKER_GRACE
+                + PROBE_MANAGER_REPLY_GRACE
+        );
+    }
+
+    #[test]
+    fn probe_batch_deadline_scales_for_multiple_probe_waves() {
+        let requests = vec![
+            ProbeRequest::reachability(
+                "example.com",
+                super::ProbeClass::UiMonitor,
+                Duration::from_secs(1),
+            );
+            257
+        ];
+        assert_eq!(
+            probe_batch_wait_timeout(&requests),
+            probe_worker_timeout(Duration::from_secs(1)) * 2 + PROBE_MANAGER_REPLY_GRACE
+        );
     }
 }

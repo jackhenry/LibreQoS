@@ -22,8 +22,11 @@ scheduler = None
 
 def install_scheduler_stubs():
     libre = types.ModuleType("LibreQoS")
+    class RefreshFailure(Exception):
+        pass
     class ValidationFailure(Exception):
         pass
+    libre.RefreshFailure = RefreshFailure
     libre.ValidationFailure = ValidationFailure
     libre.refreshShapers = Mock()
     libre.refreshShapersUpdateOnly = Mock()
@@ -194,6 +197,10 @@ class TestSchedulerAffinity(unittest.TestCase):
 class TestSchedulerErrorReporting(unittest.TestCase):
     def setUp(self):
         scheduler.set_scheduler_status_bus_enabled(True)
+        scheduler._reset_startup_topology_runtime_wait()
+        scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
+        scheduler.shaping_runtime_hash = 0
 
     def test_python_integration_output_does_not_set_scheduler_error(self):
         result = types.SimpleNamespace(returncode=0, stdout="normal info\n", stderr="")
@@ -290,8 +297,40 @@ class TestSchedulerErrorReporting(unittest.TestCase):
         )
         self.assertEqual(mock_scheduler_output.call_args_list, [(( "",),)])
 
+    def test_ready_progress_keeps_latest_integration_failure_visible(self):
+        scheduler.remember_integration_failure("Sonar exited with code 1. Continuing.")
+
+        with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+            with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                scheduler.publish_ready_progress(
+                    False,
+                    "ready",
+                    "Scheduler ready",
+                    scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                    scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                    percent=100,
+                )
+
+        mock_progress.assert_called_once()
+        mock_scheduler_error.assert_called_once()
+        self.assertIn(
+            "Scheduler ready using last-known-good topology; latest integration import failed.",
+            mock_scheduler_error.call_args.args[0],
+        )
+        self.assertIn(
+            "Sonar exited with code 1. Continuing.",
+            mock_scheduler_error.call_args.args[0],
+        )
+
 
 class TestSchedulerLogging(unittest.TestCase):
+    def setUp(self):
+        scheduler.set_scheduler_status_bus_enabled(True)
+        scheduler._reset_startup_topology_runtime_wait()
+        scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
+        scheduler.shaping_runtime_hash = 0
+
     def test_configure_scheduler_stdio_enables_line_buffering_when_supported(self):
         class FakeStream:
             def __init__(self):
@@ -368,6 +407,55 @@ class TestSchedulerLogging(unittest.TestCase):
             "Topology runtime refresh failed: bad runtime"
         )
 
+    def test_topology_runtime_refresh_tick_waits_for_stale_shaping_inputs(self):
+        stale_exc = scheduler.RefreshFailure(
+            "Missing or stale shaping_inputs.json. Run topology runtime before shaping."
+        )
+
+        with patch.object(scheduler, "ensure_topology_runtime_process"):
+            with patch.object(
+                scheduler,
+                "topology_runtime_readiness_detail",
+                return_value=(True, "", "generation-1"),
+            ):
+                with patch.object(
+                    scheduler,
+                    "current_topology_source_generation",
+                    return_value="generation-1",
+                ):
+                    with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=5):
+                        with patch.object(
+                            scheduler,
+                            "refreshShapers",
+                            side_effect=stale_exc,
+                        ):
+                            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                                with patch.object(
+                                    scheduler,
+                                    "report_scheduler_runtime_failure",
+                                ) as mock_report:
+                                    with patch.object(
+                                        scheduler,
+                                        "publish_scheduler_progress",
+                                    ) as mock_progress:
+                                        with patch("builtins.print"):
+                                            scheduler.shaping_runtime_hash = 1
+                                            scheduler.topology_runtime_refresh_tick()
+
+        mock_clear_error.assert_called_once()
+        mock_report.assert_not_called()
+        self.assertTrue(scheduler.partial_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    True,
+                    "waiting_for_topology_runtime",
+                    "Waiting for topology runtime",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
     def test_topology_runtime_refresh_tick_reports_validation_failure(self):
         validation_exc = scheduler.ValidationFailure("Validation failed. Will now exit.")
 
@@ -407,6 +495,61 @@ class TestSchedulerLogging(unittest.TestCase):
             )
         )
 
+    def test_topology_runtime_refresh_tick_clears_error_after_success(self):
+        with patch.object(scheduler, "ensure_topology_runtime_process"):
+            with patch.object(
+                scheduler,
+                "topology_runtime_readiness_detail",
+                return_value=(True, "", "generation-1"),
+            ):
+                with patch.object(
+                    scheduler,
+                    "calculate_shaping_runtime_hash",
+                    side_effect=[5, 5],
+                ):
+                    with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                        with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                            with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                                scheduler.shaping_runtime_hash = 1
+                                scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_called_once()
+        mock_clear_error.assert_called_once()
+        self.assertEqual(scheduler.shaping_runtime_hash, 5)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    False,
+                    "ready",
+                    "Scheduler ready",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
+    def test_topology_runtime_refresh_tick_reports_missing_hash_after_success(self):
+        with patch.object(scheduler, "ensure_topology_runtime_process"):
+            with patch.object(
+                scheduler,
+                "topology_runtime_readiness_detail",
+                return_value=(True, "", "generation-1"),
+            ):
+                with patch.object(
+                    scheduler,
+                    "calculate_shaping_runtime_hash",
+                    side_effect=[5, 0],
+                ):
+                    with patch.object(scheduler, "refreshShapers"):
+                        with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                                scheduler.shaping_runtime_hash = 1
+                                scheduler.topology_runtime_refresh_tick()
+
+        mock_clear_error.assert_not_called()
+        mock_scheduler_error.assert_called_once_with(
+            "Topology runtime refresh failed: Shaping runtime hash was not published after topology runtime refresh."
+        )
+
     def test_topology_runtime_refresh_tick_skips_until_initial_shaping_succeeds(self):
         with patch.object(scheduler, "ensure_topology_runtime_process") as mock_ensure:
             with patch.object(scheduler, "calculate_shaping_runtime_hash") as mock_hash:
@@ -415,6 +558,243 @@ class TestSchedulerLogging(unittest.TestCase):
 
         mock_ensure.assert_not_called()
         mock_hash.assert_not_called()
+
+    def test_topology_runtime_refresh_tick_waits_for_startup_runtime_outputs(self):
+        scheduler.startup_topology_runtime_pending = True
+        scheduler.startup_topology_runtime_generation = "generation-1"
+        scheduler.startup_topology_runtime_started_monotonic = scheduler.time.monotonic()
+
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime is still building outputs for the current source generation.",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                    with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                        with patch("builtins.print"):
+                            scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_not_called()
+        mock_scheduler_error.assert_not_called()
+        self.assertTrue(scheduler.startup_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    True,
+                    "waiting_for_topology_runtime",
+                    "Waiting for topology runtime",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
+    def test_transient_topology_runtime_deferred_wait_does_not_raise_scheduler_error(self):
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime is still building outputs for the current source generation.",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                    with patch.object(scheduler, "scheduler_output") as mock_scheduler_output:
+                        with patch.object(
+                            scheduler,
+                            "publish_scheduler_progress",
+                        ) as mock_progress:
+                            with patch("builtins.print"):
+                                scheduler.report_topology_runtime_not_ready(
+                                    "Scheduled shaping refresh deferred",
+                                    phase_label="Scheduler waiting for topology runtime",
+                                    step_index=3,
+                                    step_count=scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                                )
+
+        mock_clear_error.assert_called_once()
+        mock_scheduler_error.assert_not_called()
+        mock_scheduler_output.assert_called_once()
+        mock_progress.assert_called_once_with(
+            False,
+            "waiting_for_topology_runtime",
+            "Scheduler waiting for topology runtime",
+            3,
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+        )
+
+    def test_failed_topology_runtime_deferred_wait_reports_scheduler_error(self):
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime failed for the current source generation: publish failed",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                    with patch.object(scheduler, "scheduler_output") as mock_scheduler_output:
+                        with patch.object(
+                            scheduler,
+                            "publish_scheduler_progress",
+                        ) as mock_progress:
+                            with patch("builtins.print"):
+                                scheduler.report_topology_runtime_not_ready(
+                                    "Scheduled shaping refresh deferred",
+                                    phase_label="Scheduler waiting for topology runtime",
+                                    step_index=3,
+                                    step_count=scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+                                )
+
+        mock_clear_error.assert_not_called()
+        mock_scheduler_error.assert_called_once_with(
+            "Scheduled shaping refresh deferred: Topology runtime failed for the current source generation: publish failed Generation generation-1."
+        )
+        mock_scheduler_output.assert_called_once_with(
+            "Scheduled shaping refresh deferred: Topology runtime failed for the current source generation: publish failed Generation generation-1."
+        )
+        mock_progress.assert_called_once_with(
+            False,
+            "degraded",
+            "Scheduler waiting for topology runtime",
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+            scheduler.SCHEDULER_REFRESH_STEP_COUNT,
+            percent=100,
+        )
+
+    def test_topology_runtime_refresh_tick_waits_for_partial_runtime_outputs(self):
+        scheduler.partial_topology_runtime_pending = True
+        scheduler.partial_topology_runtime_generation = "generation-1"
+        scheduler.partial_topology_runtime_started_monotonic = scheduler.time.monotonic()
+        scheduler.shaping_runtime_hash = 4
+
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(
+                False,
+                "Topology runtime is still building outputs for the current source generation.",
+                "generation-1",
+            ),
+        ):
+            with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                    with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                        with patch("builtins.print"):
+                            scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_not_called()
+        mock_scheduler_error.assert_not_called()
+        self.assertTrue(scheduler.partial_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    True,
+                    "waiting_for_topology_runtime",
+                    "Waiting for topology runtime",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
+    def test_topology_runtime_refresh_tick_completes_startup_when_runtime_ready(self):
+        scheduler.startup_topology_runtime_pending = True
+        scheduler.startup_topology_runtime_generation = "generation-1"
+        scheduler.startup_topology_runtime_started_monotonic = scheduler.time.monotonic()
+
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(True, "", "generation-1"),
+        ):
+            with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=9):
+                    with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                        with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                            with patch("builtins.print"):
+                                scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_called_once()
+        mock_clear_error.assert_called_once()
+        self.assertEqual(scheduler.shaping_runtime_hash, 9)
+        self.assertFalse(scheduler.startup_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    False,
+                    "ready",
+                    "Scheduler ready",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
+    def test_topology_runtime_refresh_tick_completes_startup_without_refresh_for_insight_topology(self):
+        scheduler.startup_topology_runtime_pending = True
+        scheduler.startup_topology_runtime_generation = "generation-1"
+        scheduler.startup_topology_runtime_started_monotonic = scheduler.time.monotonic()
+
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(True, "", "generation-1"),
+        ):
+            with patch.object(scheduler, "enable_insight_topology", return_value=True):
+                with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                    with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=9):
+                        with patch.object(scheduler, "publish_scheduler_progress"):
+                            with patch.object(scheduler, "clear_scheduler_error"):
+                                with patch("builtins.print"):
+                                    scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_not_called()
+        self.assertEqual(scheduler.shaping_runtime_hash, 9)
+        self.assertFalse(scheduler.startup_topology_runtime_pending)
+
+    def test_topology_runtime_refresh_tick_completes_partial_wait_when_runtime_ready(self):
+        scheduler.partial_topology_runtime_pending = True
+        scheduler.partial_topology_runtime_generation = "generation-1"
+        scheduler.partial_topology_runtime_started_monotonic = scheduler.time.monotonic()
+        scheduler.shaping_runtime_hash = 1
+
+        with patch.object(
+            scheduler,
+            "topology_runtime_readiness_detail",
+            return_value=(True, "", "generation-1"),
+        ):
+            with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                with patch.object(
+                    scheduler,
+                    "calculate_shaping_runtime_hash",
+                    side_effect=[9, 9],
+                ):
+                    with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                        with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                            with patch("builtins.print"):
+                                scheduler.topology_runtime_refresh_tick()
+
+        mock_refresh.assert_called_once()
+        mock_clear_error.assert_called_once()
+        self.assertEqual(scheduler.shaping_runtime_hash, 9)
+        self.assertFalse(scheduler.partial_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    False,
+                    "ready",
+                    "Scheduler ready",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
 
     def test_import_and_shape_full_reload_reenables_status_bus_after_success(self):
         scheduler.set_scheduler_status_bus_enabled(False)
@@ -432,9 +812,18 @@ class TestSchedulerLogging(unittest.TestCase):
     def test_import_and_shape_full_reload_returns_false_when_topology_runtime_not_ready(self):
         with patch.object(scheduler, "importFromCRM"):
             with patch.object(scheduler, "ensure_topology_runtime_process", return_value=False):
-                with patch.object(scheduler, "report_topology_runtime_not_ready"):
+                with patch.object(
+                    scheduler,
+                    "topology_runtime_readiness_detail",
+                    return_value=(
+                        False,
+                        "Topology runtime is still building outputs for the current source generation.",
+                        "generation-1",
+                    ),
+                ):
                     with patch.object(scheduler, "publish_scheduler_progress"):
                         self.assertFalse(scheduler.importAndShapeFullReload())
+        self.assertTrue(scheduler.startup_topology_runtime_pending)
 
     def test_run_scheduler_main_reports_validation_failure_without_ready(self):
         fake_ads = Mock()
@@ -506,6 +895,59 @@ class TestSchedulerLogging(unittest.TestCase):
                     False,
                     "validation_failed",
                     "Scheduler validation failed",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
+    def test_partial_reload_waits_for_stale_shaping_inputs(self):
+        stale_exc = scheduler.RefreshFailure(
+            "Missing or stale shaping_inputs.json. Run topology runtime before shaping."
+        )
+
+        with patch.object(scheduler, "importFromCRM"):
+            with patch.object(scheduler, "ensure_topology_runtime_process", return_value=True):
+                with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=2):
+                    with patch.object(scheduler, "shaping_runtime_hash", 1):
+                        with patch.object(
+                            scheduler,
+                            "topology_runtime_readiness_detail",
+                            return_value=(True, "", "generation-1"),
+                        ):
+                            with patch.object(
+                                scheduler,
+                                "current_topology_source_generation",
+                                return_value="generation-1",
+                            ):
+                                with patch.object(
+                                    scheduler,
+                                    "refreshShapers",
+                                    side_effect=stale_exc,
+                                ):
+                                    with patch.object(
+                                        scheduler,
+                                        "clear_scheduler_error",
+                                    ) as mock_clear_error:
+                                        with patch.object(
+                                            scheduler,
+                                            "report_scheduler_runtime_failure",
+                                        ) as mock_report:
+                                            with patch.object(
+                                                scheduler,
+                                                "publish_scheduler_progress",
+                                            ) as mock_progress:
+                                                with patch("builtins.print"):
+                                                    scheduler.importAndShapePartialReload()
+
+        mock_clear_error.assert_called_once()
+        mock_report.assert_not_called()
+        self.assertTrue(scheduler.partial_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    True,
+                    "waiting_for_topology_runtime",
+                    "Waiting for topology runtime",
                 )
                 for call in mock_progress.call_args_list
             )
@@ -662,6 +1104,12 @@ class TestTopologyRuntimeReadiness(unittest.TestCase):
 
 
 class TestTopologyRuntimeGating(unittest.TestCase):
+    def setUp(self):
+        scheduler._reset_startup_topology_runtime_wait()
+        scheduler._reset_partial_topology_runtime_wait()
+        scheduler.clear_integration_failure()
+        scheduler.shaping_runtime_hash = 0
+
     def test_full_reload_skips_refresh_when_topology_runtime_not_ready(self):
         with patch.object(scheduler, "importFromCRM"):
             with patch.object(scheduler, "ensure_topology_runtime_process", return_value=False):
@@ -671,18 +1119,97 @@ class TestTopologyRuntimeGating(unittest.TestCase):
                             scheduler.importAndShapeFullReload()
 
         mock_refresh.assert_not_called()
-        mock_report.assert_called_once()
+        mock_report.assert_not_called()
+        self.assertTrue(scheduler.startup_topology_runtime_pending)
 
-    def test_partial_reload_skips_refresh_when_topology_runtime_not_ready(self):
+    def test_partial_reload_waits_when_topology_runtime_not_ready(self):
         with patch.object(scheduler, "importFromCRM"):
             with patch.object(scheduler, "ensure_topology_runtime_process", return_value=False):
-                with patch.object(scheduler, "report_topology_runtime_not_ready") as mock_report:
-                    with patch.object(scheduler, "refreshShapers") as mock_refresh:
-                        with patch.object(scheduler, "publish_scheduler_progress"):
-                            scheduler.importAndShapePartialReload()
+                with patch.object(
+                    scheduler,
+                    "topology_runtime_readiness_detail",
+                    return_value=(
+                        False,
+                        "Topology runtime is still building outputs for the current source generation.",
+                        "generation-1",
+                    ),
+                ):
+                    with patch.object(scheduler, "report_topology_runtime_not_ready") as mock_report:
+                        with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                            with patch.object(scheduler, "publish_scheduler_progress"):
+                                scheduler.importAndShapePartialReload()
+
+        mock_refresh.assert_not_called()
+        mock_report.assert_not_called()
+        self.assertTrue(scheduler.partial_topology_runtime_pending)
+
+    def test_partial_reload_reports_runtime_failure_when_topology_runtime_failed(self):
+        with patch.object(scheduler, "importFromCRM"):
+            with patch.object(scheduler, "ensure_topology_runtime_process", return_value=False):
+                with patch.object(
+                    scheduler,
+                    "topology_runtime_readiness_detail",
+                    return_value=(
+                        False,
+                        "Topology runtime failed for the current source generation: publish failed",
+                        "generation-1",
+                    ),
+                ):
+                    with patch.object(scheduler, "report_topology_runtime_not_ready") as mock_report:
+                        with patch.object(scheduler, "refreshShapers") as mock_refresh:
+                            with patch.object(scheduler, "publish_scheduler_progress"):
+                                scheduler.importAndShapePartialReload()
 
         mock_refresh.assert_not_called()
         mock_report.assert_called_once()
+
+    def test_full_reload_waits_for_stale_shaping_inputs(self):
+        stale_exc = scheduler.RefreshFailure(
+            "Missing or stale shaping_inputs.json. Run topology runtime before shaping."
+        )
+
+        with patch.object(scheduler, "importFromCRM"):
+            with patch.object(scheduler, "ensure_topology_runtime_process", return_value=True):
+                with patch.object(scheduler, "enable_insight_topology", return_value=False):
+                    with patch.object(
+                        scheduler,
+                        "topology_runtime_readiness_detail",
+                        return_value=(True, "", "generation-1"),
+                    ):
+                        with patch.object(
+                            scheduler,
+                            "current_topology_source_generation",
+                            return_value="generation-1",
+                        ):
+                            with patch.object(
+                                scheduler,
+                                "refreshShapers",
+                                side_effect=stale_exc,
+                            ):
+                                with patch.object(
+                                    scheduler,
+                                    "clear_scheduler_error",
+                                ) as mock_clear_error:
+                                    with patch.object(
+                                        scheduler,
+                                        "publish_scheduler_progress",
+                                    ) as mock_progress:
+                                        with patch("builtins.print"):
+                                            ready = scheduler.importAndShapeFullReload()
+
+        self.assertFalse(ready)
+        mock_clear_error.assert_called_once()
+        self.assertTrue(scheduler.startup_topology_runtime_pending)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    True,
+                    "waiting_for_topology_runtime",
+                    "Waiting for topology runtime",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
 
 
 class TestSchedulerOverrideMerge(unittest.TestCase):

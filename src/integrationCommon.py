@@ -1,7 +1,7 @@
 # Optimized version of integrationCommon.py for better performance with large datasets
 # Provides common functionality shared between integrations.
 
-from typing import List, Any, Dict, Set
+from typing import List, Any, Dict, Set, Tuple
 from liblqos_python import allowed_subnets, ignore_subnets, generated_pn_download_mbps, generated_pn_upload_mbps, \
 	circuit_name_use_address, upstream_bandwidth_capacity_download_mbps, upstream_bandwidth_capacity_upload_mbps, \
 	find_ipv6_using_mikrotik, exclude_sites, bandwidth_overhead_factor, committed_bandwidth_multiplier, \
@@ -31,6 +31,46 @@ def _state_directory():
 
 def _state_path(category, filename):
 	return os.path.join(_state_directory(), category, filename)
+
+def _normalize_exception_cpes(raw_exception_cpes) -> Tuple[Dict[str, str], List[str]]:
+	normalized = {}
+	errors = []
+	if raw_exception_cpes is None:
+		return normalized, errors
+	if isinstance(raw_exception_cpes, dict):
+		for cpe, parent in raw_exception_cpes.items():
+			cpe = str(cpe).strip()
+			parent = str(parent).strip()
+			if cpe and parent:
+				normalized[cpe] = parent
+		return normalized, errors
+	if not isinstance(raw_exception_cpes, (list, tuple, set)):
+		errors.append(
+			f"exception_cpes ignored: expected dict or list, got {type(raw_exception_cpes).__name__}"
+		)
+		return normalized, errors
+	for entry in raw_exception_cpes:
+		cpe = None
+		parent = None
+		if isinstance(entry, str):
+			if ":" in entry:
+				cpe, parent = entry.split(":", 1)
+			else:
+				errors.append(f"exception_cpes entry ignored: {entry!r} is missing ':'")
+				continue
+		elif isinstance(entry, dict):
+			cpe = entry.get("cpe")
+			parent = entry.get("parent")
+		else:
+			cpe = getattr(entry, "cpe", None)
+			parent = getattr(entry, "parent", None)
+		cpe = str(cpe or "").strip()
+		parent = str(parent or "").strip()
+		if not cpe or not parent:
+			errors.append(f"exception_cpes entry ignored: {entry!r} is missing cpe or parent")
+			continue
+		normalized[cpe] = parent
+	return normalized, errors
 
 def isInAllowedSubnets(inputIP):
 	# Check whether an IP address occurs inside the allowedSubnets list
@@ -203,8 +243,9 @@ class NetworkGraph:
 						parentId="", displayName="Shaper Root")
 		]
 		self.excludeSites = exclude_sites()
-		self.exceptionCPEs = exception_cpes()
 		self.errors: List[str] = []
+		self.exceptionCPEs, exception_cpe_errors = _normalize_exception_cpes(exception_cpes())
+		self.errors.extend(exception_cpe_errors)
 		
 		# Initialize optimization structures
 		self._id_to_index = {"FakeRoot": 0}
@@ -735,8 +776,8 @@ class NetworkGraph:
 					device["mac"],
 					ipv4,
 					ipv6,
-					int(1),
-					int(1),
+					max(1.0, round(float(circuit["download"]*0.98), 2)),
+					max(1.0, round(float(circuit["upload"])*0.98, 2)),
 					max(1.0, round(float(circuit["download"]), 2)),
 					max(1.0, round(float(circuit["upload"]), 2)),
 					""

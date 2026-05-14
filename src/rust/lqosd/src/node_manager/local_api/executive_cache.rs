@@ -352,7 +352,7 @@ fn build_top_asn_rows(entities: &[ExecutiveEntitySnapshot]) -> Vec<ExecutiveTopA
             median_retransmit_pct: median_value(&entity.heatmap.retransmit),
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| right.total_bytes_15m.cmp(&left.total_bytes_15m));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total_bytes_15m));
     rows.truncate(EXECUTIVE_TOP_LIMIT);
     rows
 }

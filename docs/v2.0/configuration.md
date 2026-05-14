@@ -33,6 +33,8 @@ Most day-to-day LibreQoS configuration happens in WebUI. By default that is `htt
 
 Current builds use a consistent configuration layout across the General, RTT, Queues, TreeGuard, Network Mode, Integration Defaults, Network Layout, Insight, provider integration, IP Ranges, Flow Tracking, and Shaped Devices pages. Integration Defaults also includes the shared Ethernet port headroom policy used by integrations that can detect negotiated subscriber-facing port speeds.
 
+Configuration pages that offer topology selectors use the active runtime topology, so integration-backed deployments do not need a hand-managed `network.json` for those lists.
+
 ### Where In WebUI
 
 - General settings: `Configuration -> General`

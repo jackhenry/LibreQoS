@@ -11,6 +11,8 @@ Use this section first to avoid common topology-mode confusion.
 3. Use `full` when you need full hierarchy/backhaul representation and have CPU headroom.
 4. Use `flat` only when hierarchy is not needed and maximum performance is the priority.
 
+The `Root UISP Site` setting is required only for `full` topology mode. In `flat`, `ap_only`, and `ap_site` modes, you may leave it blank; LibreQoS will use UISP Internet data-links to pick the import root, or create a generated Internet root when UISP reports multiple Internet-connected sites.
+
 ## Router-Mode Expectations
 
 - UISP router mode is supported, but parent/route discovery quality depends on your UISP topology data quality.
@@ -124,6 +126,7 @@ enable_uisp = true
 token = "your-api-token-here"
 url = "https://uisp.your_domain.com"
 site = "Root_Site_Name"  # Root site for topology perspective
+# Required for full topology mode; optional for flat, ap_only, and ap_site
 
 # Suspension Handling (see table above)
 suspended_strategy = "none"

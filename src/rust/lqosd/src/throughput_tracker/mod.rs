@@ -446,7 +446,7 @@ pub fn top_n(start: u32, end: u32) -> BusResponse {
             })
             .collect()
     };
-    full_list.sort_by(|a, b| b.1.down.cmp(&a.1.down));
+    full_list.sort_by_key(|row| std::cmp::Reverse(row.1.down));
     let result = full_list
         .iter()
         //.skip(start as usize)
@@ -493,7 +493,7 @@ pub fn top_n_up(start: u32, end: u32) -> BusResponse {
             })
             .collect()
     };
-    full_list.sort_by(|a, b| b.1.up.cmp(&a.1.up));
+    full_list.sort_by_key(|row| std::cmp::Reverse(row.1.up));
     let result = full_list
         .iter()
         //.skip(start as usize)
@@ -1064,7 +1064,7 @@ pub fn all_unknown_ips() -> BusResponse {
             })
             .collect()
     };
-    full_list.sort_by(|a, b| b.5.cmp(&a.5));
+    full_list.sort_by_key(|row| std::cmp::Reverse(row.5));
     let result = full_list
         .iter()
         .map(

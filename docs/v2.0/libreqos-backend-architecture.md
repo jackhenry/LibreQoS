@@ -343,12 +343,13 @@ This retained-root strategy reduces avoidable root-level churn, while still pref
 
 ### 8.6 Full-reload safety guards
 
-Current Bakery full reloads apply two conservative safety checks before and during large queue rebuilds:
+Current Bakery full reloads apply conservative safety checks before and during large queue rebuilds:
 
 1. A qdisc preflight estimates planned qdiscs per interface and also separates infrastructure, `cake`, and `fq_codel` leaf qdiscs.
 2. That same preflight applies a conservative memory forecast and hard-blocks clearly unsafe full reloads before `tc -batch` starts.
-3. During chunked full reload apply, Bakery re-checks host memory at chunk boundaries and aborts the remaining apply if available memory drops below its safety floor.
-4. These guards are intentionally biased toward false positives on large reloads so the system fails early with diagnostics instead of spiraling into an OOM event.
+3. Bakery's memory floor scales with host RAM: it keeps at least 2 GiB available, or one eighth of total RAM on larger systems.
+4. During chunked full reload apply, Bakery re-checks host memory at chunk boundaries and aborts the remaining apply if available memory drops below the scaled floor plus the projected qdisc memory for the batch.
+5. These guards are intentionally biased toward false positives on large reloads so the system fails early with diagnostics instead of spiraling into an OOM event.
 
 ### 8.7 Runtime safety model
 

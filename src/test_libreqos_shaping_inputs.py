@@ -9,7 +9,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-_STUBBED_MODULES = ("pythonCheck", "liblqos_python", "LibreQoS")
+_STUBBED_MODULES = ("pythonCheck", "liblqos_python", "deepdiff", "LibreQoS")
 _ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _STUBBED_MODULES}
 LibreQoS = None
 
@@ -18,6 +18,10 @@ def install_libreqos_stubs():
     python_check = types.ModuleType("pythonCheck")
     python_check.checkPythonVersion = lambda: None
     sys.modules["pythonCheck"] = python_check
+
+    deepdiff = types.ModuleType("deepdiff")
+    deepdiff.DeepDiff = lambda *_args, **_kwargs: {}
+    sys.modules["deepdiff"] = deepdiff
 
     lqlib = types.ModuleType("liblqos_python")
     lqlib.is_lqosd_alive = lambda: True
@@ -95,6 +99,70 @@ class TestLibreQoSShapingInputs(unittest.TestCase):
     def test_attachment_lookup_candidates_preserve_generated_parent_name_without_node_id(self):
         candidates = LibreQoS._attachment_lookup_candidates("Generated_PN_1", {})
         self.assertEqual(candidates, ["Generated_PN_1"])
+
+    def test_runtime_resolved_circuit_attachment_candidates_ignore_logical_parent(self):
+        candidates = LibreQoS._circuit_attachment_name_candidates(
+            {
+                "ParentNode": "Generated_PN_2",
+                "effectiveParentNodeName": "Generated_PN_2",
+                "logicalParentNode": "Globe",
+                "parentResolvedByShapingInputs": True,
+            }
+        )
+        self.assertEqual(candidates, ["Generated_PN_2"])
+
+    def test_canonical_shaping_parent_ignores_logical_anchor_for_generated_parent(self):
+        circuit = {
+            "ParentNode": "Generated_PN_1",
+            "effectiveParentNodeName": "Generated_PN_1",
+            "ParentNodeID": "uisp:device:glenn-s1",
+            "effectiveParentNodeID": "uisp:device:glenn-s1",
+            "logicalParentNode": "glenn-s1.streamitnet.com",
+            "parentResolutionSource": "topology_anchor",
+        }
+
+        parent_name, parent_id = LibreQoS._normalize_circuit_shaping_parent(circuit)
+
+        self.assertEqual(parent_name, "Generated_PN_1")
+        self.assertEqual(parent_id, "")
+        self.assertEqual(circuit["shapingParentNode"], "Generated_PN_1")
+        self.assertEqual(circuit["shapingParentNodeID"], "")
+        self.assertEqual(circuit["shapingParentKey"], "name:Generated_PN_1")
+
+    def test_canonical_shaping_parent_drops_mismatched_parent_id(self):
+        circuit = {
+            "ParentNode": "Physical_AP",
+            "ParentNodeID": "uisp:device:logical-ap",
+        }
+
+        parent_name, parent_id = LibreQoS._normalize_circuit_shaping_parent(
+            circuit,
+            {"uisp:device:logical-ap": "Logical_AP"},
+        )
+
+        self.assertEqual(parent_name, "Physical_AP")
+        self.assertEqual(parent_id, "")
+        self.assertEqual(circuit["shapingParentKey"], "name:Physical_AP")
+
+    def test_validate_planned_circuit_attachment_rejects_major_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "Planned circuit class majors do not match"):
+            LibreQoS._validate_planned_circuit_attachment(
+                "Globe",
+                {
+                    "classMajor": "0x1",
+                    "up_classMajor": "0x11",
+                },
+                {
+                    "circuitID": "circuit-1",
+                    "ParentNode": "Generated_PN_4",
+                    "logicalParentNode": "Globe",
+                    "parentResolutionSource": "runtime_fallback",
+                },
+                {
+                    "class_major": 4,
+                    "up_class_major": 20,
+                },
+            )
 
     def test_shaping_inputs_freshness_tracks_circuit_anchors(self):
         with tempfile.TemporaryDirectory() as temp_dir:

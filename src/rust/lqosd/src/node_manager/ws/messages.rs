@@ -92,6 +92,7 @@ pub enum PrivateRequest {
     StopCircuitWatcher,
     StopPingMonitorWatch,
     CakeWatcher { circuit: String },
+    StopCakeWatcher,
     Chatbot { browser_ts_ms: Option<f64> },
     ChatbotUserInput { text: String },
     WatchTreeAttachedCircuits { query: TreeAttachedCircuitsQuery },
@@ -323,12 +324,19 @@ pub enum WsRequest {
     ProtocolFlowTimeline {
         protocol: String,
     },
-    UrgentStatus,
-    UrgentList,
+    UrgentStatus {
+        request_id: Option<u64>,
+    },
+    UrgentList {
+        request_id: Option<u64>,
+    },
     UrgentClear {
         id: u64,
+        request_id: Option<u64>,
     },
-    UrgentClearAll,
+    UrgentClearAll {
+        request_id: Option<u64>,
+    },
     UnknownIps,
     UnknownIpsClear,
     UnknownIpsCsv,
@@ -447,6 +455,8 @@ pub struct BakeryStatusState {
     pub preflight: Option<BakeryPreflightData>,
     pub reload_required: bool,
     pub reload_required_reason: Option<String>,
+    pub passthrough_degraded: bool,
+    pub passthrough_degraded_reason: Option<String>,
     pub dirty_subtree_count: usize,
 }
 
@@ -623,15 +633,23 @@ pub enum WsResponse {
     },
     UrgentStatus {
         data: UrgentStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentList {
         data: UrgentList,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentClearResult {
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UrgentClearAllResult {
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     UnknownIps {
         data: Vec<UnknownIp>,

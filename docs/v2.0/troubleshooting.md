@@ -129,6 +129,16 @@ Press the End key on the keyboard to take you to the bottom of the log to see th
 
 Lqosd will provide specific reasons it failed, such as an interface not being up, an interface lacking multi-queue, or other concerns.
 
+If `journalctl -u lqosd` shows `lqosd memory watchdog restarting daemon`, the daemon intentionally exited before host memory pressure reached the kernel OOM path. Systemd should restart `lqosd` automatically. Capture the watchdog log line before changing settings; it includes available memory, `lqosd` RSS/swap, thread count, flow count, and timing counters that help diagnose the source of memory growth.
+
+The watchdog can be tuned with systemd environment overrides:
+
+```bash
+sudo systemctl edit lqosd
+```
+
+Common override variables are `LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB`, `LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB`, and `LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB`. Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` only for short troubleshooting windows where you are actively watching memory pressure.
+
 ### Advanced lqosd debug
 
 At the command-line, run:
@@ -161,19 +171,20 @@ ldd /opt/libreqos/src/liblqos_python.so
 
 Routine package upgrades now keep `lqosd` in charge of the main WebUI when `/etc/lqos.conf` already exists. Current packages no longer start the dedicated `lqos_setup` web service during a normal upgrade just because newer first-run checks are incomplete. If the upgraded host still needs a first admin user or a topology source, finish that work in the normal WebUI (`first-run.html` or `Complete Setup`) instead of expecting `lqos_setup` to take over port `9123`.
 
-If startup shaping fails because `shaping_inputs.json` is missing or stale, current builds leave the scheduler running in a degraded state and wait for the next scheduled full refresh to recover. The high-frequency topology refresh tick stays disabled until one shaping pass completes successfully, so repeated 3-second refresh attempts should not continue hammering a fresh install that has not produced runtime topology inputs yet.
+If startup shaping begins before topology runtime has finished publishing the current generation of `shaping_inputs.json`, current builds keep the scheduler in a startup wait state and retry the initial shaping pass every few seconds. A short `still building outputs for the current source generation` message right after restart now usually means LibreQoS is still finishing the import/runtime publish cycle, not that shaping is stuck until the next 30-minute refresh.
 
-If scheduler startup is degraded with a message about topology runtime still building, that usually means LibreQoS is still finishing an import or refreshing shaping data. Give the current cycle a little time to complete, then recheck Scheduler Status before changing unrelated settings.
+If a scheduled integration refresh lands while topology runtime is still publishing outputs for the new source generation, current builds keep the scheduler in a waiting state for that generation and retry the scheduled shaping refresh automatically as soon as topology runtime finishes. Treat `Scheduled shaping refresh deferred` as a transient wait only when the message says topology runtime is still building outputs for the current generation. If the message instead says topology runtime failed for the current generation, investigate that runtime failure directly.
 
-If scheduler startup is degraded with a message that topology runtime failed for the current generation, inspect:
+If scheduler startup stays in that wait state for an unusually long time, or degrades with a message that topology runtime failed for the current generation, inspect:
 
 ```bash
-cat /opt/libreqos/src/topology_runtime_status.json
-ls -lh /opt/libreqos/src/topology_effective_state.json /opt/libreqos/src/network.effective.json /opt/libreqos/src/shaping_inputs.json
+cat /opt/libreqos/state/topology/topology_runtime_status.json
+ls -lh /opt/libreqos/state/topology/topology_effective_state.json /opt/libreqos/state/topology/network.effective.json /opt/libreqos/state/shaping/shaping_inputs.json
 journalctl -u lqos_scheduler --since "30 minutes ago"
+journalctl -u lqosd --since "30 minutes ago"
 ```
 
-If Topology Manager changes or imports seem stuck on older data, check whether LibreQoS set older snapshots aside under `/opt/libreqos/src/.topology_stale/`, then review recent scheduler logs before retrying.
+If Topology Manager changes or imports seem stuck on older data, check whether LibreQoS set older snapshots aside under `/opt/libreqos/src/.topology_stale/`, then review recent scheduler and `lqosd` logs before retrying.
 
 If Insight topology looks wrong, review the current troubleshooting snapshot that `lqosd` is preparing for Insight:
 
@@ -183,15 +194,18 @@ cat /opt/libreqos/src/network.insight.debug.json
 
 Treat `network.insight.debug.json` as a troubleshooting snapshot only; do not edit it.
 
+If `journalctl -u lqosd` shows repeated `BeginIngest queue full`, `IngestChunk queue full`, or `EndIngest queue full` warnings during startup or immediately after a topology import, older builds were dropping Insight ingest frames because the node's outbound control-channel queue was too small for burst uploads. Current builds apply backpressure on the Insight socket for ingest batches instead, so those warnings should no longer be expected during short import/startup bursts. If they still appear after upgrading, inspect recent `lqosd` CPU pressure and control-channel connectivity before assuming shaping itself is unhealthy.
+
 If specific APs or switches appear multiple times with suffixed names such as `... [AP deadbeef]`, check whether UISP is returning duplicate rows for the same device ID. Current builds defensively deduplicate raw UISP devices by `identification.id` before topology graph construction, and skip any residual duplicate device IDs during graph assembly.
 
-If an integration subprocess fails, current builds keep the scheduler alive, publish a shortened output preview to the scheduler status/error surfaces, and save the full captured output to a timestamped file under `/tmp` such as `lqos_scheduler_uisp_integration_YYYYMMDD_HHMMSS.log`.
+If an integration subprocess fails, current builds keep the scheduler alive, publish a shortened output preview to the scheduler status/error surfaces, and save the full captured output to a timestamped file under `/tmp` such as `lqos_scheduler_uisp_integration_YYYYMMDD_HHMMSS.log`. If shaping can continue from the last-known-good topology, the scheduler may still report ready, but the latest integration failure remains visible in scheduler status until the next successful integration run.
 
 ### Scheduler status in WebUI looks unhealthy
 
 Recent builds expose scheduler readiness/state in the WebUI (Node Manager).
 If the scheduler is still starting, the sidebar now reports the current startup phase and a coarse progress ring rather than only a spinner.
 Current builds also treat scheduler progress, output, and error bus messages as proof that the scheduler is alive, so the sidebar should not stay stuck on `Scheduler available: false` while the scheduler is actively reporting work.
+If the scheduler modal says scheduler details timed out, current builds keep showing the last good scheduler snapshot with its age instead of turning that transport problem into a scheduler error. Treat that warning as a WebUI or `lqosd` communication issue first, then confirm scheduler health in the service logs before assuming shaping failed.
 
 If scheduler status appears down/stale:
 1. Verify both services:
@@ -217,23 +231,34 @@ If status repeatedly oscillates between ready/error, collect both logs and confi
 
 This tends to show up when the MQ qdisc cannot be added correctly to the NIC interface. This would suggest the NIC has insufficient RX/TX queues. Please make sure you are using the [recommended NICs](requirements.md).
 
-### Python ModuleNotFoundError in Ubuntu 24.04
+### Python dependency or virtual environment errors
+
+Packaged installs keep LibreQoS Python dependencies in `/opt/libreqos/venv`. The services still run as root, but Python packages do not mix with apt-managed system packages. If the scheduler reports missing Python modules, or package configuration was interrupted while installing Python dependencies, rebuild the virtual environment:
+
+```bash
+sudo /opt/libreqos/src/bin/rebuild_python_venv.sh
+sudo dpkg --configure -a
+sudo systemctl restart lqosd lqos_scheduler
 ```
-pip uninstall binpacking --break-system-packages --yes
-sudo pip uninstall binpacking --break-system-packages --yes
-sudo pip install binpacking --break-system-packages
-pip uninstall apscheduler --break-system-packages --yes
-sudo pip uninstall apscheduler --break-system-packages --yes
-sudo pip install apscheduler --break-system-packages
-pip uninstall deepdiff --break-system-packages --yes
-sudo pip uninstall deepdiff --break-system-packages --yes
-sudo pip install deepdiff --break-system-packages
+
+Git-based installs should use `./build_rust.sh` after pulling updates. It rebuilds the virtual environment before refreshing service files or restarting services. If systemd reports `status=203/EXEC` on `/opt/libreqos/venv/bin/python`, or a failed scheduler pre-start check, rebuild the virtual environment with the command above and restart `lqos_scheduler`.
+
+For manual shaping tests, use the same interpreter as the service:
+
+```bash
+sudo systemctl stop lqos_scheduler
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
+sudo systemctl start lqos_scheduler
 ```
+
+Older installs that predate the virtual environment may show `ModuleNotFoundError` and suggest system `pip` commands. Do not repair current installs with system `pip` or `--break-system-packages`; those packages are not used by the venv-backed scheduler service. Upgrade to a package that creates `/opt/libreqos/venv`, then use the repair command above.
+
 ### All customer IPs are listed under Unknown IPs, rather than Shaped Devices in GUI
+
 ```
 cd /opt/libreqos/src
 sudo systemctl stop lqos_scheduler
-sudo python3 LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 The console output from running LibreQoS.py directly provides more specific errors regarding issues with ShapedDevices.csv and network.json
@@ -311,7 +336,7 @@ WebUI urgent issues include machine-readable codes. Use them to triage quickly.
 | `MAPPED_CIRCUIT_LIMIT` | Bakery is enforcing a mapped-circuit limit. | Insight license status, `journalctl -u lqosd` for requested/allowed/dropped counts. | Reduce mapped circuits immediately or update license/limits. |
 | `TC_U16_OVERFLOW` | Queue/class minor IDs exceeded the Linux tc u16 range on a CPU queue. | `journalctl -u lqos_scheduler -u lqosd`, topology depth/queue distribution. | Increase queue count and/or simplify/rebalance hierarchy (for example with integration strategy or root promotion changes). |
 | `TC_QDISC_CAPACITY` | Planned auto-allocated qdiscs exceed the per-interface safe budget or Bakery's conservative memory-safety preflight before apply. | Estimated per-interface qdisc counts, qdisc-kind breakdown, and memory fields in the urgent issue context, `journalctl -u lqos_scheduler -u lqosd`, `on_a_stick` and `queue_mode` config. | Reduce the planned qdisc load for this run (for example fewer circuits/devices in the test shape) before retrying; do not trust partial apply. |
-| `BAKERY_MEMORY_GUARD` | A chunked Bakery full reload was stopped mid-apply because available host memory fell below the safety floor. | `journalctl -u lqosd`, available/total memory in the urgent issue context, and recent Bakery apply progress. | Treat the run as failed, reduce memory pressure or queue footprint, and retry only after the host is stable. |
+| `BAKERY_MEMORY_GUARD` | A chunked Bakery full reload was stopped mid-apply because available host memory fell below the scaled safety floor. | `journalctl -u lqosd`, available/total memory in the urgent issue context, and recent Bakery apply progress. | Treat the run as failed, reduce memory pressure or queue footprint, and retry only after the host is stable. |
 | `XDP_IP_MAPPING_CAPACITY` | Required IP mappings exceed the current XDP kernel map capacity. | `ShapedDevices.csv` row shape, IPv4/IPv6 mix, one-device-vs-many-device assumptions, `journalctl -u lqos_scheduler -u lqosd`. | Reduce required mappings immediately (for example fewer devices or IPv4-only test shape), or raise kernel map capacity in a coordinated change. |
 | `XDP_IP_MAPPING_APPLY_FAILED` | One or more IP mapping inserts failed during apply. | `journalctl -u lqos_scheduler -u lqosd` for summarized failure examples and counts. | Fix the underlying mapping failure, then rerun; do not trust partial shaping. |
 

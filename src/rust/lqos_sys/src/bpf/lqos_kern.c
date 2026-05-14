@@ -109,6 +109,9 @@ int xdp_prog(struct xdp_md *ctx)
         bpf_debug("Error: interface direction unspecified, aborting.");
         return XDP_PASS;
     }
+    if (tc_classify_bypass_enabled()) {
+        return XDP_PASS;
+    }
 
     // Do we need to perform a VLAN redirect?
     bool vlan_redirect = false;
@@ -264,6 +267,9 @@ int tc_iphash_to_cpu(struct __sk_buff *skb)
 #endif
     if (direction == 255) {
         bpf_debug("(TC) Error: interface direction unspecified, aborting.");
+        return TC_ACT_OK;
+    }
+    if (tc_classify_bypass_enabled()) {
         return TC_ACT_OK;
     }
 #ifdef VERBOSE

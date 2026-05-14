@@ -48,19 +48,19 @@ sudo systemctl stop lqos_scheduler
 For one-time runs of LibreQoS.py, use
 
 ```shell
-sudo ./LibreQoS.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py
 ```
 
 - To use the debug mode with more verbose output, use:
 
 ```shell
-sudo ./LibreQoS.py --debug
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/LibreQoS.py --debug
 ```
 
 To confirm that lqos_scheduler (scheduler.py) is able to work correctly, run:
 
 ```shell
-sudo python3 scheduler.py
+sudo /opt/libreqos/venv/bin/python /opt/libreqos/src/scheduler.py
 ```
 
 Once you have any errors eliminated, restart lqos_scheduler with

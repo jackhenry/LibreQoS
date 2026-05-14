@@ -356,6 +356,20 @@ pub struct TopologyRuntimeStatusFile {
     pub error: Option<String>,
 }
 
+/// Shaping-relevant runtime status identity used by consumers that only need
+/// to know whether the active shaping payload changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopologyRuntimeShapingPayloadIdentity {
+    /// Whether runtime outputs are ready.
+    pub ready: bool,
+    /// Stable generation hash of the source topology inputs.
+    pub source_generation: String,
+    /// Stable generation hash of the shaping payload.
+    pub shaping_generation: String,
+    /// Path to the active shaping inputs payload.
+    pub shaping_inputs_path: String,
+}
+
 fn default_runtime_schema_version() -> u32 {
     1
 }
@@ -428,20 +442,33 @@ pub fn active_runtime_shaping_inputs_path(
 ) -> Result<Option<PathBuf>, TopologyRuntimeStateError> {
     let current_generation = compute_topology_source_generation(config)?;
     let status = TopologyRuntimeStatusFile::load(config)?;
+    Ok(active_runtime_shaping_inputs_path_from_status(
+        &status,
+        &current_generation,
+    ))
+}
+
+/// Returns the active runtime shaping-inputs path from an already-loaded status file.
+///
+/// This function is pure: it has no side effects.
+pub fn active_runtime_shaping_inputs_path_from_status(
+    status: &TopologyRuntimeStatusFile,
+    current_generation: &str,
+) -> Option<PathBuf> {
     if !status.ready {
-        return Ok(None);
+        return None;
     }
     if status.shaping_generation.trim().is_empty() {
-        return Ok(None);
+        return None;
     }
     if status.source_generation.trim() != current_generation {
-        return Ok(None);
+        return None;
     }
     let path = status.shaping_inputs_path.trim();
     if path.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(PathBuf::from(path)))
+    Some(PathBuf::from(path))
 }
 
 /// Loads the currently active runtime shaping-inputs file when the topology
@@ -450,6 +477,20 @@ pub fn load_active_runtime_shaping_inputs(
     config: &Config,
 ) -> Result<Option<TopologyShapingInputsFile>, TopologyRuntimeStateError> {
     let Some(path) = active_runtime_shaping_inputs_path(config)? else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&path)?;
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+/// Loads the active runtime shaping-inputs file from an already-loaded status file.
+pub fn load_active_runtime_shaping_inputs_from_status(
+    config: &Config,
+    status: &TopologyRuntimeStatusFile,
+) -> Result<Option<TopologyShapingInputsFile>, TopologyRuntimeStateError> {
+    let current_generation = compute_topology_source_generation(config)?;
+    let Some(path) = active_runtime_shaping_inputs_path_from_status(status, &current_generation)
+    else {
         return Ok(None);
     };
     let raw = std::fs::read_to_string(&path)?;
@@ -694,7 +735,7 @@ fn normalized_json_value_for_generation(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             let mut normalized = serde_json::Map::with_capacity(entries.len());
             for (key, child) in entries {
                 normalized.insert(key.clone(), normalized_json_value_for_generation(child));
@@ -741,6 +782,29 @@ impl TopologyRuntimeStatusFile {
             &config.topology_state_file_path(TOPOLOGY_RUNTIME_STATUS_FILENAME),
             self,
         )
+    }
+
+    /// Returns true when runtime status is equal except for the generated timestamp.
+    pub fn semantic_equals_for_publish(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.source_generation == other.source_generation
+            && self.shaping_generation == other.shaping_generation
+            && self.effective_generation == other.effective_generation
+            && self.ready == other.ready
+            && self.effective_state_path == other.effective_state_path
+            && self.effective_network_path == other.effective_network_path
+            && self.shaping_inputs_path == other.shaping_inputs_path
+            && self.error == other.error
+    }
+
+    /// Returns the shaping payload identity used by cache consumers.
+    pub fn shaping_payload_identity(&self) -> TopologyRuntimeShapingPayloadIdentity {
+        TopologyRuntimeShapingPayloadIdentity {
+            ready: self.ready,
+            source_generation: self.source_generation.clone(),
+            shaping_generation: self.shaping_generation.clone(),
+            shaping_inputs_path: self.shaping_inputs_path.clone(),
+        }
     }
 }
 
@@ -1297,6 +1361,41 @@ mod tests {
                 .join("state")
                 .join("topology")
                 .join(TOPOLOGY_RUNTIME_STATUS_FILENAME)
+        );
+    }
+
+    #[test]
+    fn topology_runtime_status_publish_compare_ignores_generated_unix() {
+        let first = TopologyRuntimeStatusFile {
+            schema_version: 1,
+            source_generation: "source-1".to_string(),
+            shaping_generation: "shape-1".to_string(),
+            effective_generation: "effective-1".to_string(),
+            ready: true,
+            generated_unix: Some(1),
+            effective_state_path: "/tmp/effective.json".to_string(),
+            effective_network_path: "/tmp/network.effective.json".to_string(),
+            shaping_inputs_path: "/tmp/shaping_inputs.json".to_string(),
+            error: None,
+        };
+        let second = TopologyRuntimeStatusFile {
+            generated_unix: Some(2),
+            ..first.clone()
+        };
+        let changed = TopologyRuntimeStatusFile {
+            shaping_generation: "shape-2".to_string(),
+            ..first.clone()
+        };
+
+        assert!(first.semantic_equals_for_publish(&second));
+        assert!(!first.semantic_equals_for_publish(&changed));
+        assert_eq!(
+            first.shaping_payload_identity(),
+            second.shaping_payload_identity()
+        );
+        assert_ne!(
+            first.shaping_payload_identity(),
+            changed.shaping_payload_identity()
         );
     }
 

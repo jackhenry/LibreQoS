@@ -42,6 +42,11 @@ pub(crate) enum CommitOutcome {
 
 pub(crate) fn build_candidate_config(existing: Option<lqos_config::Config>) -> lqos_config::Config {
     let mut config = existing.unwrap_or_default();
+    let existing_bridge_mtu = config.bridge.as_ref().and_then(|bridge| bridge.mtu);
+    let existing_single_interface_mtu = config
+        .single_interface
+        .as_ref()
+        .and_then(|single| single.mtu);
     let new_config = CURRENT_CONFIG.lock();
     config.node_name = new_config.node_name.clone();
     config.queues.downlink_bandwidth_mbps = new_config.mbps_to_internet;
@@ -55,6 +60,7 @@ pub(crate) fn build_candidate_config(existing: Option<lqos_config::Config>) -> l
                 use_xdp_bridge: false,
                 to_internet: new_config.to_internet.clone(),
                 to_network: new_config.to_network.clone(),
+                mtu: existing_bridge_mtu,
             });
         }
         BridgeMode::XDP => {
@@ -63,6 +69,7 @@ pub(crate) fn build_candidate_config(existing: Option<lqos_config::Config>) -> l
                 use_xdp_bridge: true,
                 to_internet: new_config.to_internet.clone(),
                 to_network: new_config.to_network.clone(),
+                mtu: existing_bridge_mtu,
             });
         }
         BridgeMode::Single => {
@@ -70,6 +77,7 @@ pub(crate) fn build_candidate_config(existing: Option<lqos_config::Config>) -> l
                 interface: new_config.to_internet.clone(),
                 internet_vlan: new_config.internet_vlan,
                 network_vlan: new_config.network_vlan,
+                mtu: existing_single_interface_mtu,
             });
             config.bridge = None;
         }
@@ -245,7 +253,8 @@ fn load_existing_or_default(event_log: &mut Vec<String>) -> Result<lqos_config::
 
 #[cfg(test)]
 mod tests {
-    use super::load_existing_or_default;
+    use super::{build_candidate_config, load_existing_or_default};
+    use crate::config_builder::{BridgeMode, CURRENT_CONFIG};
     use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use std::fs;
@@ -281,5 +290,33 @@ mod tests {
         }
         lqos_config::clear_cached_config();
         fs::remove_file(path).expect("remove temp config");
+    }
+
+    #[test]
+    fn build_candidate_config_preserves_existing_mtu_for_same_mode() {
+        let _guard = CONFIG_ENV_LOCK.lock();
+        let previous_builder = {
+            let mut builder = CURRENT_CONFIG.lock();
+            let previous = builder.clone();
+            builder.bridge_mode = BridgeMode::Linux;
+            builder.to_internet = "wan0".to_string();
+            builder.to_network = "lan0".to_string();
+            previous
+        };
+
+        let existing = lqos_config::Config {
+            bridge: Some(lqos_config::BridgeConfig {
+                mtu: Some(9000),
+                ..lqos_config::BridgeConfig::default()
+            }),
+            ..lqos_config::Config::default()
+        };
+        let candidate = build_candidate_config(Some(existing));
+        assert_eq!(
+            candidate.bridge.as_ref().and_then(|bridge| bridge.mtu),
+            Some(9000)
+        );
+
+        *CURRENT_CONFIG.lock() = previous_builder;
     }
 }

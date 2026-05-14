@@ -83,6 +83,12 @@ pub fn is_scheduler_available() -> bool {
     now.saturating_sub(last) < 300
 }
 
+/// Returns the Unix timestamp of the scheduler's last heartbeat, if one has been seen.
+pub fn scheduler_last_seen_unix() -> Option<u64> {
+    let last = SCHEDULER_LAST_SEEN.load(Ordering::Relaxed);
+    if last == 0 { None } else { Some(last) }
+}
+
 /// Returns the current scheduler error message, if any.
 pub fn scheduler_error_message() -> Option<String> {
     let guard: parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, Option<String>> =

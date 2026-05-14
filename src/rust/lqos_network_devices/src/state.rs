@@ -132,9 +132,7 @@ mod tests {
     use super::network_json_with_carried_runtime_state;
     use lqos_config::NetworkJsonNode;
     use lqos_utils::{
-        qoq_heatmap::TemporalQoqHeatmap,
-        rtt::RttBuffer,
-        temporal_heatmap::TemporalHeatmap,
+        qoq_heatmap::TemporalQoqHeatmap, rtt::RttBuffer, temporal_heatmap::TemporalHeatmap,
         units::DownUpOrder,
     };
 

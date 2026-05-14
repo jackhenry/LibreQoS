@@ -1,7 +1,7 @@
 use crate::queue_types::QueueType;
 use serde::Serialize;
 use thiserror::Error;
-use tracing::error;
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum QueueDiff {
@@ -21,24 +21,43 @@ pub(crate) fn make_queue_diff(
         QueueType::FqCodel(..) => match current {
             QueueType::FqCodel(..) => Ok(fq_codel_diff(previous, current)?),
             _ => {
-                error!(
-                    "Queue diffs are not implemented for FqCodel to {:?}",
-                    current
+                warn!(
+                    previous = queue_kind(previous),
+                    current = queue_kind(current),
+                    "Queue type changed; resetting queue diff sample"
                 );
-                Err(QueueDiffError::NotImplemented)
+                Ok(QueueDiff::None)
             }
         },
         QueueType::Cake(..) => match current {
             QueueType::Cake(..) => Ok(cake_diff(previous, current)?),
             _ => {
-                error!("Queue diffs are not implemented for Cake to {:?}", current);
-                Err(QueueDiffError::NotImplemented)
+                warn!(
+                    previous = queue_kind(previous),
+                    current = queue_kind(current),
+                    "Queue type changed; resetting queue diff sample"
+                );
+                Ok(QueueDiff::None)
             }
         },
         _ => {
-            error!("Queue diffs are not implemented for {:?}", current);
-            Err(QueueDiffError::NotImplemented)
+            warn!(
+                previous = queue_kind(previous),
+                current = queue_kind(current),
+                "Queue diff unavailable for queue type; resetting queue diff sample"
+            );
+            Ok(QueueDiff::None)
         }
+    }
+}
+
+fn queue_kind(queue: &QueueType) -> &'static str {
+    match queue {
+        QueueType::FqCodel(_) => "fq_codel",
+        QueueType::Cake(_) => "cake",
+        QueueType::Mq(_) => "mq",
+        QueueType::Htb(_) => "htb",
+        QueueType::ClsAct => "clsact",
     }
 }
 
@@ -115,4 +134,43 @@ fn fq_codel_diff(previous: &QueueType, current: &QueueType) -> Result<QueueDiff,
         return Ok(QueueDiff::FqCodel(diff));
     }
     Err(QueueDiffError::NotImplemented)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deserialize_tc_tree;
+
+    #[test]
+    fn queue_type_change_resets_diff_sample() {
+        let fq_codel = deserialize_tc_tree(
+            r#"[{
+                "kind":"fq_codel",
+                "handle":"9000:",
+                "parent":"1:2",
+                "options":{},
+                "bytes":1000,
+                "packets":10
+            }]"#,
+        )
+        .expect("fq_codel qdisc should parse")
+        .remove(0);
+        let cake = deserialize_tc_tree(
+            r#"[{
+                "kind":"cake",
+                "handle":"9001:",
+                "parent":"1:2",
+                "options":{},
+                "bytes":2000,
+                "packets":20,
+                "tins":[]
+            }]"#,
+        )
+        .expect("cake qdisc should parse")
+        .remove(0);
+
+        let diff = make_queue_diff(&fq_codel, &cake).expect("type changes should not error");
+
+        assert!(matches!(diff, QueueDiff::None));
+    }
 }
