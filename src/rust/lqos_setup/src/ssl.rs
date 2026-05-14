@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use uuid::Uuid;
 
 const CADDYFILE_PATH: &str = "/etc/caddy/Caddyfile";
 const INTERNAL_CA_CERT_PATH: &str =
@@ -25,6 +26,7 @@ const RUNTIME_SECURE_LISTEN: &str = "127.0.0.1:9123";
 const API_UPSTREAM: &str = "127.0.0.1:9122";
 const WEB_UPSTREAM: &str = "127.0.0.1:9123";
 const DELAYED_SWITCH_SHELL: &str = "/bin/sh";
+const SYSTEMD_RUN_BIN: &str = "/usr/bin/systemd-run";
 
 /// The effective HTTPS mode for the current or requested config.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +102,7 @@ pub fn ssl_status(config: &Config, preferred_host: Option<&str>) -> SslStatus {
 /// - updates `/etc/lqos.conf`
 /// - runs the Caddy installer helper if needed
 /// - writes `/etc/caddy/Caddyfile`
-/// - spawns a delayed background shell that restarts `caddy.service` and `lqosd.service`
+/// - schedules a delayed service switch that restarts `caddy.service` and `lqosd.service`
 pub fn enable_runtime_ssl(
     external_hostname: Option<String>,
     preferred_host: Option<&str>,
@@ -147,7 +149,7 @@ pub fn enable_runtime_ssl(
 /// - updates `/etc/lqos.conf`
 /// - removes the managed `/etc/caddy/Caddyfile`
 /// - runs the Caddy disable helper when LibreQoS owns that setup
-/// - spawns a delayed background shell that restarts `lqosd.service`
+/// - schedules a delayed service switch that restarts `lqosd.service`
 pub fn disable_runtime_ssl(preferred_host: Option<&str>) -> Result<SslActionOutcome> {
     let existing = (*lqos_config::load_config()?).clone();
     let ssl = existing
@@ -566,6 +568,27 @@ fn disable_runtime_command() -> &'static str {
 }
 
 fn schedule_delayed_runtime_switch(command: &str) -> Result<()> {
+    if unsafe { libc::geteuid() } == 0 && Path::new(SYSTEMD_RUN_BIN).exists() {
+        let unit_name = format!("lqos-ssl-switch-{}", Uuid::new_v4().simple());
+        let status = Command::new(SYSTEMD_RUN_BIN)
+            .args([
+                "--unit",
+                &unit_name,
+                "--on-active=2s",
+                DELAYED_SWITCH_SHELL,
+                "-lc",
+                command,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("Unable to invoke {SYSTEMD_RUN_BIN} for SSL service switch"))?;
+        if !status.success() {
+            bail!("Unable to schedule SSL service switch via systemd-run: {status}");
+        }
+        return Ok(());
+    }
+
     let mut child = Command::new(DELAYED_SWITCH_SHELL)
         .args(["-lc", &format!("sleep 2; {command}")])
         .stdin(Stdio::null())
