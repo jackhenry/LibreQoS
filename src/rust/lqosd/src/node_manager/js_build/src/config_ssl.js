@@ -1,4 +1,9 @@
 import {loadConfig, renderConfigMenu} from "./config/config_helper";
+import {
+    SSL_DISABLE_REDIRECT_DELAY_MS,
+    directHttpUrlFromLocation,
+    sslDisableRedirectTarget,
+} from "./config/ssl_redirect.mjs";
 
 function escapeHtml(value) {
     return String(value)
@@ -105,6 +110,16 @@ function actionMessage(outcome) {
     return html;
 }
 
+function redirectNotice(targetUrl) {
+    return `SSL shutdown was requested. Redirecting to <a href="${escapeHtml(targetUrl)}">${escapeHtml(targetUrl)}</a>...`;
+}
+
+function scheduleRedirect(targetUrl) {
+    window.setTimeout(() => {
+        window.location.assign(targetUrl);
+    }, SSL_DISABLE_REDIRECT_DELAY_MS);
+}
+
 async function setupSsl() {
     setResult("info", "Preparing HTTPS setup...");
     const outcome = await fetchJson("/local-api/ssl/setup", {
@@ -118,11 +133,26 @@ async function setupSsl() {
 
 async function disableSsl() {
     setResult("info", "Preparing HTTPS shutdown...");
-    const outcome = await fetchJson("/local-api/ssl/disable", {
-        method: "POST",
-        body: JSON.stringify({}),
-    });
-    setResult("success", actionMessage(outcome));
+    const fallbackTarget = directHttpUrlFromLocation(window.location);
+    try {
+        const outcome = await fetchJson("/local-api/ssl/disable", {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        const targetUrl = sslDisableRedirectTarget(outcome, window.location);
+        setResult("success", `${actionMessage(outcome)} <br><span class="small">${redirectNotice(targetUrl)}</span>`);
+        scheduleRedirect(targetUrl);
+    } catch (error) {
+        if (window.location.protocol === "https:") {
+            setResult(
+                "warning",
+                `${escapeHtml(error.message)} <br><span class="small">${redirectNotice(fallbackTarget)}</span>`,
+            );
+            scheduleRedirect(fallbackTarget);
+            return;
+        }
+        throw error;
+    }
 }
 
 renderConfigMenu("ssl");
