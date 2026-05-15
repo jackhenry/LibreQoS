@@ -8,11 +8,12 @@ const chatbotEnabled = typeof window.hasChatbot !== 'undefined' ? !!window.hasCh
 const liveControlAvailable = typeof window.liveControlAvailable !== 'undefined'
   ? !!window.liveControlAvailable
   : false;
+const libbyAvailable = chatbotEnabled && liveControlAvailable;
 
 function scrollToBottom() { log.scrollTop = log.scrollHeight; }
 
 function ensureInsightNotice() {
-  if (chatbotEnabled && liveControlAvailable) return;
+  if (libbyAvailable) return;
   const chatWrap = document.querySelector('.chat-wrap');
   const chatLog = document.getElementById('chatLog');
   if (!chatWrap || !chatLog) return;
@@ -44,7 +45,7 @@ function ensureInsightNotice() {
 ensureInsightNotice();
 
 function disableChatWhenUnavailable() {
-  if (chatbotEnabled && liveControlAvailable) return;
+  if (libbyAvailable) return;
   if (input) {
     input.disabled = true;
     input.placeholder = chatbotEnabled
@@ -228,7 +229,7 @@ function handleStreamText(text) {
 }
 
 let client = null;
-if (insightEnabled) {
+if (libbyAvailable) {
   client = get_ws_client();
   client.on("ChatbotChunk", (msg) => {
     if (msg && typeof msg.text === "string") {
@@ -243,7 +244,7 @@ if (insightEnabled) {
 
 function sendText() {
   const text = input.value.trim();
-  if (!insightEnabled) return;
+  if (!libbyAvailable) return;
   if (!text) return;
   bubbleUser(text);
   if (client) {
