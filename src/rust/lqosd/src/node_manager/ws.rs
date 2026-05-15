@@ -284,6 +284,10 @@ struct WsRequestState<'a> {
     shaper_query: Sender<ShaperQueryCommand>,
 }
 
+fn can_write_dashboard_themes(login: LoginResult) -> bool {
+    login == LoginResult::Admin
+}
+
 async fn receive_channel_message(
     msg: Message,
     channels: Arc<PubSub>,
@@ -369,17 +373,25 @@ async fn receive_channel_message(
             }
         }
         WsRequest::DashletSave { name, entries } => {
-            let data = dashboard_themes::DashletSave { name, entries };
-            let result = dashboard_themes::save_theme_data(&data);
-            let response = match result {
-                Ok(_) => WsResponse::DashletSaveResult {
-                    ok: true,
-                    error: None,
-                },
-                Err(err) => WsResponse::DashletSaveResult {
+            let response = if can_write_dashboard_themes(*request_state.login) {
+                let data = dashboard_themes::DashletSave { name, entries };
+                match dashboard_themes::save_theme_data(&data) {
+                    Ok(_) => WsResponse::DashletSaveResult {
+                        ok: true,
+                        error: None,
+                    },
+                    Err(err) => WsResponse::DashletSaveResult {
+                        ok: false,
+                        error: Some(err),
+                    },
+                }
+            } else {
+                WsResponse::DashletSaveResult {
                     ok: false,
-                    error: Some(err),
-                },
+                    error: Some(
+                        "Only administrators can save shared dashboard layouts.".to_string(),
+                    ),
+                }
             };
             if send_ws_response(&tx, response).await {
                 return true;
@@ -393,16 +405,24 @@ async fn receive_channel_message(
             }
         }
         WsRequest::DashletDelete { name } => {
-            let result = dashboard_themes::delete_theme_file(&name);
-            let response = match result {
-                Ok(_) => WsResponse::DashletDeleteResult {
-                    ok: true,
-                    error: None,
-                },
-                Err(err) => WsResponse::DashletDeleteResult {
+            let response = if can_write_dashboard_themes(*request_state.login) {
+                match dashboard_themes::delete_theme_file(&name) {
+                    Ok(_) => WsResponse::DashletDeleteResult {
+                        ok: true,
+                        error: None,
+                    },
+                    Err(err) => WsResponse::DashletDeleteResult {
+                        ok: false,
+                        error: Some(err),
+                    },
+                }
+            } else {
+                WsResponse::DashletDeleteResult {
                     ok: false,
-                    error: Some(err),
-                },
+                    error: Some(
+                        "Only administrators can delete shared dashboard layouts.".to_string(),
+                    ),
+                }
             };
             if send_ws_response(&tx, response).await {
                 return true;
@@ -2564,7 +2584,8 @@ fn payload_hint(payload: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_ws_request;
+    use super::{can_write_dashboard_themes, decode_ws_request};
+    use crate::node_manager::auth::LoginResult;
     use crate::node_manager::local_api::urgent::{UrgentList, UrgentStatus};
     use crate::node_manager::ws::messages::WsRequest;
     use crate::node_manager::ws::messages::{WsResponse, encode_ws_message};
@@ -2658,6 +2679,13 @@ mod tests {
             panic!("response should encode as a CBOR map");
         };
         entries.contains_key(&text("request_id"))
+    }
+
+    #[test]
+    fn read_only_websocket_users_cannot_write_dashboard_themes() {
+        assert!(can_write_dashboard_themes(LoginResult::Admin));
+        assert!(!can_write_dashboard_themes(LoginResult::ReadOnly));
+        assert!(!can_write_dashboard_themes(LoginResult::Denied));
     }
 
     #[test]
