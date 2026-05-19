@@ -158,8 +158,13 @@ mod tests {
         BUS_CHUNK_SIZE, MAX_FRAME_BYTES, decode_reply_cbor, decode_session_cbor, encode_reply_cbor,
         encode_session_cbor, read_frame, write_frame,
     };
-    use crate::{BusReply, BusRequest, BusResponse, BusSession, QooData, bus::BusClientError};
-    use lqos_utils::{qoq_heatmap::QoqHeatmapBlocks, units::DownUpOrder};
+    use crate::{
+        BusReply, BusRequest, BusResponse, BusSession, CircuitRollup, QooData, bus::BusClientError,
+    };
+    use lqos_utils::{
+        qoq_heatmap::QoqHeatmapBlocks,
+        units::{DownUpOrder, TcpRetransmitSample},
+    };
     use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]
@@ -194,6 +199,21 @@ mod tests {
                     site_name: "North".to_string(),
                 },
                 BusRequest::GetCircuitQoo {
+                    circuit_id: "Circuit-1".to_string(),
+                },
+            ],
+        };
+        let bytes = encode_session_cbor(&session).expect("encode_session_cbor");
+        let decoded = decode_session_cbor(&bytes).expect("decode_session_cbor");
+        assert_eq!(decoded.requests, session.requests);
+    }
+
+    #[test]
+    fn cbor_round_trip_circuit_rollup_requests() {
+        let session = BusSession {
+            requests: vec![
+                BusRequest::GetAllCircuitRollups,
+                BusRequest::GetCircuitRollupById {
                     circuit_id: "Circuit-1".to_string(),
                 },
             ],
@@ -245,6 +265,48 @@ mod tests {
     fn cbor_round_trip_empty_qoo_reply() {
         let reply = BusReply {
             responses: vec![BusResponse::Qoo(None)],
+        };
+        let bytes = encode_reply_cbor(&reply).expect("encode_reply_cbor");
+        let decoded = decode_reply_cbor(&bytes).expect("decode_reply_cbor");
+        assert_eq!(decoded.responses, reply.responses);
+    }
+
+    #[test]
+    fn cbor_round_trip_circuit_rollup_reply() {
+        let rollup = CircuitRollup {
+            circuit_id: "Circuit-1".to_string(),
+            circuit_name: "Crew".to_string(),
+            parent_node: "Ship-10001-Crew".to_string(),
+            device_names: vec!["Crew Devices".to_string()],
+            ip_addrs: vec!["10.224.11.10".to_string()],
+            plan_mbps: DownUpOrder {
+                down: 10.0,
+                up: 2.0,
+            },
+            bytes_per_second: DownUpOrder {
+                down: 1234,
+                up: 567,
+            },
+            rtt_current_p50_nanos: DownUpOrder {
+                down: Some(1000),
+                up: Some(2000),
+            },
+            qoo: DownUpOrder {
+                down: Some(95.0),
+                up: Some(93.0),
+            },
+            tcp_retransmit_sample: DownUpOrder {
+                down: TcpRetransmitSample::new(2, 100),
+                up: TcpRetransmitSample::new(1, 50),
+            },
+            last_seen_nanos: 42,
+        };
+        let reply = BusReply {
+            responses: vec![
+                BusResponse::CircuitRollups(vec![rollup.clone()]),
+                BusResponse::CircuitRollup(Some(rollup)),
+                BusResponse::CircuitRollup(None),
+            ],
         };
         let bytes = encode_reply_cbor(&reply).expect("encode_reply_cbor");
         let decoded = decode_reply_cbor(&bytes).expect("decode_reply_cbor");

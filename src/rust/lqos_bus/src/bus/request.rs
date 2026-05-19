@@ -278,6 +278,15 @@ pub enum BusRequest {
         circuit_id: String,
     },
 
+    /// Get live usage rollups aggregated by circuit ID.
+    GetAllCircuitRollups,
+
+    /// Get one live usage rollup aggregated by circuit ID.
+    GetCircuitRollupById {
+        /// Circuit ID to query.
+        circuit_id: String,
+    },
+
     /// Retrieve stats for all queues above a named circuit id
     GetFunnel {
         /// Circuit being analyzed, as the named circuit id

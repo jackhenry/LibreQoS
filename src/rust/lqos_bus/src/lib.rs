@@ -26,8 +26,8 @@ pub use ip_stats::{
 mod tc_handle;
 pub use bus::response::{
     AsnHeatmapData, AsnListEntry, BakeryStatsSnapshot, CircuitCapacityRow, CircuitCount,
-    CircuitHeatmapData, CountryListEntry, DeviceCounts, ExecutiveSummaryHeader, FlowMapPoint,
-    FlowTimelineEntry, InsightLicenseSummary, LtsCapabilitiesSummary, NodeCapacity,
+    CircuitHeatmapData, CircuitRollup, CountryListEntry, DeviceCounts, ExecutiveSummaryHeader,
+    FlowMapPoint, FlowTimelineEntry, InsightLicenseSummary, LtsCapabilitiesSummary, NodeCapacity,
     ProtocolListEntry, QooData, QueueStatsTotal, RetransmitSummary, SchedulerDetails,
     SearchResultEntry, SiteHeatmapData, StormguardDebugDirection, StormguardDebugEntry,
     TreeGuardRuntimeNodeBranchSnapshot, TreeGuardRuntimeNodeOperationSnapshot, UrgentIssue,

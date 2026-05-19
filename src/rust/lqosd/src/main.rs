@@ -655,6 +655,12 @@ fn handle_bus_requests(requests: &[BusRequest], responses: &mut Vec<BusResponse>
             BusRequest::GetCircuitById { circuit_id } => {
                 shaped_devices_tracker::get_circuit_by_id(circuit_id.clone())
             }
+            BusRequest::GetAllCircuitRollups => BusResponse::CircuitRollups(
+                shaped_devices_tracker::circuit_live::all_circuit_rollups(),
+            ),
+            BusRequest::GetCircuitRollupById { circuit_id } => BusResponse::CircuitRollup(
+                shaped_devices_tracker::circuit_live::circuit_rollup_by_id(circuit_id),
+            ),
             BusRequest::GetFunnel { target: parent } => shaped_devices_tracker::get_funnel(parent),
             BusRequest::GetLqosStats => BusResponse::LqosdStats {
                 bus_requests: BUS_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
