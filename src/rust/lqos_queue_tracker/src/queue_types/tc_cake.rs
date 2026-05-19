@@ -71,16 +71,16 @@ pub(crate) struct TcCakeTin {
     pub(crate) peak_delay_us: u32,
     pub(crate) avg_delay_us: u32,
     pub(crate) base_delay_us: u32,
-    pub(crate) sent_packets: u32,
-    pub(crate) way_indirect_hits: u16,
-    pub(crate) way_misses: u16,
-    pub(crate) way_collisions: u16,
+    pub(crate) sent_packets: u64,
+    pub(crate) way_indirect_hits: u64,
+    pub(crate) way_misses: u64,
+    pub(crate) way_collisions: u64,
     pub(crate) drops: u32,
     pub(crate) ecn_marks: u32,
     pub(crate) ack_drops: u32,
-    pub(crate) sparse_flows: u16,
-    pub(crate) bulk_flows: u16,
-    pub(crate) unresponsive_flows: u16,
+    pub(crate) sparse_flows: u32,
+    pub(crate) bulk_flows: u32,
+    pub(crate) unresponsive_flows: u32,
     pub(crate) max_pkt_len: u16,
     pub(crate) flow_quantum: u16,
 }
@@ -195,21 +195,19 @@ impl TcCakeTin {
                         "base_delay_us" => {
                             result.base_delay_us = value.as_u64().unwrap_or(0) as u32
                         }
-                        "sent_packets" => result.sent_packets = value.as_u64().unwrap_or(0) as u32,
+                        "sent_packets" => result.sent_packets = value.as_u64().unwrap_or(0),
                         "way_indirect_hits" => {
-                            result.way_indirect_hits = value.as_u64().unwrap_or(0) as u16
+                            result.way_indirect_hits = value.as_u64().unwrap_or(0)
                         }
-                        "way_misses" => result.way_misses = value.as_u64().unwrap_or(0) as u16,
-                        "way_collisions" => {
-                            result.way_collisions = value.as_u64().unwrap_or(0) as u16
-                        }
+                        "way_misses" => result.way_misses = value.as_u64().unwrap_or(0),
+                        "way_collisions" => result.way_collisions = value.as_u64().unwrap_or(0),
                         "drops" => result.drops = value.as_u64().unwrap_or(0) as u32,
                         "ecn_mark" => result.ecn_marks = value.as_u64().unwrap_or(0) as u32,
                         "ack_drops" => result.ack_drops = value.as_u64().unwrap_or(0) as u32,
-                        "sparse_flows" => result.sparse_flows = value.as_u64().unwrap_or(0) as u16,
-                        "bulk_flows" => result.bulk_flows = value.as_u64().unwrap_or(0) as u16,
+                        "sparse_flows" => result.sparse_flows = value.as_u64().unwrap_or(0) as u32,
+                        "bulk_flows" => result.bulk_flows = value.as_u64().unwrap_or(0) as u32,
                         "unresponsive_flows" => {
-                            result.unresponsive_flows = value.as_u64().unwrap_or(0) as u16
+                            result.unresponsive_flows = value.as_u64().unwrap_or(0) as u32
                         }
                         "max_pkt_len" => result.max_pkt_len = value.as_u64().unwrap_or(0) as u16,
                         "flow_quantum" => result.flow_quantum = value.as_u64().unwrap_or(0) as u16,
