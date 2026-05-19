@@ -592,6 +592,21 @@ pub enum BusRequest {
     /// Retrieve queue marks/drops totals
     GetQueueStatsTotal,
 
+    /// Retrieve current top-level QoO history.
+    GetQoo,
+
+    /// Retrieve current QoO history for a site by site name.
+    GetSiteQoo {
+        /// Site name to query.
+        site_name: String,
+    },
+
+    /// Retrieve current QoO history for a circuit by circuit ID.
+    GetCircuitQoo {
+        /// Circuit ID to query.
+        circuit_id: String,
+    },
+
     /// Retrieve per-circuit capacity utilization
     GetCircuitCapacity,
 

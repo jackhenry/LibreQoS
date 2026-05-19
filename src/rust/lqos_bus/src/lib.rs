@@ -28,8 +28,8 @@ pub use bus::response::{
     AsnHeatmapData, AsnListEntry, BakeryStatsSnapshot, CircuitCapacityRow, CircuitCount,
     CircuitHeatmapData, CountryListEntry, DeviceCounts, ExecutiveSummaryHeader, FlowMapPoint,
     FlowTimelineEntry, InsightLicenseSummary, LtsCapabilitiesSummary, NodeCapacity,
-    ProtocolListEntry, QueueStatsTotal, RetransmitSummary, SchedulerDetails, SearchResultEntry,
-    SiteHeatmapData, StormguardDebugDirection, StormguardDebugEntry,
+    ProtocolListEntry, QooData, QueueStatsTotal, RetransmitSummary, SchedulerDetails,
+    SearchResultEntry, SiteHeatmapData, StormguardDebugDirection, StormguardDebugEntry,
     TreeGuardRuntimeNodeBranchSnapshot, TreeGuardRuntimeNodeOperationSnapshot, UrgentIssue,
     WarningLevel,
 };

@@ -158,7 +158,8 @@ mod tests {
         BUS_CHUNK_SIZE, MAX_FRAME_BYTES, decode_reply_cbor, decode_session_cbor, encode_reply_cbor,
         encode_session_cbor, read_frame, write_frame,
     };
-    use crate::{BusReply, BusRequest, BusResponse, BusSession, bus::BusClientError};
+    use crate::{BusReply, BusRequest, BusResponse, BusSession, QooData, bus::BusClientError};
+    use lqos_utils::{qoq_heatmap::QoqHeatmapBlocks, units::DownUpOrder};
     use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]
@@ -185,9 +186,65 @@ mod tests {
     }
 
     #[test]
+    fn cbor_round_trip_qoo_requests() {
+        let session = BusSession {
+            requests: vec![
+                BusRequest::GetQoo,
+                BusRequest::GetSiteQoo {
+                    site_name: "North".to_string(),
+                },
+                BusRequest::GetCircuitQoo {
+                    circuit_id: "Circuit-1".to_string(),
+                },
+            ],
+        };
+        let bytes = encode_session_cbor(&session).expect("encode_session_cbor");
+        let decoded = decode_session_cbor(&bytes).expect("decode_session_cbor");
+        assert_eq!(decoded.requests, session.requests);
+    }
+
+    #[test]
     fn cbor_round_trip_reply() {
         let reply = BusReply {
             responses: vec![BusResponse::Ack],
+        };
+        let bytes = encode_reply_cbor(&reply).expect("encode_reply_cbor");
+        let decoded = decode_reply_cbor(&bytes).expect("decode_reply_cbor");
+        assert_eq!(decoded.responses, reply.responses);
+    }
+
+    #[test]
+    fn cbor_round_trip_qoo_reply() {
+        let mut download_total = [None; 15];
+        let mut upload_total = [None; 15];
+        download_total[14] = Some(91.0);
+        upload_total[14] = Some(89.0);
+        let reply = BusReply {
+            responses: vec![BusResponse::Qoo(Some(QooData {
+                key: "site:North".to_string(),
+                entity_kind: "site".to_string(),
+                label: "North".to_string(),
+                site_name: Some("North".to_string()),
+                circuit_id: None,
+                blocks: QoqHeatmapBlocks {
+                    download_total,
+                    upload_total,
+                },
+                latest: DownUpOrder {
+                    down: Some(91.0),
+                    up: Some(89.0),
+                },
+            }))],
+        };
+        let bytes = encode_reply_cbor(&reply).expect("encode_reply_cbor");
+        let decoded = decode_reply_cbor(&bytes).expect("decode_reply_cbor");
+        assert_eq!(decoded.responses, reply.responses);
+    }
+
+    #[test]
+    fn cbor_round_trip_empty_qoo_reply() {
+        let reply = BusReply {
+            responses: vec![BusResponse::Qoo(None)],
         };
         let bytes = encode_reply_cbor(&reply).expect("encode_reply_cbor");
         let decoded = decode_reply_cbor(&bytes).expect("decode_reply_cbor");

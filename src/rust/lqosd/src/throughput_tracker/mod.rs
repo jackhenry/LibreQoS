@@ -68,10 +68,7 @@ pub(crate) fn circuit_current_qoo(circuit_hash: i64) -> DownUpOrder<Option<f32>>
         return DownUpOrder::default();
     };
     let blocks = heatmap.blocks();
-    DownUpOrder {
-        down: blocks.download_total.last().copied().flatten(),
-        up: blocks.upload_total.last().copied().flatten(),
-    }
+    blocks.current_values()
 }
 
 fn resolve_circuit_metadata_for_entry(

@@ -78,6 +78,26 @@ pub struct LtsCapabilitiesSummary {
     /// Effective mapped-circuit limit. `None` means unlimited.
     pub mapped_circuit_limit: Option<u64>,
 }
+
+/// QoO history and latest values for a dashboard entity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Allocative)]
+pub struct QooData {
+    /// Stable key for this QoO row.
+    pub key: String,
+    /// Entity kind: "global", "site", or "circuit".
+    pub entity_kind: String,
+    /// Display label for this QoO row.
+    pub label: String,
+    /// Site name for site rows.
+    pub site_name: Option<String>,
+    /// Circuit ID for circuit rows.
+    pub circuit_id: Option<String>,
+    /// Fifteen QoO history blocks, oldest to newest.
+    pub blocks: QoqHeatmapBlocks,
+    /// Latest download and upload QoO score.
+    pub latest: DownUpOrder<Option<f32>>,
+}
+
 /// Serializable snapshot of BakeryStats for bus transmission
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Allocative)]
 pub struct BakeryStatsSnapshot {
@@ -704,6 +724,9 @@ pub enum BusResponse {
 
     /// Queue stats totals (marks/drops)
     QueueStatsTotal(QueueStatsTotal),
+
+    /// Current QoO data.
+    Qoo(Option<QooData>),
 
     /// Circuit capacity utilization
     CircuitCapacity(Vec<CircuitCapacityRow>),
