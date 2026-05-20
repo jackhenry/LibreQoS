@@ -1085,13 +1085,24 @@ pub fn all_unknown_ips() -> BusResponse {
 /// For debugging: dump all active flows!
 pub fn dump_active_flows() -> BusResponse {
     let lock = ALL_FLOWS.lock();
-    let result: Vec<lqos_bus::FlowbeeSummaryData> = lock
+    let table: Vec<(FlowbeeKey, (FlowbeeLocalData, FlowAnalysis))> = lock
         .flow_data
+        .iter()
+        .map(|(key, value)| (*key, value.clone()))
+        .collect();
+    std::mem::drop(lock);
+
+    let catalog = lqos_network_devices::network_devices_catalog();
+    let throughput = THROUGHPUT_TRACKER.raw_data.lock();
+
+    let result: Vec<lqos_bus::FlowbeeSummaryData> = table
         .iter()
         .map(|(key, row)| {
             let geo = get_asn_name_and_country(key.remote_ip.as_ip());
-
-            let (circuit_id, circuit_name) = (String::new(), String::new());
+            let (circuit_id, circuit_name) = throughput
+                .get(&key.local_ip)
+                .map(|te| resolve_circuit_metadata_for_entry(&catalog, &key.local_ip, te))
+                .unwrap_or_default();
 
             lqos_bus::FlowbeeSummaryData {
                 remote_ip: key.remote_ip.as_ip().to_string(),
