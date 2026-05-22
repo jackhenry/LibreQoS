@@ -1,9 +1,9 @@
-//! Memory pressure watchdog for controlled `lqosd` restarts.
+//! Memory pressure diagnostics for `lqosd`.
 //!
-//! The watchdog samples `/proc` and exits the daemon before the kernel OOM
-//! path has to choose a victim. `lqosd.service` is configured with
-//! `Restart=always`, so this releases process memory while preserving logs that
-//! explain why the restart happened.
+//! The watchdog samples `/proc` and logs host and process memory pressure. It
+//! does not terminate the daemon; the logs are intended to preserve useful
+//! diagnostic context while leaving restart decisions to system policy and
+//! operators.
 
 use crate::stats::{BUS_REQUESTS, FLOWS_TRACKED, HIGH_WATERMARK, TIME_TO_POLL_HOSTS};
 use std::collections::HashMap;
@@ -12,18 +12,13 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const CHECK_INTERVAL_SECONDS: u64 = 15;
-const PRESSURE_WARNING_AVAILABLE_BYTES: u64 = mib(3_072);
-const DEFAULT_MIN_AVAILABLE_BYTES: u64 = mib(2_304);
-const DEFAULT_MIN_PROCESS_BYTES: u64 = mib(1_024);
-const DEFAULT_MAX_PROCESS_BYTES: u64 = gib(4);
-const DEFAULT_MAX_SWAP_BYTES: u64 = gib(1);
-const WATCHDOG_EXIT_CODE: i32 = 75;
+const HOST_PRESSURE_AVAILABLE_PERCENT: u64 = 10;
+const PROCESS_CRITICAL_TOTAL_RAM_PERCENT: u64 = 90;
 
 /// Spawns the memory watchdog thread.
 ///
 /// Side effects: this function starts a background thread. The thread reads
-/// `/proc/meminfo`, `/proc/self/status`, and exits the process when memory
-/// pressure reaches the configured critical threshold.
+/// `/proc/meminfo` and `/proc/self/status` to log memory pressure diagnostics.
 pub fn start_memory_watchdog() {
     if env_flag_enabled("LQOSD_MEMORY_WATCHDOG_DISABLED") {
         warn!("lqosd memory watchdog disabled by LQOSD_MEMORY_WATCHDOG_DISABLED");
@@ -40,8 +35,7 @@ pub fn start_memory_watchdog() {
 }
 
 fn memory_watchdog_loop() {
-    let config = MemoryWatchdogConfig::from_env();
-    let mut warned_about_pressure = false;
+    let mut state = MemoryWatchdogState::default();
 
     loop {
         std::thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECONDS));
@@ -51,115 +45,135 @@ fn memory_watchdog_loop() {
             continue;
         };
 
-        if let Some(reason) = config.critical_reason(&snapshot) {
-            log_critical_memory_snapshot(&snapshot, &config, &reason);
-            std::thread::sleep(Duration::from_millis(250));
-            std::process::exit(WATCHDOG_EXIT_CODE);
-        }
+        state.events_for(&snapshot).log(&snapshot);
+    }
+}
 
-        if snapshot.mem_available_bytes < PRESSURE_WARNING_AVAILABLE_BYTES {
-            if !warned_about_pressure {
-                warn!(
-                    "lqosd memory pressure warning: mem_available={} process_rss={} process_swap={} process_total={} threads={}",
-                    format_bytes(snapshot.mem_available_bytes),
-                    format_bytes(snapshot.process_rss_bytes),
-                    format_bytes(snapshot.process_swap_bytes),
-                    format_bytes(snapshot.process_total_bytes()),
-                    snapshot.thread_count,
-                );
-                warned_about_pressure = true;
+#[derive(Default)]
+struct MemoryWatchdogState {
+    warned_about_host_pressure: bool,
+    warned_about_process_pressure: bool,
+}
+
+impl MemoryWatchdogState {
+    fn events_for(&mut self, snapshot: &MemorySnapshot) -> MemoryWatchdogEvents {
+        let mut events = MemoryWatchdogEvents::default();
+
+        if snapshot.host_memory_pressure() {
+            if !self.warned_about_host_pressure {
+                events.host_pressure = true;
+                self.warned_about_host_pressure = true;
             }
         } else {
-            warned_about_pressure = false;
+            self.warned_about_host_pressure = false;
+        }
+
+        if snapshot.process_memory_critical() {
+            if !self.warned_about_process_pressure {
+                events.process_pressure = true;
+                self.warned_about_process_pressure = true;
+            }
+        } else {
+            self.warned_about_process_pressure = false;
+        }
+
+        events
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MemoryWatchdogEvents {
+    host_pressure: bool,
+    process_pressure: bool,
+}
+
+impl MemoryWatchdogEvents {
+    fn log(&self, snapshot: &MemorySnapshot) {
+        if !self.host_pressure && !self.process_pressure {
+            return;
+        }
+
+        if self.host_pressure {
+            log_host_memory_pressure(snapshot);
+        }
+        if self.process_pressure {
+            log_process_memory_critical(snapshot);
+        }
+
+        let diagnostics = MemoryDiagnostics::read();
+        if self.process_pressure {
+            diagnostics.log(MemoryDiagnosticLevel::Error);
+        } else {
+            diagnostics.log(MemoryDiagnosticLevel::Warn);
         }
     }
 }
 
-fn log_critical_memory_snapshot(
-    snapshot: &MemorySnapshot,
-    config: &MemoryWatchdogConfig,
-    reason: &str,
-) {
-    error!(
-        "lqosd memory watchdog restarting daemon: reason={} mem_available={} mem_total={} process_rss={} process_swap={} process_total={} threads={} thresholds=min_available:{} min_process:{} max_process:{} max_swap:{}",
-        reason,
+fn log_host_memory_pressure(snapshot: &MemorySnapshot) {
+    warn!(
+        "lqosd host memory pressure: mem_available={} mem_total={} threshold={} process_rss={} process_swap={} process_total={} threads={}",
         format_bytes(snapshot.mem_available_bytes),
         format_bytes(snapshot.mem_total_bytes),
+        format_bytes(snapshot.host_memory_pressure_threshold_bytes()),
         format_bytes(snapshot.process_rss_bytes),
         format_bytes(snapshot.process_swap_bytes),
         format_bytes(snapshot.process_total_bytes()),
         snapshot.thread_count,
-        format_bytes(config.min_available_bytes),
-        format_bytes(config.min_process_bytes),
-        format_bytes(config.max_process_bytes),
-        format_bytes(config.max_swap_bytes),
     );
+}
+
+fn log_process_memory_critical(snapshot: &MemorySnapshot) {
     error!(
-        "lqosd memory watchdog diagnostics: flows_tracked={} bus_requests={} time_to_poll_hosts_us={} high_watermark_down={} high_watermark_up={}",
-        FLOWS_TRACKED.load(Ordering::Relaxed),
-        BUS_REQUESTS.load(Ordering::Relaxed),
-        TIME_TO_POLL_HOSTS.load(Ordering::Relaxed),
-        HIGH_WATERMARK.get_down(),
-        HIGH_WATERMARK.get_up(),
+        "lqosd process memory critical: process_total={} mem_total={} threshold={} mem_available={} process_rss={} process_swap={} threads={}",
+        format_bytes(snapshot.process_total_bytes()),
+        format_bytes(snapshot.mem_total_bytes),
+        format_bytes(snapshot.process_memory_critical_threshold_bytes()),
+        format_bytes(snapshot.mem_available_bytes),
+        format_bytes(snapshot.process_rss_bytes),
+        format_bytes(snapshot.process_swap_bytes),
+        snapshot.thread_count,
     );
 }
 
-#[derive(Debug)]
-struct MemoryWatchdogConfig {
-    min_available_bytes: u64,
-    min_process_bytes: u64,
-    max_process_bytes: u64,
-    max_swap_bytes: u64,
+enum MemoryDiagnosticLevel {
+    Warn,
+    Error,
 }
 
-impl MemoryWatchdogConfig {
-    fn from_env() -> Self {
+struct MemoryDiagnostics {
+    flows_tracked: u64,
+    bus_requests: u64,
+    time_to_poll_hosts_us: u64,
+    high_watermark_down: u64,
+    high_watermark_up: u64,
+}
+
+impl MemoryDiagnostics {
+    fn read() -> Self {
         Self {
-            min_available_bytes: env_mib(
-                "LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB",
-                DEFAULT_MIN_AVAILABLE_BYTES,
-            ),
-            min_process_bytes: env_mib(
-                "LQOSD_MEMORY_WATCHDOG_MIN_PROCESS_MB",
-                DEFAULT_MIN_PROCESS_BYTES,
-            ),
-            max_process_bytes: env_mib(
-                "LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB",
-                DEFAULT_MAX_PROCESS_BYTES,
-            ),
-            max_swap_bytes: env_mib("LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB", DEFAULT_MAX_SWAP_BYTES),
+            flows_tracked: FLOWS_TRACKED.load(Ordering::Relaxed),
+            bus_requests: BUS_REQUESTS.load(Ordering::Relaxed),
+            time_to_poll_hosts_us: TIME_TO_POLL_HOSTS.load(Ordering::Relaxed),
+            high_watermark_down: HIGH_WATERMARK.get_down(),
+            high_watermark_up: HIGH_WATERMARK.get_up(),
         }
     }
 
-    fn critical_reason(&self, snapshot: &MemorySnapshot) -> Option<String> {
-        if snapshot.process_swap_bytes >= self.max_swap_bytes {
-            return Some(format!(
-                "process swap {} reached limit {}",
-                format_bytes(snapshot.process_swap_bytes),
-                format_bytes(self.max_swap_bytes)
-            ));
-        }
+    fn log(&self, level: MemoryDiagnosticLevel) {
+        let flows_tracked = self.flows_tracked;
+        let bus_requests = self.bus_requests;
+        let time_to_poll_hosts_us = self.time_to_poll_hosts_us;
+        let high_watermark_down = self.high_watermark_down;
+        let high_watermark_up = self.high_watermark_up;
 
-        if snapshot.process_total_bytes() >= self.max_process_bytes {
-            return Some(format!(
-                "process rss+swap {} reached limit {}",
-                format_bytes(snapshot.process_total_bytes()),
-                format_bytes(self.max_process_bytes)
-            ));
+        match level {
+            MemoryDiagnosticLevel::Warn => warn!(
+                "lqosd memory diagnostics: flows_tracked={flows_tracked} bus_requests={bus_requests} time_to_poll_hosts_us={time_to_poll_hosts_us} high_watermark_down={high_watermark_down} high_watermark_up={high_watermark_up}",
+            ),
+            MemoryDiagnosticLevel::Error => error!(
+                "lqosd memory diagnostics: flows_tracked={flows_tracked} bus_requests={bus_requests} time_to_poll_hosts_us={time_to_poll_hosts_us} high_watermark_down={high_watermark_down} high_watermark_up={high_watermark_up}",
+            ),
         }
-
-        if snapshot.mem_available_bytes < self.min_available_bytes
-            && snapshot.process_total_bytes() >= self.min_process_bytes
-        {
-            return Some(format!(
-                "available memory {} below limit {} while lqosd uses {}",
-                format_bytes(snapshot.mem_available_bytes),
-                format_bytes(self.min_available_bytes),
-                format_bytes(snapshot.process_total_bytes())
-            ));
-        }
-
-        None
     }
 }
 
@@ -189,6 +203,24 @@ impl MemorySnapshot {
     fn process_total_bytes(&self) -> u64 {
         self.process_rss_bytes
             .saturating_add(self.process_swap_bytes)
+    }
+
+    fn host_memory_pressure_threshold_bytes(&self) -> u64 {
+        percent_of(self.mem_total_bytes, HOST_PRESSURE_AVAILABLE_PERCENT)
+    }
+
+    fn process_memory_critical_threshold_bytes(&self) -> u64 {
+        percent_of(self.mem_total_bytes, PROCESS_CRITICAL_TOTAL_RAM_PERCENT)
+    }
+
+    fn host_memory_pressure(&self) -> bool {
+        self.mem_total_bytes > 0
+            && self.mem_available_bytes < self.host_memory_pressure_threshold_bytes()
+    }
+
+    fn process_memory_critical(&self) -> bool {
+        self.mem_total_bytes > 0
+            && self.process_total_bytes() >= self.process_memory_critical_threshold_bytes()
     }
 }
 
@@ -225,14 +257,6 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_mib(name: &str, default_bytes: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(mib)
-        .unwrap_or(default_bytes)
-}
-
 const fn kib(value: u64) -> u64 {
     value * 1024
 }
@@ -241,8 +265,13 @@ const fn mib(value: u64) -> u64 {
     value * 1024 * 1024
 }
 
+#[cfg(test)]
 const fn gib(value: u64) -> u64 {
     value * 1024 * 1024 * 1024
+}
+
+const fn percent_of(value: u64, percent: u64) -> u64 {
+    value.saturating_mul(percent) / 100
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -269,69 +298,154 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_restarts_on_process_swap_limit() {
-        let config = MemoryWatchdogConfig {
-            min_available_bytes: mib(2_304),
-            min_process_bytes: mib(1_024),
-            max_process_bytes: gib(4),
-            max_swap_bytes: gib(1),
-        };
+    fn watchdog_reports_process_memory_at_ninety_percent_of_installed_ram() {
         let snapshot = MemorySnapshot {
-            mem_total_bytes: gib(16),
-            mem_available_bytes: gib(12),
-            process_rss_bytes: mib(900),
-            process_swap_bytes: gib(2),
-            thread_count: 44,
-        };
-
-        assert!(
-            config
-                .critical_reason(&snapshot)
-                .unwrap()
-                .contains("process swap")
-        );
-    }
-
-    #[test]
-    fn watchdog_restarts_on_low_available_memory_with_large_lqosd() {
-        let config = MemoryWatchdogConfig {
-            min_available_bytes: mib(2_304),
-            min_process_bytes: mib(1_024),
-            max_process_bytes: gib(4),
-            max_swap_bytes: gib(1),
-        };
-        let snapshot = MemorySnapshot {
-            mem_total_bytes: gib(16),
-            mem_available_bytes: mib(1_900),
-            process_rss_bytes: mib(1_500),
+            mem_total_bytes: gib(10),
+            mem_available_bytes: gib(2),
+            process_rss_bytes: gib(9),
             process_swap_bytes: 0,
             thread_count: 44,
         };
 
-        assert!(
-            config
-                .critical_reason(&snapshot)
-                .unwrap()
-                .contains("available memory")
-        );
+        assert!(snapshot.process_memory_critical());
     }
 
     #[test]
-    fn watchdog_ignores_low_memory_when_lqosd_is_small() {
-        let config = MemoryWatchdogConfig {
-            min_available_bytes: mib(2_304),
-            min_process_bytes: mib(1_024),
-            max_process_bytes: gib(4),
-            max_swap_bytes: gib(1),
+    fn watchdog_ignores_process_memory_below_ninety_percent_of_installed_ram() {
+        let snapshot = MemorySnapshot {
+            mem_total_bytes: gib(10),
+            mem_available_bytes: gib(2),
+            process_rss_bytes: gib(9) - 1,
+            process_swap_bytes: 0,
+            thread_count: 44,
         };
+
+        assert!(!snapshot.process_memory_critical());
+    }
+
+    #[test]
+    fn watchdog_reports_low_available_host_memory() {
         let snapshot = MemorySnapshot {
             mem_total_bytes: gib(16),
-            mem_available_bytes: mib(1_900),
+            mem_available_bytes: mib(1_500),
             process_rss_bytes: mib(256),
             process_swap_bytes: 0,
             thread_count: 44,
         };
 
-        assert!(config.critical_reason(&snapshot).is_none());
+        assert!(snapshot.host_memory_pressure());
+    }
+
+    #[test]
+    fn watchdog_ignores_four_gib_process_on_large_host() {
+        let snapshot = MemorySnapshot {
+            mem_total_bytes: gib(64),
+            mem_available_bytes: gib(48),
+            process_rss_bytes: gib(4),
+            process_swap_bytes: 0,
+            thread_count: 44,
+        };
+
+        assert!(!snapshot.process_memory_critical());
+        assert!(!snapshot.host_memory_pressure());
+    }
+
+    #[test]
+    fn watchdog_state_logs_host_pressure_once_until_recovery() {
+        let mut state = MemoryWatchdogState::default();
+        let pressure = MemorySnapshot {
+            mem_total_bytes: gib(16),
+            mem_available_bytes: mib(1_500),
+            process_rss_bytes: mib(256),
+            process_swap_bytes: 0,
+            thread_count: 44,
+        };
+        let recovered = MemorySnapshot {
+            mem_total_bytes: gib(16),
+            mem_available_bytes: gib(4),
+            process_rss_bytes: mib(256),
+            process_swap_bytes: 0,
+            thread_count: 44,
+        };
+
+        assert_eq!(
+            state.events_for(&pressure),
+            MemoryWatchdogEvents {
+                host_pressure: true,
+                process_pressure: false,
+            }
+        );
+        assert_eq!(state.events_for(&pressure), MemoryWatchdogEvents::default());
+        assert_eq!(
+            state.events_for(&recovered),
+            MemoryWatchdogEvents::default()
+        );
+        assert_eq!(
+            state.events_for(&pressure),
+            MemoryWatchdogEvents {
+                host_pressure: true,
+                process_pressure: false,
+            }
+        );
+    }
+
+    #[test]
+    fn watchdog_state_logs_process_pressure_once_until_recovery() {
+        let mut state = MemoryWatchdogState::default();
+        let pressure = MemorySnapshot {
+            mem_total_bytes: gib(16),
+            mem_available_bytes: gib(12),
+            process_rss_bytes: gib(15),
+            process_swap_bytes: mib(400),
+            thread_count: 44,
+        };
+        let recovered = MemorySnapshot {
+            mem_total_bytes: gib(16),
+            mem_available_bytes: gib(12),
+            process_rss_bytes: gib(2),
+            process_swap_bytes: 0,
+            thread_count: 44,
+        };
+
+        assert_eq!(
+            state.events_for(&pressure),
+            MemoryWatchdogEvents {
+                host_pressure: false,
+                process_pressure: true,
+            }
+        );
+        assert_eq!(state.events_for(&pressure), MemoryWatchdogEvents::default());
+        assert_eq!(
+            state.events_for(&recovered),
+            MemoryWatchdogEvents::default()
+        );
+        assert_eq!(
+            state.events_for(&pressure),
+            MemoryWatchdogEvents {
+                host_pressure: false,
+                process_pressure: true,
+            }
+        );
+    }
+
+    #[test]
+    fn watchdog_state_reports_both_memory_events_in_one_sample() {
+        let mut state = MemoryWatchdogState::default();
+        let pressure = MemorySnapshot {
+            mem_total_bytes: gib(10),
+            mem_available_bytes: mib(512),
+            process_rss_bytes: gib(9),
+            process_swap_bytes: 0,
+            thread_count: 44,
+        };
+
+        assert_eq!(
+            state.events_for(&pressure),
+            MemoryWatchdogEvents {
+                host_pressure: true,
+                process_pressure: true,
+            }
+        );
+        assert_eq!(state.events_for(&pressure), MemoryWatchdogEvents::default());
     }
 }
