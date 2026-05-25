@@ -129,6 +129,8 @@ Press the End key on the keyboard to take you to the bottom of the log to see th
 
 Lqosd will provide specific reasons it failed, such as an interface not being up, an interface lacking multi-queue, or other concerns.
 
+If the log shows `LibreQoS failed to attach the XDP/TC kernel` or `Unable to load the XDP/TC kernel`, treat `lqosd` startup as failed. The WebUI and local bus will not start until the kernel program loads and attaches successfully. The load error includes the raw return value, errno number, and errno code, for example `raw=-11, errno=11, code=EAGAIN`. Check for an existing XDP program, busy TC hook, missing driver support, or stale pinned maps before restarting `lqosd`.
+
 If `journalctl -u lqosd` shows `lqosd host memory pressure` or `lqosd process memory critical`, the daemon detected high memory usage and logged diagnostic context. The watchdog does not restart `lqosd`; it records available memory, total memory, `lqosd` RSS/swap, thread count, flow count, and timing counters that help diagnose the source of memory growth. Host memory pressure is logged when available memory is below 10% of installed RAM. Process memory is logged as critical when `lqosd` RSS plus swap reaches 90% of installed RAM.
 
 You can disable these diagnostics with a systemd environment override during short troubleshooting windows:

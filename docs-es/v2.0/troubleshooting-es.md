@@ -107,6 +107,8 @@ sudo systemctl status lqosd
 journalctl -u lqosd --since "10 minutes ago"
 ```
 
+Si el log muestra `LibreQoS failed to attach the XDP/TC kernel` o `Unable to load the XDP/TC kernel`, trate el arranque de `lqosd` como fallido. La WebUI y el bus local no arrancan hasta que el programa del kernel se cargue y se adjunte correctamente. El error de carga incluye el valor de retorno bruto, el número errno y el código errno, por ejemplo `raw=-11, errno=11, code=EAGAIN`. Revise si hay un programa XDP existente, un hook TC ocupado, falta de soporte del driver o mapas BPF fijados obsoletos antes de reiniciar `lqosd`.
+
 ### Depuración avanzada de lqosd
 
 ```bash
