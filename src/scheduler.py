@@ -14,8 +14,8 @@ from liblqos_python import automatic_import_uisp, automatic_import_splynx, queue
     blackboard_finish, blackboard_submit, automatic_import_wispgate, enable_insight_topology, insight_topology_role, \
     automatic_import_netzur, automatic_import_visp, calculate_shaping_runtime_hash, efficiency_core_ids, scheduler_alive as _scheduler_alive_native, scheduler_error as _scheduler_error_native, \
     calculate_topology_source_generation, topology_import_ingress_enabled, \
-    scheduler_progress as _scheduler_progress_native, overrides_persistent_devices_materialized, overrides_circuit_adjustments_materialized, \
-    overrides_network_adjustments_materialized, \
+    scheduler_progress as _scheduler_progress_native, overrides_network_adjustments_materialized, \
+    overrides_materialized, \
     scheduler_output as _scheduler_output_native, wait_for_bus_ready
 
 from apscheduler.schedulers.background import BlockingScheduler
@@ -37,6 +37,13 @@ STARTUP_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 PARTIAL_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 SCHEDULER_STARTUP_STEP_COUNT = 5
 SCHEDULER_REFRESH_STEP_COUNT = 4
+OVERRIDE_SECTION_READ_ATTEMPTS = 5
+OVERRIDE_SECTION_READ_RETRY_SECONDS = 0.25
+OVERRIDE_LOCK_ERROR_MARKERS = (
+    "lqos_overrides_locked",
+    "overrides files are locked by another process",
+    "locked by another process",
+)
 scheduler_status_bus_enabled = True
 startup_topology_runtime_pending = False
 startup_topology_runtime_generation = None
@@ -47,6 +54,10 @@ partial_topology_runtime_generation = None
 partial_topology_runtime_started_monotonic = None
 partial_topology_runtime_last_report_state = None
 last_integration_failure_message = ""
+
+
+class RequiredOverrideReadError(RuntimeError):
+    """Raised when scheduler reloads cannot safely materialize operator overrides."""
 
 
 def configure_scheduler_stdio():
@@ -493,8 +504,19 @@ def importFromCRM(
         )
         apply_lqos_overrides()
     except Exception as e:
-        scheduler_error(f"Failed to apply lqos_overrides: {e}")
-        print(f"Failed to apply lqos_overrides: {e}")
+        message = f"Failed to apply lqos_overrides; preserving last-known-good topology: {e}"
+        scheduler_error(message)
+        scheduler_output(message)
+        publish_scheduler_progress(
+            False,
+            "degraded",
+            "Scheduler blocked by override failure",
+            overrides_step,
+            progress_step_count,
+            percent=100,
+        )
+        print(message)
+        raise
 
 
 # --------------- Overrides Handling ---------------
@@ -704,23 +726,23 @@ def operator_requires_sqm_column(devices, adjustments):
 
 def apply_lqos_overrides():
     """Apply overrides to source topology files without mutating integration-owned shaping CSV."""
+    materialized = read_required_override_section(
+        "materialized overrides",
+        overrides_materialized,
+    )
+    persistent_devices = materialized.get("persistent_devices", [])
+    circuit_adjustments = materialized.get("circuit_adjustments", [])
+    network_adjustments = materialized.get("network_adjustments", [])
+
     if not topology_import_ingress_enabled():
         path = shaped_devices_csv_path()
         header, rows = read_shaped_devices_csv(path)
 
         # 1) Persistent devices: replace by device_id or append
-        try:
-            extra = overrides_persistent_devices_materialized()
-        except Exception as e:
-            print(f"Skipping persistent device overrides: {e}")
-            extra = []
+        extra = persistent_devices
 
         # 2) Circuit adjustments: speed changes, removals, reparenting
-        try:
-            adjustments = overrides_circuit_adjustments_materialized()
-        except Exception as e:
-            print(f"Failed to read circuit adjustments: {e}")
-            adjustments = []
+        adjustments = circuit_adjustments
 
         need_sqm_column = header_has_sqm(header) or operator_requires_sqm_column(extra, adjustments)
         if need_sqm_column and not header_has_sqm(header):
@@ -806,11 +828,7 @@ def apply_lqos_overrides():
             print("Updated ShapedDevices.csv with overrides")
 
     # 3) Load, adjust, and optionally save topology compatibility state
-    try:
-        adjustments = overrides_network_adjustments_materialized()
-    except Exception as e:
-        print(f"Failed to read network adjustments: {e}")
-        adjustments = []
+    adjustments = network_adjustments
     canonical_path = topology_canonical_state_path()
     canonical_state = load_topology_canonical_state(canonical_path)
     if topology_import_ingress_enabled():
@@ -870,6 +888,35 @@ def write_topology_canonical_state(path: str, canonical_state: dict):
         f.write(json.dumps(canonical_state, indent=4))
 
 
+def _format_attempt_count(attempts: int) -> str:
+    if attempts == 1:
+        return "1 attempt"
+    return f"{attempts} attempts"
+
+
+def _is_override_lock_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(marker in message for marker in OVERRIDE_LOCK_ERROR_MARKERS)
+
+
+def read_required_override_section(section_name: str, reader):
+    attempts = max(1, int(OVERRIDE_SECTION_READ_ATTEMPTS))
+    last_error = None
+    for attempt_index in range(attempts):
+        try:
+            return reader()
+        except Exception as exc:
+            last_error = exc
+            if not _is_override_lock_error(exc):
+                raise
+            if attempt_index + 1 < attempts:
+                time.sleep(OVERRIDE_SECTION_READ_RETRY_SECONDS)
+
+    raise RequiredOverrideReadError(
+        f"failed to read {section_name} after {_format_attempt_count(attempts)}: {last_error}"
+    ) from last_error
+
+
 def apply_network_adjustments(network: dict, adjustments=None) -> bool:
     """Apply network adjustments from overrides to the network JSON structure.
 
@@ -886,11 +933,10 @@ def apply_network_adjustments(network: dict, adjustments=None) -> bool:
     Returns True if any changes were applied.
     """
     if adjustments is None:
-        try:
-            adjustments = overrides_network_adjustments_materialized()
-        except Exception as e:
-            print(f"Failed to read network adjustments: {e}")
-            return False
+        adjustments = read_required_override_section(
+            "network adjustments",
+            overrides_network_adjustments_materialized,
+        )
 
     if not adjustments:
         return False

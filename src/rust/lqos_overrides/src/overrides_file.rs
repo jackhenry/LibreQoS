@@ -228,11 +228,14 @@ fn save_to_path(path: &Path, overrides: &OverrideFile) -> Result<()> {
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        anyhow::anyhow!("Overrides path '{}' has no parent directory", path.display())
+        anyhow::anyhow!(
+            "Overrides path '{}' has no parent directory",
+            path.display()
+        )
     })?;
-    let file_name = path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("Overrides path '{}' has no file name", path.display())
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Overrides path '{}' has no file name", path.display()))?;
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -604,7 +607,7 @@ impl OverrideFile {
 
     /// Loads the operator-owned overrides file, creating an empty file if it does not exist.
     pub fn load() -> Result<Self> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation("load operator overrides")?;
         let config = lqos_config::load_config()?;
         let path = overrides_path(&config, OverrideLayer::Operator);
         ensure_exists_default(&path)?;
@@ -615,7 +618,7 @@ impl OverrideFile {
 
     /// Saves this value to the operator-owned overrides file.
     pub fn save(&self) -> Result<()> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation("save operator overrides")?;
         let config = lqos_config::load_config()?;
         let path = overrides_path(&config, OverrideLayer::Operator);
         save_to_path(&path, self)?;
@@ -1080,7 +1083,7 @@ impl OverrideStore {
     ///
     /// Side effects: acquires the global overrides lock and may create the operator overrides file.
     pub fn load_layer(layer: OverrideLayer) -> Result<OverrideFile> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation(&format!("load {layer:?} overrides"))?;
         let config = lqos_config::load_config()?;
         let path = Self::path_for_layer_config(&config, layer);
         let overrides = match layer {
@@ -1104,7 +1107,7 @@ impl OverrideStore {
     ///
     /// Side effects: acquires the global overrides lock and writes the selected overrides file.
     pub fn save_layer(layer: OverrideLayer, overrides: &OverrideFile) -> Result<()> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation(&format!("save {layer:?} overrides"))?;
         let config = lqos_config::load_config()?;
         let path = overrides_path(&config, layer);
         save_to_path(&path, overrides)?;
@@ -1118,7 +1121,7 @@ impl OverrideStore {
     ///
     /// Side effects: acquires the global overrides lock and may create the operator overrides file.
     pub fn load_effective(apply_stormguard: bool, apply_treeguard: bool) -> Result<OverrideFile> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation("load effective overrides")?;
         let config = lqos_config::load_config()?;
         let merged =
             Self::load_effective_for_config_inner(&config, apply_stormguard, apply_treeguard)?;

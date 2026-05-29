@@ -202,6 +202,8 @@ If specific APs or switches appear multiple times with suffixed names such as `.
 
 If an integration subprocess fails, current builds keep the scheduler alive, publish a shortened output preview to the scheduler status/error surfaces, and save the full captured output to a timestamped file under `/tmp` such as `lqos_scheduler_uisp_integration_YYYYMMDD_HHMMSS.log`. If shaping can continue from the last-known-good topology, the scheduler may still report ready, but the latest integration failure remains visible in scheduler status until the next successful integration run.
 
+If the scheduler cannot read `lqos_overrides.json` or its materialized override layers because another process holds the overrides lock, current builds retry briefly and then block that reload. The previous topology remains in use, and the scheduler error includes lock-holder details such as PID, process name, operation, and lock creation time when available.
+
 ### Scheduler status in WebUI looks unhealthy
 
 Recent builds expose scheduler readiness/state in the WebUI (Node Manager).
