@@ -11,7 +11,10 @@ use libbpf_sys::{
     libbpf_set_strict_mode,
 };
 use lqos_utils::XdpIpAddress;
-use nix::libc::{close, geteuid, if_nametoindex};
+use nix::{
+    errno::Errno,
+    libc::{close, geteuid, if_nametoindex},
+};
 use std::{
     ffi::{CString, c_void},
     fs,
@@ -214,6 +217,21 @@ mod tests {
 
         assert!(err.to_string().contains("map info failed"));
     }
+
+    #[test]
+    fn kernel_load_error_includes_raw_errno_and_code() {
+        for (raw, errno, code) in [(-11, 11, "EAGAIN"), (-16, 16, "EBUSY")] {
+            let error = format_kernel_load_error(raw);
+
+            assert!(error.contains(&format!("raw={raw}")));
+            assert!(error.contains(&format!("errno={errno}")));
+            assert!(error.contains(&format!("code={code}")));
+        }
+
+        let error = format_kernel_load_error(i32::MIN);
+        assert!(error.contains("raw=-2147483648"));
+        assert!(error.contains("errno=2147483648"));
+    }
 }
 
 pub fn check_root() -> Result<()> {
@@ -382,13 +400,24 @@ unsafe fn open_kernel() -> Result<*mut bpf::lqos_kern> {
 }
 
 unsafe fn load_kernel(skeleton: *mut bpf::lqos_kern) -> Result<()> {
-    let error = unsafe { bpf::lqos_kern_load(skeleton) };
-    if error != 0 {
-        let error = format!("Unable to load the XDP/TC kernel ({error})");
-        Err(Error::msg(error))
+    let raw_error = unsafe { bpf::lqos_kern_load(skeleton) };
+    if raw_error != 0 {
+        Err(Error::msg(format_kernel_load_error(raw_error)))
     } else {
         Ok(())
     }
+}
+
+fn format_kernel_load_error(raw_error: i32) -> String {
+    let errno_number = raw_error.unsigned_abs();
+    let errno_code = if let Ok(errno) = i32::try_from(errno_number) {
+        format!("{:?}", Errno::from_raw(errno))
+    } else {
+        "unknown".to_string()
+    };
+    format!(
+        "Unable to load the XDP/TC kernel (raw={raw_error}, errno={errno_number}, code={errno_code})"
+    )
 }
 
 #[derive(PartialEq, Eq)]
@@ -452,8 +481,7 @@ pub fn attach_xdp_and_tc_to_interface(
             (*(*skeleton).bss).isp_vlan = isp.to_be();
             (*(*skeleton).bss).stick_offset = stick_offset;
         }
-        // Ensure no lingering XDP programs before loading/attaching
-        let _ = unload_xdp_from_interface(interface_name);
+        // Load before detaching so a verifier/load failure leaves the previous XDP state intact.
         load_kernel(skeleton)?;
         crate::initialize_tc_classify_bypass()?;
         let prog_fd = bpf::bpf_program__fd((*skeleton).progs.xdp_prog);

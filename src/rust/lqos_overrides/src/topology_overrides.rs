@@ -200,7 +200,7 @@ impl TopologyOverridesFile {
 
     /// Saves this value to the operator-owned topology-manager overrides file.
     pub fn save(&self) -> Result<()> {
-        let lock = FileLock::new()?;
+        let lock = FileLock::new_for_operation("save topology overrides")?;
         let config = lqos_config::load_config()?;
         let path = topology_overrides_path(&config);
         save_to_path(&path, self)?;

@@ -10,13 +10,14 @@ use lqos_config::{
     TopLevelPlannerItem, TopLevelPlannerMode, TopLevelPlannerParams, TopologyAllowedParent,
     TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus, TopologyAttachmentOption,
     TopologyAttachmentRateSource, TopologyAttachmentRole, TopologyCanonicalIngressKind,
-    TopologyCanonicalNode, TopologyCanonicalStateFile, TopologyEditorNode, TopologyEditorStateFile,
-    TopologyEffectiveAttachmentState, TopologyEffectiveNodeState, TopologyEffectiveStateFile,
-    TopologyQueueVisibilityPolicy, TopologyRuntimeStatusFile, TopologyShapingCircuitInput,
-    TopologyShapingDeviceInput, TopologyShapingInputsFile, TopologyShapingResolutionSource,
-    circuit_anchors_path, compute_effective_network_generation, detect_shaping_cpus,
-    plan_top_level_assignments, topology_effective_network_path, topology_effective_state_path,
-    topology_runtime_status_path, topology_shaping_inputs_path,
+    TopologyCanonicalNode, TopologyCanonicalRateInputSource, TopologyCanonicalStateFile,
+    TopologyEditorNode, TopologyEditorStateFile, TopologyEffectiveAttachmentState,
+    TopologyEffectiveNodeState, TopologyEffectiveStateFile, TopologyQueueVisibilityPolicy,
+    TopologyRuntimeStatusFile, TopologyShapingCircuitInput, TopologyShapingDeviceInput,
+    TopologyShapingInputsFile, TopologyShapingResolutionSource, circuit_anchors_path,
+    compute_effective_network_generation, detect_shaping_cpus, plan_top_level_assignments,
+    topology_effective_network_path, topology_effective_state_path, topology_runtime_status_path,
+    topology_shaping_inputs_path,
 };
 use lqos_overrides::{
     CircuitAdjustment, NetworkAdjustment, OverrideStore, TopologyAttachmentMode,
@@ -3269,7 +3270,16 @@ fn rate_pair_from_value(node: &Map<String, Value>) -> CompiledRatePair {
     )
 }
 
-fn rate_pair_from_canonical_node(node: &TopologyCanonicalNode) -> CompiledRatePair {
+fn rate_pair_from_canonical_node(
+    node: &TopologyCanonicalNode,
+    use_compatibility_export_rates: bool,
+) -> CompiledRatePair {
+    if node.rate_input.source == TopologyCanonicalRateInputSource::CompatibilityExport
+        && !use_compatibility_export_rates
+    {
+        return CompiledRatePair::default();
+    }
+
     compiled_rate_pair(
         node.rate_input
             .intrinsic_download_mbps
@@ -3352,16 +3362,21 @@ fn recompile_effective_bandwidths_for_value(
     canonical_nodes: &HashMap<&str, &TopologyCanonicalNode>,
     selected_attachment_caps: &HashMap<String, CompiledRatePair>,
     inherited_parent_rates: Option<CompiledRatePair>,
+    use_compatibility_export_rates: bool,
 ) {
     let Some(node) = value.as_object_mut() else {
         return;
     };
     let existing_rates = rate_pair_from_value(node);
     let node_id = node.get("id").and_then(Value::as_str);
-    let mut compiled = node_id
-        .and_then(|node_id| canonical_nodes.get(node_id).copied())
-        .map(rate_pair_from_canonical_node)
+    let canonical_node = node_id.and_then(|node_id| canonical_nodes.get(node_id).copied());
+    let mut compiled = canonical_node
+        .map(|node| rate_pair_from_canonical_node(node, use_compatibility_export_rates))
         .unwrap_or(existing_rates);
+    let skip_existing_compatibility_rates = canonical_node.is_some_and(|node| {
+        node.rate_input.source == TopologyCanonicalRateInputSource::CompatibilityExport
+            && !use_compatibility_export_rates
+    });
     if let Some(node_id) = node_id
         && let Some(attachment_rates) = selected_attachment_caps.get(node_id)
     {
@@ -3371,14 +3386,22 @@ fn recompile_effective_bandwidths_for_value(
         compiled = intersect_rate_pairs(compiled, parent_rates);
     }
     if compiled.download.is_none() {
-        compiled.download = existing_rates
-            .download
-            .or(inherited_parent_rates.and_then(|pair| pair.download));
+        compiled.download = if skip_existing_compatibility_rates {
+            inherited_parent_rates.and_then(|pair| pair.download)
+        } else {
+            existing_rates
+                .download
+                .or(inherited_parent_rates.and_then(|pair| pair.download))
+        };
     }
     if compiled.upload.is_none() {
-        compiled.upload = existing_rates
-            .upload
-            .or(inherited_parent_rates.and_then(|pair| pair.upload));
+        compiled.upload = if skip_existing_compatibility_rates {
+            inherited_parent_rates.and_then(|pair| pair.upload)
+        } else {
+            existing_rates
+                .upload
+                .or(inherited_parent_rates.and_then(|pair| pair.upload))
+        };
     }
     write_rate_pair(node, compiled);
     let next_parent_rates = Some(rate_pair_from_value(node));
@@ -3389,6 +3412,7 @@ fn recompile_effective_bandwidths_for_value(
                 canonical_nodes,
                 selected_attachment_caps,
                 next_parent_rates,
+                use_compatibility_export_rates,
             );
         }
     }
@@ -3406,12 +3430,15 @@ fn recompile_effective_network_bandwidths(
         .map(|node| (node.node_id.as_str(), node))
         .collect::<HashMap<_, _>>();
     let selected_attachment_caps = selected_attachment_rate_caps(ui_state, effective);
+    let use_compatibility_export_rates =
+        canonical.ingress_kind != TopologyCanonicalIngressKind::NativeIntegration;
     for node in root.values_mut() {
         recompile_effective_bandwidths_for_value(
             node,
             &canonical_nodes,
             &selected_attachment_caps,
             None,
+            use_compatibility_export_rates,
         );
     }
 }
@@ -4376,10 +4403,11 @@ mod tests {
         CircuitAnchor, CircuitAnchorsFile, Config, ConfigShapedDevices, ShapedDevice,
         TopologyAllowedParent, TopologyAttachmentHealthStateFile, TopologyAttachmentHealthStatus,
         TopologyAttachmentOption, TopologyAttachmentRateSource, TopologyAttachmentRole,
-        TopologyCanonicalIngressKind, TopologyCanonicalNode, TopologyCanonicalStateFile,
-        TopologyEditorNode, TopologyEditorStateFile, TopologyEffectiveAttachmentState,
-        TopologyEffectiveNodeState, TopologyEffectiveStateFile, TopologyQueueVisibilityPolicy,
-        TopologyRuntimeStatusFile, topology_effective_network_path, topology_effective_state_path,
+        TopologyCanonicalIngressKind, TopologyCanonicalNode, TopologyCanonicalRateInput,
+        TopologyCanonicalRateInputSource, TopologyCanonicalStateFile, TopologyEditorNode,
+        TopologyEditorStateFile, TopologyEffectiveAttachmentState, TopologyEffectiveNodeState,
+        TopologyEffectiveStateFile, TopologyQueueVisibilityPolicy, TopologyRuntimeStatusFile,
+        topology_effective_network_path, topology_effective_state_path,
         topology_runtime_status_path, topology_shaping_inputs_path,
     };
     use lqos_overrides::{TopologyAttachmentMode, TopologyOverridesFile};
@@ -4397,6 +4425,150 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
         fs::create_dir_all(&path).expect("temp directory should be creatable");
         path
+    }
+
+    fn canonical_node_with_rate_source(
+        node_id: &str,
+        node_name: &str,
+        download: u64,
+        upload: u64,
+        source: TopologyCanonicalRateInputSource,
+    ) -> TopologyCanonicalNode {
+        TopologyCanonicalNode {
+            node_id: node_id.to_string(),
+            node_name: node_name.to_string(),
+            latitude: None,
+            longitude: None,
+            node_kind: "Site".to_string(),
+            is_virtual: false,
+            current_parent_node_id: None,
+            current_parent_node_name: None,
+            current_attachment_id: None,
+            current_attachment_name: None,
+            can_move: true,
+            allowed_parents: Vec::new(),
+            queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+            rate_input: TopologyCanonicalRateInput {
+                intrinsic_download_mbps: Some(download),
+                intrinsic_upload_mbps: Some(upload),
+                legacy_imported_download_mbps: Some(download),
+                legacy_imported_upload_mbps: Some(upload),
+                source,
+            },
+        }
+    }
+
+    fn sample_effective_bandwidth_tree() -> serde_json::Map<String, Value> {
+        json!({
+            "Hoodoo Hill": {
+                "children": {
+                    "HoodooHill-Thunderhill": {
+                        "children": {},
+                        "downloadBandwidthMbps": 214,
+                        "id": "ap-thunderhill",
+                        "name": "HoodooHill-Thunderhill",
+                        "type": "AP",
+                        "uploadBandwidthMbps": 773
+                    }
+                },
+                "downloadBandwidthMbps": 774,
+                "id": "site-hoodoo",
+                "name": "Hoodoo Hill",
+                "type": "Site",
+                "uploadBandwidthMbps": 774
+            }
+        })
+        .as_object()
+        .expect("sample tree should be an object")
+        .clone()
+    }
+
+    #[test]
+    fn native_compatibility_export_rates_do_not_clamp_auto_child_nodes() {
+        let mut root = sample_effective_bandwidth_tree();
+        let canonical = TopologyCanonicalStateFile {
+            ingress_kind: TopologyCanonicalIngressKind::NativeIntegration,
+            nodes: vec![
+                canonical_node_with_rate_source(
+                    "site-hoodoo",
+                    "Hoodoo Hill",
+                    774,
+                    774,
+                    TopologyCanonicalRateInputSource::AttachmentMax,
+                ),
+                canonical_node_with_rate_source(
+                    "ap-thunderhill",
+                    "HoodooHill-Thunderhill",
+                    214,
+                    773,
+                    TopologyCanonicalRateInputSource::CompatibilityExport,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        super::recompile_effective_network_bandwidths(
+            &mut root,
+            &canonical,
+            &TopologyEditorStateFile::default(),
+            &TopologyEffectiveStateFile::default(),
+        );
+
+        let ap = root["Hoodoo Hill"]["children"]["HoodooHill-Thunderhill"]
+            .as_object()
+            .expect("AP node should exist");
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "downloadBandwidthMbps"),
+            Some(774)
+        );
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "uploadBandwidthMbps"),
+            Some(774)
+        );
+    }
+
+    #[test]
+    fn legacy_imported_rates_still_cap_child_nodes() {
+        let mut root = sample_effective_bandwidth_tree();
+        let canonical = TopologyCanonicalStateFile {
+            ingress_kind: TopologyCanonicalIngressKind::LegacyNetworkJson,
+            nodes: vec![
+                canonical_node_with_rate_source(
+                    "site-hoodoo",
+                    "Hoodoo Hill",
+                    774,
+                    774,
+                    TopologyCanonicalRateInputSource::ImportedNetworkJson,
+                ),
+                canonical_node_with_rate_source(
+                    "ap-thunderhill",
+                    "HoodooHill-Thunderhill",
+                    214,
+                    773,
+                    TopologyCanonicalRateInputSource::ImportedNetworkJson,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        super::recompile_effective_network_bandwidths(
+            &mut root,
+            &canonical,
+            &TopologyEditorStateFile::default(),
+            &TopologyEffectiveStateFile::default(),
+        );
+
+        let ap = root["Hoodoo Hill"]["children"]["HoodooHill-Thunderhill"]
+            .as_object()
+            .expect("AP node should exist");
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "downloadBandwidthMbps"),
+            Some(214)
+        );
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "uploadBandwidthMbps"),
+            Some(773)
+        );
     }
 
     fn write_runtime_json_fixture(path: PathBuf, value: &Value, label: &str) {

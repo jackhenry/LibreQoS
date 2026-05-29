@@ -59,11 +59,14 @@ def install_scheduler_stubs():
     lqlib.scheduler_progress = Mock()
     lqlib.wait_for_bus_ready = Mock(return_value=True)
     lqlib.overrides_persistent_devices_effective = lambda: []
-    lqlib.overrides_persistent_devices_materialized = lambda: []
     lqlib.overrides_circuit_adjustments_effective = lambda: []
-    lqlib.overrides_circuit_adjustments_materialized = lambda: []
     lqlib.overrides_network_adjustments_effective = lambda: []
     lqlib.overrides_network_adjustments_materialized = lambda: []
+    lqlib.overrides_materialized = lambda: {
+        "persistent_devices": [],
+        "circuit_adjustments": [],
+        "network_adjustments": [],
+    }
     sys.modules["liblqos_python"] = lqlib
 
     apscheduler_pkg = types.ModuleType("apscheduler")
@@ -1235,6 +1238,165 @@ class TestSchedulerOverrideMerge(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertEqual(merged[1][2], "legacy_device_1")
 
+    def test_required_override_section_retries_transient_lock_failure(self):
+        reader = Mock(side_effect=[
+            RuntimeError("locked by another process"),
+            RuntimeError("still locked by another process"),
+            [{"type": "adjust_site_speed"}],
+        ])
+
+        with patch.object(scheduler, "OVERRIDE_SECTION_READ_ATTEMPTS", 5):
+            with patch.object(scheduler, "OVERRIDE_SECTION_READ_RETRY_SECONDS", 0.01):
+                with patch.object(scheduler.time, "sleep") as mock_sleep:
+                    adjustments = scheduler.read_required_override_section(
+                        "network adjustments",
+                        reader,
+                    )
+
+        self.assertEqual(adjustments, [{"type": "adjust_site_speed"}])
+        self.assertEqual(reader.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_required_override_section_raises_after_retry_budget(self):
+        reader = Mock(side_effect=RuntimeError("locked by another process: pid 42"))
+
+        with patch.object(scheduler, "OVERRIDE_SECTION_READ_ATTEMPTS", 2):
+            with patch.object(scheduler.time, "sleep"):
+                with self.assertRaises(scheduler.RequiredOverrideReadError) as raised:
+                    scheduler.read_required_override_section(
+                        "network adjustments",
+                        reader,
+                    )
+
+        self.assertEqual(reader.call_count, 2)
+        self.assertIn("failed to read network adjustments after 2 attempts", str(raised.exception))
+        self.assertIn("locked by another process: pid 42", str(raised.exception))
+
+    def test_required_override_section_does_not_retry_non_lock_failure(self):
+        reader = Mock(side_effect=RuntimeError("invalid overrides json"))
+
+        with patch.object(scheduler, "OVERRIDE_SECTION_READ_ATTEMPTS", 5):
+            with patch.object(scheduler.time, "sleep") as mock_sleep:
+                with self.assertRaises(RuntimeError) as raised:
+                    scheduler.read_required_override_section(
+                        "network adjustments",
+                        reader,
+                    )
+
+        self.assertEqual(reader.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertIn("invalid overrides json", str(raised.exception))
+
+    def test_apply_lqos_overrides_aborts_when_network_adjustments_are_unavailable(self):
+        with patch.object(scheduler, "topology_import_ingress_enabled", return_value=True):
+            with patch.object(
+                scheduler,
+                "overrides_materialized",
+                side_effect=RuntimeError("locked by another process: pid 42"),
+            ):
+                with patch.object(scheduler, "OVERRIDE_SECTION_READ_ATTEMPTS", 2):
+                    with patch.object(scheduler.time, "sleep"):
+                        with patch.object(scheduler, "load_topology_canonical_state") as mock_load_canonical:
+                            with patch.object(scheduler, "write_topology_canonical_state") as mock_write_canonical:
+                                with self.assertRaises(scheduler.RequiredOverrideReadError):
+                                    scheduler.apply_lqos_overrides()
+
+        mock_load_canonical.assert_not_called()
+        mock_write_canonical.assert_not_called()
+
+    def test_apply_lqos_overrides_reads_all_sections_before_writing_non_ingress_files(self):
+        with patch.object(scheduler, "topology_import_ingress_enabled", return_value=False):
+            with patch.object(
+                scheduler,
+                "overrides_materialized",
+                side_effect=RuntimeError("locked by another process: pid 42"),
+            ):
+                with patch.object(scheduler, "OVERRIDE_SECTION_READ_ATTEMPTS", 2):
+                    with patch.object(scheduler.time, "sleep"):
+                        with patch.object(scheduler, "read_shaped_devices_csv") as mock_read_sd:
+                            with patch.object(scheduler, "write_shaped_devices_csv") as mock_write_sd:
+                                with patch.object(scheduler, "load_network_json") as mock_load_network:
+                                    with patch.object(scheduler, "write_network_json") as mock_write_network:
+                                        with self.assertRaises(scheduler.RequiredOverrideReadError):
+                                            scheduler.apply_lqos_overrides()
+
+        mock_read_sd.assert_not_called()
+        mock_write_sd.assert_not_called()
+        mock_load_network.assert_not_called()
+        mock_write_network.assert_not_called()
+
+    def test_apply_lqos_overrides_uses_single_materialized_snapshot(self):
+        header = [
+            "Circuit ID", "Circuit Name", "Device ID", "Device Name", "Parent Node", "MAC",
+            "IPv4", "IPv6", "Download Min Mbps", "Upload Min Mbps", "Download Max Mbps",
+            "Upload Max Mbps", "Comment",
+        ]
+        rows = []
+        materialized = {
+            "persistent_devices": [],
+            "circuit_adjustments": [],
+            "network_adjustments": [],
+        }
+
+        with patch.object(scheduler, "topology_import_ingress_enabled", return_value=False):
+            with patch.object(scheduler, "overrides_materialized", return_value=materialized) as mock_materialized:
+                with patch.object(
+                    scheduler,
+                    "overrides_persistent_devices_materialized",
+                    side_effect=AssertionError("legacy persistent reader should not be used"),
+                    create=True,
+                ) as mock_persistent:
+                    with patch.object(
+                        scheduler,
+                        "overrides_circuit_adjustments_materialized",
+                        side_effect=AssertionError("legacy circuit reader should not be used"),
+                        create=True,
+                    ) as mock_circuit:
+                        with patch.object(
+                            scheduler,
+                            "overrides_network_adjustments_materialized",
+                            side_effect=AssertionError("legacy network reader should not be used"),
+                        ) as mock_network:
+                            with patch.object(scheduler, "read_shaped_devices_csv", return_value=(header, rows)):
+                                with patch.object(scheduler, "load_network_json", return_value={}):
+                                    with patch.object(scheduler, "load_topology_canonical_state", return_value=None):
+                                        scheduler.apply_lqos_overrides()
+
+        mock_materialized.assert_called_once_with()
+        mock_persistent.assert_not_called()
+        mock_circuit.assert_not_called()
+        mock_network.assert_not_called()
+
+    def test_import_from_crm_does_not_continue_after_override_failure(self):
+        with patch.object(
+            scheduler,
+            "apply_lqos_overrides",
+            side_effect=scheduler.RequiredOverrideReadError("locked by pid 42"),
+        ):
+            with patch.object(scheduler.os.path, "isfile", return_value=False):
+                with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
+                    with patch.object(scheduler, "scheduler_output") as mock_scheduler_output:
+                        with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
+                            with patch("builtins.print"):
+                                with self.assertRaises(scheduler.RequiredOverrideReadError):
+                                    scheduler.importFromCRM()
+
+        self.assertIn(
+            "preserving last-known-good topology",
+            mock_scheduler_error.call_args.args[0],
+        )
+        self.assertEqual(mock_scheduler_output.call_args.args, mock_scheduler_error.call_args.args)
+        self.assertTrue(
+            any(
+                call.args[:3] == (
+                    False,
+                    "degraded",
+                    "Scheduler blocked by override failure",
+                )
+                for call in mock_progress.call_args_list
+            )
+        )
+
     def test_apply_lqos_overrides_device_adjust_sqm_only_updates_sqm_column(self):
         header = [
             "Circuit ID", "Circuit Name", "Device ID", "Device Name", "Parent Node", "MAC",
@@ -1249,18 +1411,21 @@ class TestSchedulerOverrideMerge(unittest.TestCase):
         # Test-only fake csv path.
         with patch.object(scheduler, "shaped_devices_csv_path", return_value="/tmp/ShapedDevices.csv"):  # nosec B108
             with patch.object(scheduler, "read_shaped_devices_csv", return_value=(header, rows)):
-                with patch.object(scheduler, "overrides_persistent_devices_materialized", return_value=[]):
-                    with patch.object(
-                        scheduler,
-                        "overrides_circuit_adjustments_materialized",
-                        return_value=[{
+                with patch.object(
+                    scheduler,
+                    "overrides_materialized",
+                    return_value={
+                        "persistent_devices": [],
+                        "circuit_adjustments": [{
                             "type": "device_adjust_sqm",
                             "device_id": "splynx_service_93",
                             "sqm_override": "fq_codel/fq_codel",
                         }],
-                    ):
-                        with patch.object(scheduler, "write_shaped_devices_csv") as mock_write:
-                            scheduler.apply_lqos_overrides()
+                        "network_adjustments": [],
+                    },
+                ):
+                    with patch.object(scheduler, "write_shaped_devices_csv") as mock_write:
+                        scheduler.apply_lqos_overrides()
 
         written_rows = mock_write.call_args.args[2]
         self.assertEqual(written_rows[0][10], "330")
@@ -1281,18 +1446,21 @@ class TestSchedulerOverrideMerge(unittest.TestCase):
 
         with patch.object(scheduler, "shaped_devices_csv_path", return_value="/tmp/ShapedDevices.csv"):  # nosec B108
             with patch.object(scheduler, "read_shaped_devices_csv", return_value=(header, rows)):
-                with patch.object(scheduler, "overrides_persistent_devices_materialized", return_value=[]):
-                    with patch.object(
-                        scheduler,
-                        "overrides_circuit_adjustments_materialized",
-                        return_value=[{
+                with patch.object(
+                    scheduler,
+                    "overrides_materialized",
+                    return_value={
+                        "persistent_devices": [],
+                        "circuit_adjustments": [{
                             "type": "reparent_circuit",
                             "circuit_id": "93",
                             "parent_node": "AP-Updated",
                         }],
-                    ):
-                        with patch.object(scheduler, "write_shaped_devices_csv") as mock_write:
-                            scheduler.apply_lqos_overrides()
+                        "network_adjustments": [],
+                    },
+                ):
+                    with patch.object(scheduler, "write_shaped_devices_csv") as mock_write:
+                        scheduler.apply_lqos_overrides()
 
         written_rows = mock_write.call_args.args[2]
         self.assertEqual(written_rows[0][4], "AP-Updated")
@@ -1330,26 +1498,28 @@ class TestSchedulerOverrideMerge(unittest.TestCase):
 
         with patch.object(scheduler, "shaped_devices_csv_path", return_value="/tmp/ShapedDevices.csv"):  # nosec B108
             with patch.object(scheduler, "read_shaped_devices_csv", return_value=(header, rows)):
-                with patch.object(scheduler, "overrides_persistent_devices_materialized", return_value=[]):
-                    with patch.object(scheduler, "overrides_circuit_adjustments_materialized", return_value=[]):
-                        with patch.object(
-                            scheduler,
-                            "overrides_network_adjustments_materialized",
-                            return_value=[{
+                with patch.object(
+                    scheduler,
+                    "overrides_materialized",
+                    return_value={
+                        "persistent_devices": [],
+                        "circuit_adjustments": [],
+                        "network_adjustments": [{
                                 "type": "adjust_site_speed",
                                 "node_id": "node-b",
                                 "site_name": "NodeB",
                                 "download_bandwidth_mbps": 80,
                                 "upload_bandwidth_mbps": 40,
                             }],
-                        ):
-                            with patch.object(scheduler, "topology_import_ingress_enabled", return_value=True):
-                                with patch.object(scheduler, "load_topology_canonical_state", return_value=canonical_state):
-                                    with patch.object(scheduler, "write_topology_canonical_state") as mock_write_canonical:
-                                        with patch.object(scheduler, "load_network_json") as mock_load_network:
-                                            with patch.object(scheduler, "write_network_json") as mock_write_network:
-                                                with patch.object(scheduler, "write_shaped_devices_csv") as mock_write_sd:
-                                                    scheduler.apply_lqos_overrides()
+                    },
+                ):
+                    with patch.object(scheduler, "topology_import_ingress_enabled", return_value=True):
+                        with patch.object(scheduler, "load_topology_canonical_state", return_value=canonical_state):
+                            with patch.object(scheduler, "write_topology_canonical_state") as mock_write_canonical:
+                                with patch.object(scheduler, "load_network_json") as mock_load_network:
+                                    with patch.object(scheduler, "write_network_json") as mock_write_network:
+                                        with patch.object(scheduler, "write_shaped_devices_csv") as mock_write_sd:
+                                            scheduler.apply_lqos_overrides()
 
         mock_load_network.assert_not_called()
         mock_write_network.assert_not_called()

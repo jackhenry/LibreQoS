@@ -1214,14 +1214,19 @@ async fn receive_channel_message(
                 Err(_) => (false, "Error".to_string()),
             };
             let response = WsResponse::LtsSignUpResult { ok, message };
-            if send_ws_response(&tx, response).await {
-                return true;
-            }
-            if ok {
+            let close_connection = send_ws_response(&tx, response).await;
+            maybe_schedule_lts_signup_shutdown(ok, close_connection, || {
                 tokio::spawn(async {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    std::process::exit(0);
+                    if let Err(err) = crate::program_control::request_graceful_shutdown(
+                        "Insight signup completed",
+                    ) {
+                        tracing::error!("Unable to request graceful lqosd restart: {err}");
+                    }
                 });
+            });
+            if close_connection {
+                return true;
             }
         }
         WsRequest::LtsShaperStatus => match lts::shaper_status_data().await {
@@ -2470,6 +2475,16 @@ async fn send_ws_response(tx: &Sender<Arc<Vec<u8>>>, response: WsResponse) -> bo
     }
 }
 
+fn maybe_schedule_lts_signup_shutdown(
+    signup_ok: bool,
+    close_connection: bool,
+    schedule_shutdown: impl FnOnce(),
+) {
+    if signup_ok && !close_connection {
+        schedule_shutdown();
+    }
+}
+
 fn decode_ws_request(payload: &[u8]) -> Result<WsRequest, String> {
     let prefix = payload_prefix_hex(payload, 24);
     let hint = payload_hint(payload);
@@ -2525,12 +2540,16 @@ fn payload_hint(payload: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_ws_request;
+    use super::{decode_ws_request, maybe_schedule_lts_signup_shutdown};
     use crate::node_manager::local_api::urgent::{UrgentList, UrgentStatus};
     use crate::node_manager::ws::messages::WsRequest;
     use crate::node_manager::ws::messages::{WsResponse, encode_ws_message};
     use serde_cbor::Value as CborValue;
     use std::collections::BTreeMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn text(value: &str) -> CborValue {
         CborValue::Text(value.to_string())
@@ -2580,6 +2599,42 @@ mod tests {
             map(vec![("device", device)]),
         )]))
         .expect("valid create payload")
+    }
+
+    #[test]
+    fn lts_signup_shutdown_is_scheduled_after_successful_response() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_scheduler = called.clone();
+
+        maybe_schedule_lts_signup_shutdown(true, false, || {
+            called_by_scheduler.store(true, Ordering::SeqCst);
+        });
+
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lts_signup_shutdown_is_not_scheduled_when_response_closes_connection() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_scheduler = called.clone();
+
+        maybe_schedule_lts_signup_shutdown(true, true, || {
+            called_by_scheduler.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lts_signup_shutdown_is_not_scheduled_after_failed_signup() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_scheduler = called.clone();
+
+        maybe_schedule_lts_signup_shutdown(false, false, || {
+            called_by_scheduler.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     fn update_shaped_device_payload(device: CborValue) -> Vec<u8> {

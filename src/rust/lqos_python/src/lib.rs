@@ -1067,6 +1067,7 @@ fn liblqos_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
         overrides_network_adjustments_materialized,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(overrides_materialized, m)?)?;
     m.add_function(wrap_pyfunction!(is_network_flat, m)?)?;
     m.add_function(wrap_pyfunction!(blackboard_finish, m)?)?;
     m.add_function(wrap_pyfunction!(blackboard_submit, m)?)?;
@@ -1564,13 +1565,17 @@ fn overrides_persistent_devices_effective(py: Python<'_>) -> PyResult<Vec<PyObje
 /// overwrite the source-of-truth CSV.
 #[pyfunction]
 fn overrides_persistent_devices_materialized(py: Python<'_>) -> PyResult<Vec<PyObject>> {
-    let overrides = match lqos_overrides::OverrideStore::load_effective(false, false) {
-        Ok(o) => o,
-        Err(e) => return Err(PyOSError::new_err(e.to_string())),
-    };
+    let overrides = load_materialized_overrides()?;
 
+    persistent_devices_to_py(py, overrides.persistent_devices())
+}
+
+fn persistent_devices_to_py(
+    py: Python<'_>,
+    devices: &[lqos_config::ShapedDevice],
+) -> PyResult<Vec<PyObject>> {
     let mut out: Vec<PyObject> = Vec::new();
-    for dev in overrides.persistent_devices().iter() {
+    for dev in devices.iter() {
         let ipv4s: Vec<String> = dev
             .ipv4
             .iter()
@@ -1813,13 +1818,17 @@ fn overrides_circuit_adjustments_effective(py: Python<'_>) -> PyResult<Vec<PyObj
 /// overwrite the source-of-truth CSV.
 #[pyfunction]
 fn overrides_circuit_adjustments_materialized(py: Python<'_>) -> PyResult<Vec<PyObject>> {
-    let overrides = match lqos_overrides::OverrideStore::load_effective(false, false) {
-        Ok(o) => o,
-        Err(e) => return Err(PyOSError::new_err(e.to_string())),
-    };
+    let overrides = load_materialized_overrides()?;
 
+    circuit_adjustments_to_py(py, overrides.circuit_adjustments())
+}
+
+fn circuit_adjustments_to_py(
+    py: Python<'_>,
+    adjustments: &[lqos_overrides::CircuitAdjustment],
+) -> PyResult<Vec<PyObject>> {
     let mut out: Vec<PyObject> = Vec::new();
-    for adj in overrides.circuit_adjustments().iter() {
+    for adj in adjustments.iter() {
         let d = PyDict::new(py);
         match adj {
             lqos_overrides::CircuitAdjustment::CircuitAdjustSpeed {
@@ -1940,12 +1949,39 @@ fn overrides_network_adjustments_effective(py: Python<'_>) -> PyResult<Vec<PyObj
 /// file.
 #[pyfunction]
 fn overrides_network_adjustments_materialized(py: Python<'_>) -> PyResult<Vec<PyObject>> {
-    let overrides = match lqos_overrides::OverrideStore::load_effective(false, false) {
-        Ok(o) => o,
-        Err(e) => return Err(PyOSError::new_err(e.to_string())),
-    };
+    let overrides = load_materialized_overrides()?;
 
     network_adjustments_to_py(py, overrides.network_adjustments())
+}
+
+/// Returns all operator-owned override sections that scheduler materializes into
+/// source-of-truth compatibility files.
+///
+/// Side effects: acquires the overrides file lock once and reads the effective
+/// operator-only override snapshot.
+#[pyfunction]
+fn overrides_materialized(py: Python<'_>) -> PyResult<PyObject> {
+    let overrides = load_materialized_overrides()?;
+
+    let out = PyDict::new(py);
+    out.set_item(
+        "persistent_devices",
+        persistent_devices_to_py(py, overrides.persistent_devices())?,
+    )?;
+    out.set_item(
+        "circuit_adjustments",
+        circuit_adjustments_to_py(py, overrides.circuit_adjustments())?,
+    )?;
+    out.set_item(
+        "network_adjustments",
+        network_adjustments_to_py(py, overrides.network_adjustments())?,
+    )?;
+    Ok(out.unbind().into())
+}
+
+fn load_materialized_overrides() -> PyResult<lqos_overrides::OverrideFile> {
+    lqos_overrides::OverrideStore::load_effective(false, false)
+        .map_err(|e| PyOSError::new_err(e.to_string()))
 }
 
 fn network_adjustments_to_py(

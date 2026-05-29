@@ -107,6 +107,8 @@ sudo systemctl status lqosd
 journalctl -u lqosd --since "10 minutes ago"
 ```
 
+Si el log muestra `LibreQoS failed to attach the XDP/TC kernel` o `Unable to load the XDP/TC kernel`, trate el arranque de `lqosd` como fallido. La WebUI y el bus local no arrancan hasta que el programa del kernel se cargue y se adjunte correctamente. El error de carga incluye el valor de retorno bruto, el número errno y el código errno, por ejemplo `raw=-11, errno=11, code=EAGAIN`. Revise si hay un programa XDP existente, un hook TC ocupado, falta de soporte del driver o mapas BPF fijados obsoletos antes de reiniciar `lqosd`.
+
 ### Depuración avanzada de lqosd
 
 ```bash
@@ -133,21 +135,22 @@ Las instalaciones antiguas anteriores al entorno virtual pueden mostrar `ModuleN
 
 Si el scheduler falla inmediatamente después de un reinicio con un mensaje como `Socket (typically /run/lqos/bus) not found`, eso indica que `lqosd` todavía no había terminado de enlazar el bus local. Los builds actuales esperan brevemente la disponibilidad del bus al arrancar el scheduler en lugar de abortar de inmediato, por lo que ya no deberían aparecer panics repetidos de arranque tras un reinicio.
 
-Si `journalctl -u lqosd` muestra `lqosd memory watchdog restarting daemon`, el daemon salió intencionalmente antes de que la presión de memoria del host llegara al camino OOM del kernel. Systemd debería reiniciar `lqosd` automáticamente. Capture esa línea de log antes de cambiar ajustes; incluye memoria disponible, RSS/swap de `lqosd`, cantidad de hilos, cantidad de flujos y contadores de tiempo que ayudan a diagnosticar el origen del crecimiento de memoria.
+Si `journalctl -u lqosd` muestra `lqosd host memory pressure` o `lqosd process memory critical`, el daemon detectó uso alto de memoria y registró contexto de diagnóstico. El watchdog no reinicia `lqosd`; registra memoria disponible, memoria total, RSS/swap de `lqosd`, cantidad de hilos, cantidad de flujos y contadores de tiempo que ayudan a diagnosticar el origen del crecimiento de memoria. La presión de memoria del host se registra cuando la memoria disponible está por debajo del 10% de la RAM instalada. La memoria del proceso se registra como crítica cuando el RSS más swap de `lqosd` alcanza el 90% de la RAM instalada.
 
-El watchdog se puede ajustar con overrides de entorno de systemd:
+Puede desactivar estos diagnósticos con un override de entorno de systemd durante ventanas cortas de diagnóstico:
 
 ```bash
 sudo systemctl edit lqosd
 ```
 
-Las variables comunes son `LQOSD_MEMORY_WATCHDOG_MIN_AVAILABLE_MB`, `LQOSD_MEMORY_WATCHDOG_MAX_PROCESS_MB` y `LQOSD_MEMORY_WATCHDOG_MAX_SWAP_MB`. Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` solo durante ventanas cortas de diagnóstico en las que esté observando activamente la presión de memoria.
+Use `LQOSD_MEMORY_WATCHDOG_DISABLED=1` solamente cuando esté observando activamente la presión de memoria con otra herramienta.
 
 ### El estado del scheduler en WebUI aparece no saludable
 
 Versiones recientes muestran estado/readiness del scheduler en WebUI.
 Si el modal del scheduler indica que se agotó el tiempo al cargar detalles, las versiones actuales mantienen visible la última instantánea buena del scheduler con su antigüedad en lugar de convertir ese problema de transporte en un error del scheduler. Trate primero esa advertencia como un problema de comunicación entre WebUI y `lqosd`, y confirme la salud real del scheduler en los logs antes de asumir que falló el shaping.
 Si falla un subproceso de integración pero el shaping puede continuar con la última topología válida, el scheduler puede seguir mostrando estado ready, pero el último error de integración permanece visible en el estado del scheduler hasta la siguiente integración exitosa.
+Si el scheduler no puede leer `lqos_overrides.json` o sus capas materializadas porque otro proceso mantiene el lock de overrides, las versiones actuales reintentan brevemente y luego bloquean esa recarga. La topología anterior permanece en uso, y el error del scheduler incluye detalles del proceso que mantiene el lock, como PID, nombre de proceso, operación y hora de creación cuando estén disponibles.
 
 Si aparece caído/desactualizado:
 
