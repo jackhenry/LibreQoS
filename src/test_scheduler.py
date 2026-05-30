@@ -1525,6 +1525,10 @@ class TestSchedulerOverrideMerge(unittest.TestCase):
         mock_write_network.assert_not_called()
         mock_write_sd.assert_not_called()
         mock_write_canonical.assert_called_once()
+        rate_input = canonical_state["nodes"][0]["rate_input"]
+        self.assertEqual(rate_input["source"], "operator_override")
+        self.assertEqual(rate_input["intrinsic_download_mbps"], 80)
+        self.assertEqual(rate_input["intrinsic_upload_mbps"], 40)
 
     def test_override_devices_to_rows_preserves_anchor_node_id(self):
         header = [

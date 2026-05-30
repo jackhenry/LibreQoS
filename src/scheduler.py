@@ -1070,7 +1070,7 @@ def apply_network_adjustments_to_canonical_state(canonical_state: dict, adjustme
                     rate_input['legacy_imported_upload_mbps'] = normalized_upload
                     nodes_changed = True
                 if download is not None or upload is not None:
-                    rate_input['source'] = 'compatibility_export'
+                    rate_input['source'] = 'operator_override'
         elif adj_type == 'set_node_virtual':
             target_name = adj.get('node_name', '')
             virtual_val = adj.get('virtual', None)

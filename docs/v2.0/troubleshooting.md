@@ -283,6 +283,25 @@ journalctl -u lqosd --since "10 minutes ago"
 
 If still blank under normal traffic, collect recent logs and open an issue.
 
+### Circuits show Generated_PN instead of network.json node names
+
+If a DIY/manual deployment uses `network.json` and `ShapedDevices.csv`, but the Circuit page shows parents such as `Generated_PN_1`, check the runtime shaping inputs:
+
+```bash
+jq '.circuits[] | {circuit_id, logical_parent_node_name, effective_parent_node_name, resolution_source}' /opt/libreqos/state/shaping/shaping_inputs.json
+```
+
+If `resolution_source` is `flat_bucket`, LibreQoS is in flat topology mode. That mode intentionally assigns circuits to generated CPU bucket queues instead of shaping them under the named `Parent Node` hierarchy.
+
+To shape circuits under the node names from `network.json`, set:
+
+```toml
+[topology]
+compile_mode = "full"
+```
+
+Then reload or wait for the scheduler to regenerate `network.effective.json` and `shaping_inputs.json`.
+
 ### Site Map appears blank or slow
 
 Site Map has one extra dependency beyond normal WebUI data feeds: current builds fetch bbox/bootstrap data and raster tiles from `https://insight.libreqos.com`.

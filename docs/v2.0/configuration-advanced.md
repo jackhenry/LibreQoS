@@ -88,6 +88,17 @@ If built-in integration mode is enabled, the integration and topology compiler o
 - Use WebUI/manual edits for short operational adjustments only.
 - Put permanent changes in your integration system, integration overrides, or declared external source of truth workflow.
 
+#### Topology compile mode for DIY/manual files
+
+For DIY/manual deployments that maintain `network.json` and `ShapedDevices.csv`, use a hierarchy-preserving mode when circuits should shape under the `Parent Node` names from `network.json`:
+
+```toml
+[topology]
+compile_mode = "full"
+```
+
+Use `compile_mode = "flat"` only when hierarchy is not part of the shaping plan. In flat mode, LibreQoS assigns circuits to generated CPU bucket queues such as `Generated_PN_1`; the original `Parent Node` remains a logical reference, but the effective shaping parent in `shaping_inputs.json` will be a generated bucket with `resolution_source: "flat_bucket"`.
+
 #### Static queue visibility policy
 
 Current builds separate logical topology from queue-visible topology.

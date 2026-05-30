@@ -26,6 +26,8 @@ Comportamiento clave:
 - Su flujo externo es donde deben hacerse los cambios permanentes.
 - Las ediciones por WebUI son válidas para cambios operativos rápidos.
 - Mantenga los cambios de largo plazo en sus scripts o automatización.
+- Use `topology.compile_mode = "full"` cuando los valores `Parent Node` de `ShapedDevices.csv` deban moldear bajo la jerarquía nombrada en `network.json`.
+- Use `flat` solo cuando las colas generadas por CPU, como `Generated_PN_1`, sean la topología de colas deseada.
 
 ## Modo archivos manuales
 
@@ -35,6 +37,8 @@ Comportamiento clave:
 - Es más adecuado para redes pequeñas, pilotos cortos o soluciones temporales.
 - La WebUI le ayuda a validar lo que LibreQoS está usando.
 - Requiere disciplina manual porque no hay un sistema superior que mantenga esos archivos sincronizados.
+- Use `topology.compile_mode = "full"` cuando el shaping por padres superiores, AP o Sitio deba seguir `network.json`.
+- Si `shaping_inputs.json` muestra `resolution_source: "flat_bucket"`, LibreQoS está en modo flat y los circuitos mostrarán colas padre generadas en vez de los nombres de `network.json`.
 
 ## Lista de verificación de modo (antes de producción)
 

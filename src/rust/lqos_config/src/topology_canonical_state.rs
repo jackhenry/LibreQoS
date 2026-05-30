@@ -37,6 +37,8 @@ pub enum TopologyCanonicalIngressKind {
 pub enum TopologyCanonicalRateInputSource {
     /// The canonical node rate input came from the richest available attachment metadata.
     AttachmentMax,
+    /// The canonical node rate input came from an operator-saved rate override.
+    OperatorOverride,
     /// The canonical node rate input came from an imported legacy `network.json`.
     ImportedNetworkJson,
     /// The canonical node rate input came from the compatibility export tree.

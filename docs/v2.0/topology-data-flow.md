@@ -110,6 +110,15 @@ Operator-managed files remain the ingress contract.
   - `network.effective.json`
   - `shaping_inputs.json`
 
+For DIY/manual deployments that expect the `Parent Node` column in `ShapedDevices.csv` to shape under named nodes from `network.json`, use a hierarchy-preserving topology mode such as:
+
+```toml
+[topology]
+compile_mode = "full"
+```
+
+Do not use `compile_mode = "flat"` for hierarchy-based parent shaping. Flat mode intentionally assigns circuits to generated CPU bucket queues such as `Generated_PN_1`; `shaping_inputs.json` will show `resolution_source: "flat_bucket"` for those circuits.
+
 ```{mermaid}
 flowchart LR
     A[Built-in Integration Mode] --> B[topology_import.json]
@@ -142,6 +151,8 @@ flowchart LR
 ## Runtime Fallback Warnings
 
 When a circuit references a parent or anchor that is not present in the queue-visible effective topology, LibreQoS still shapes the circuit under a generated parent node. Scheduler output summarizes those fallbacks by reason and includes a few example circuits instead of printing one warning per circuit. Review the examples in Topology Manager or the source integration when those circuits should attach to a specific real site, AP, or parent node.
+
+This is different from explicit flat mode. If `shaping_inputs.json` shows `resolution_source: "flat_bucket"`, the generated parent node is expected flat-mode behavior. Switch `topology.compile_mode` away from `flat` when circuits should follow `network.json` parent names.
 
 ## Consumer Map
 
