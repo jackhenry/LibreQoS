@@ -73,6 +73,17 @@ Si el modo integración está habilitado, los ciclos de refresco suelen ser due�
 - Use edición manual/WebUI para ajustes operativos temporales.
 - Mantenga cambios permanentes en el sistema de integración, overrides de integración o flujo externo declarado.
 
+### Modo de compilación de topología para archivos DIY/manuales
+
+Para despliegues DIY/manuales que mantienen `network.json` y `ShapedDevices.csv`, use un modo que conserve jerarquía cuando los circuitos deban moldearse bajo los nombres `Parent Node` de `network.json`:
+
+```toml
+[topology]
+compile_mode = "full"
+```
+
+Use `compile_mode = "flat"` solo cuando la jerarquía no forme parte del plan de shaping. En modo flat, LibreQoS asigna los circuitos a colas generadas por CPU, como `Generated_PN_1`; el `Parent Node` original queda como referencia lógica, pero el padre efectivo de shaping en `shaping_inputs.json` será una cola generada con `resolution_source: "flat_bucket"`.
+
 ### Overrides en runtime (`lqos_overrides.json`)
 
 LibreQoS también permite ajustes de runtime mediante `lqos_overrides.json` en el `lqos_directory`.

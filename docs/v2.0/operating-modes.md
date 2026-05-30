@@ -43,6 +43,8 @@ Key behavior:
 - Your external workflow is where permanent changes belong.
 - WebUI edits are fine for quick operational changes.
 - Keep your long-term changes in your own scripts or automation.
+- Use `topology.compile_mode = "full"` when the `Parent Node` values in `ShapedDevices.csv` should shape under the named hierarchy in `network.json`.
+- Use `flat` only when generated CPU bucket queues such as `Generated_PN_1` are the intended queue layout.
 
 ## Manual Files Mode
 
@@ -52,6 +54,8 @@ Key behavior:
 - Best fit for small networks, short pilots, or temporary workarounds.
 - WebUI helps you validate what LibreQoS is using.
 - Manual discipline matters because there is no upstream system keeping those files in sync for you.
+- Use `topology.compile_mode = "full"` when top-level or AP/Site parent shaping should follow `network.json`.
+- If `shaping_inputs.json` shows `resolution_source: "flat_bucket"`, LibreQoS is in flat mode and circuits will show generated parent queues instead of the names from `network.json`.
 
 ## Mode Declaration Checklist (Before Go-Live)
 

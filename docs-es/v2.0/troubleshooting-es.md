@@ -216,6 +216,25 @@ journalctl -u lqosd --since "10 minutes ago"
 
 Si sigue en blanco con tráfico normal, recolecte logs y abra issue.
 
+### Los circuitos muestran Generated_PN en vez de nombres de network.json
+
+Si un despliegue DIY/manual usa `network.json` y `ShapedDevices.csv`, pero la página de Circuitos muestra padres como `Generated_PN_1`, revise las entradas de shaping runtime:
+
+```bash
+jq '.circuits[] | {circuit_id, logical_parent_node_name, effective_parent_node_name, resolution_source}' /opt/libreqos/state/shaping/shaping_inputs.json
+```
+
+Si `resolution_source` es `flat_bucket`, LibreQoS está en modo de topología flat. Ese modo asigna intencionalmente los circuitos a colas generadas por CPU en vez de moldearlos bajo la jerarquía nombrada por `Parent Node`.
+
+Para moldear circuitos bajo los nombres de nodo de `network.json`, configure:
+
+```toml
+[topology]
+compile_mode = "full"
+```
+
+Después recargue o espere al scheduler para regenerar `network.effective.json` y `shaping_inputs.json`.
+
 ### Colisión de promoción de nodo virtual (`network.json`)
 
 Si `LibreQoS.py` falla con `Virtual node promotion collision: 'AP_A' already exists at this level.`, hay un nodo con `"virtual": true` cuyos hijos colisionan por nombre al promoverse.

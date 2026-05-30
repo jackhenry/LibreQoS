@@ -102,7 +102,10 @@ Choose this only if another internal process already writes LibreQoS-compatible 
 Do this now:
 1. Configure shared topology behavior under `Integration - Common`.
 2. Publish `network.json` and `ShapedDevices.csv` from your own process.
-3. Reload or wait for the scheduler so LibreQoS can validate and use those files.
+3. Use `topology.compile_mode = "full"` if circuits should shape under the named `Parent Node` hierarchy from `network.json`.
+4. Reload or wait for the scheduler so LibreQoS can validate and use those files.
+
+Do not use `topology.compile_mode = "flat"` when you expect `Parent Node` values from `ShapedDevices.csv` to create top-level shaping queues. In flat mode, LibreQoS intentionally assigns circuits to generated CPU bucket queues such as `Generated_PN_1`.
 
 Next:
 - [Operating Modes and Source of Truth](operating-modes.md)
@@ -115,8 +118,11 @@ Choose this only if you intentionally want LibreQoS to own the files directly.
 Do this now:
 1. Build `network.json`.
 2. Build `ShapedDevices.csv`.
-3. Use the WebUI editors or file-based workflow to maintain them.
-4. Confirm the scheduler accepts the data and the expected topology appears.
+3. Set `topology.compile_mode = "full"` if the `Parent Node` column should shape under the named nodes in `network.json`.
+4. Use the WebUI editors or file-based workflow to maintain them.
+5. Confirm the scheduler accepts the data and the expected topology appears.
+
+Use `flat` only when you want generated CPU bucket queues instead of hierarchy-based parent queues.
 
 Next:
 - [Advanced Configuration Reference](configuration-advanced.md)

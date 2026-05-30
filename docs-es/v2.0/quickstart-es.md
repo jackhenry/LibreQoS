@@ -107,7 +107,10 @@ Elija esta opción solo si otro proceso interno ya escribe archivos compatibles 
 Haga esto ahora:
 1. Configure el comportamiento compartido de topología en `Integration - Common`.
 2. Publique `network.json` y `ShapedDevices.csv` desde su propio proceso.
-3. Recargue o espere al scheduler para que LibreQoS valide y use esos archivos.
+3. Use `topology.compile_mode = "full"` si los circuitos deben moldearse bajo la jerarquía nombrada por `Parent Node` en `network.json`.
+4. Recargue o espere al scheduler para que LibreQoS valide y use esos archivos.
+
+No use `topology.compile_mode = "flat"` si espera que los valores `Parent Node` de `ShapedDevices.csv` creen colas superiores de shaping. En modo flat, LibreQoS asigna intencionalmente los circuitos a colas generadas por CPU, como `Generated_PN_1`.
 
 Siguiente:
 - [Modos de operación y fuente de verdad](operating-modes-es.md)
@@ -120,8 +123,11 @@ Elija esta opción solo si quiere que LibreQoS mantenga directamente esos archiv
 Haga esto ahora:
 1. Construya `network.json`.
 2. Construya `ShapedDevices.csv`.
-3. Manténgalos con los editores de WebUI o con su flujo basado en archivos.
-4. Confirme que el scheduler acepta los datos y que aparece la topología esperada.
+3. Configure `topology.compile_mode = "full"` si la columna `Parent Node` debe moldear bajo los nodos nombrados en `network.json`.
+4. Manténgalos con los editores de WebUI o con su flujo basado en archivos.
+5. Confirme que el scheduler acepta los datos y que aparece la topología esperada.
+
+Use `flat` solo cuando quiera colas generadas por CPU en vez de colas padre basadas en jerarquía.
 
 Siguiente:
 - [Referencia avanzada de configuración](configuration-advanced-es.md)

@@ -4571,6 +4571,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_operator_override_rates_still_cap_nodes() {
+        let mut root = sample_effective_bandwidth_tree();
+        let canonical = TopologyCanonicalStateFile {
+            ingress_kind: TopologyCanonicalIngressKind::NativeIntegration,
+            nodes: vec![
+                canonical_node_with_rate_source(
+                    "site-hoodoo",
+                    "Hoodoo Hill",
+                    774,
+                    774,
+                    TopologyCanonicalRateInputSource::AttachmentMax,
+                ),
+                canonical_node_with_rate_source(
+                    "ap-thunderhill",
+                    "HoodooHill-Thunderhill",
+                    300,
+                    300,
+                    TopologyCanonicalRateInputSource::OperatorOverride,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        super::recompile_effective_network_bandwidths(
+            &mut root,
+            &canonical,
+            &TopologyEditorStateFile::default(),
+            &TopologyEffectiveStateFile::default(),
+        );
+
+        let ap = root["Hoodoo Hill"]["children"]["HoodooHill-Thunderhill"]
+            .as_object()
+            .expect("AP node should exist");
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "downloadBandwidthMbps"),
+            Some(300)
+        );
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "uploadBandwidthMbps"),
+            Some(300)
+        );
+    }
+
     fn write_runtime_json_fixture(path: PathBuf, value: &Value, label: &str) {
         let parent = path
             .parent()
