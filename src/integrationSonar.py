@@ -70,6 +70,10 @@ def sonarAccountIpAssignmentDeviceNodeId(account_id):
   return f"sonar:account-ip-assignments:{account_id}"
 
 
+def sonarUninventoriedMacAddressDeviceNodeId(uninventoried_mac_address_id):
+  return f"sonar:uninventoried-mac-address:{uninventoried_mac_address_id}"
+
+
 def sonarSession():
   global _SONAR_SESSION
   if _SONAR_SESSION is None:
@@ -480,6 +484,25 @@ def buildAccountDevices(account):
       'source': 'account_ip_assignments',
     })
 
+  for uninventoried_mac_address in account.get('uninventoried_mac_addresses', {}).get('entities', []):
+    mac_address = (uninventoried_mac_address.get('mac_address') or '').strip()
+    uninventoried_mac_address_ips = [
+      ip['subnet']
+      for ip in uninventoried_mac_address.get('ip_assignments', {}).get('entities', [])
+      if ip.get('subnet') and ip['subnet'] not in known_ip_subnets
+    ]
+    if not uninventoried_mac_address_ips:
+      continue
+    known_ip_subnets.update(uninventoried_mac_address_ips)
+    devices.append({
+      'id': sonarUninventoriedMacAddressDeviceNodeId(uninventoried_mac_address['id']),
+      'raw_id': uninventoried_mac_address['id'],
+      'name': f"Uninventoried MAC Address: {mac_address}" if mac_address else "Uninventoried MAC Address",
+      'ips': uninventoried_mac_address_ips,
+      'mac': mac_address,
+      'source': 'uninventoried_mac_addresses',
+    })
+
   return devices
 
 
@@ -629,6 +652,17 @@ def getAccounts(sonar_active_status_ids):
                         }
                       }
                     }
+                    uninventoried_mac_addresses {
+                      entities {
+                        id
+                        mac_address
+                        ip_assignments {
+                          entities {
+                            subnet
+                          }
+                        }
+                      }
+                    }
                     child_accounts {
                       entities {
                         id
@@ -687,6 +721,17 @@ def getAccounts(sonar_active_status_ids):
                         radius_accounts {
                           entities {
                             id
+                            ip_assignments {
+                              entities {
+                                subnet
+                              }
+                            }
+                          }
+                        }
+                        uninventoried_mac_addresses {
+                          entities {
+                            id
+                            mac_address
                             ip_assignments {
                               entities {
                                 subnet
