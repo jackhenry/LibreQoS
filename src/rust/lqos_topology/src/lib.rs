@@ -3430,8 +3430,9 @@ fn recompile_effective_network_bandwidths(
         .map(|node| (node.node_id.as_str(), node))
         .collect::<HashMap<_, _>>();
     let selected_attachment_caps = selected_attachment_rate_caps(ui_state, effective);
-    let use_compatibility_export_rates =
-        canonical.ingress_kind != TopologyCanonicalIngressKind::NativeIntegration;
+    let use_compatibility_export_rates = canonical.ingress_kind
+        != TopologyCanonicalIngressKind::NativeIntegration
+        || canonical.source.starts_with("uisp/");
     for node in root.values_mut() {
         recompile_effective_bandwidths_for_value(
             node,
@@ -4546,6 +4547,51 @@ mod tests {
                     214,
                     773,
                     TopologyCanonicalRateInputSource::ImportedNetworkJson,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        super::recompile_effective_network_bandwidths(
+            &mut root,
+            &canonical,
+            &TopologyEditorStateFile::default(),
+            &TopologyEffectiveStateFile::default(),
+        );
+
+        let ap = root["Hoodoo Hill"]["children"]["HoodooHill-Thunderhill"]
+            .as_object()
+            .expect("AP node should exist");
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "downloadBandwidthMbps"),
+            Some(214)
+        );
+        assert_eq!(
+            super::node_bandwidth_mbps(ap, "uploadBandwidthMbps"),
+            Some(773)
+        );
+    }
+
+    #[test]
+    fn native_uisp_compatibility_export_rates_still_cap_ap_nodes() {
+        let mut root = sample_effective_bandwidth_tree();
+        let canonical = TopologyCanonicalStateFile {
+            source: "uisp/full".to_string(),
+            ingress_kind: TopologyCanonicalIngressKind::NativeIntegration,
+            nodes: vec![
+                canonical_node_with_rate_source(
+                    "site-hoodoo",
+                    "Hoodoo Hill",
+                    774,
+                    774,
+                    TopologyCanonicalRateInputSource::AttachmentMax,
+                ),
+                canonical_node_with_rate_source(
+                    "ap-thunderhill",
+                    "HoodooHill-Thunderhill",
+                    214,
+                    773,
+                    TopologyCanonicalRateInputSource::CompatibilityExport,
                 ),
             ],
             ..Default::default()
