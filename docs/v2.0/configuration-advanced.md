@@ -193,6 +193,7 @@ attach_to = "" # optional network.json node name
 Notes:
 - `ip_range` must be a CIDR. `0.0.0.0` (and `::`) are allowed shorthands for the match-all `/0` networks.
 - `attach_to` is a `network.json` node name (optional; empty is allowed).
+- Unknown-IP promotions are applied to Bakery asynchronously. Repeated observations for the same promoted circuit are deduplicated while the live overlay is queued or waiting for Bakery.
 
 #### CRM/NMS Integrations
 
