@@ -804,7 +804,7 @@ async fn persistent_connection(
                     message = timeout(TCP_TIMEOUT, read.next()) => {
                         let Ok(Some(Ok(message))) = message else {
                             // Timeout hit
-                            error!("Timeout or read error on WSS read");
+                            debug!("Timeout or read error on WSS read");
                             break 'message_pump;
                         };
                         match message {
