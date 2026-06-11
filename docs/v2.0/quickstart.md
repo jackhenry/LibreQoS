@@ -49,7 +49,10 @@ On affected Ubuntu 24.04 hosts using `systemd-networkd`, the `.deb` install may 
 If that happens, run:
 
 ```bash
-sudo /opt/libreqos/src/systemd_hotfix.sh install
+cd /tmp/
+sudo apt-get update
+sudo HOTFIX_PACKAGE_VERSION=255.4-1ubuntu9999+libreqos1 /opt/libreqos/src/systemd_hotfix.sh install
+sudo dpkg --configure -a
 sudo reboot
 ```
 
