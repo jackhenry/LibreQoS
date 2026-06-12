@@ -39,7 +39,15 @@ sudo /opt/libreqos/src/systemd_hotfix.sh install
 sudo reboot
 ```
 
-The hotfix installer bootstraps the LibreQoS APT repo at `https://repo.libreqos.com`, installs the patched Noble `systemd` package set, and pins those packages for future updates.
+The hotfix installer bootstraps the signed LibreQoS APT repo at `https://repo.libreqos.com`, installs the patched Noble `systemd` package set, and pins those packages for future updates.
+By default, it selects the current hotfix version from that repo.
+If LibreQoS support tells you that your installed package is older than v2.2, use this recovery command instead:
+
+```bash
+sudo HOTFIX_PACKAGE_VERSION=255.4-1ubuntu9999+libreqos1 /opt/libreqos/src/systemd_hotfix.sh install
+sudo dpkg --configure -a
+sudo reboot
+```
 
 After the reboot, resume the upgrade and restart services:
 
@@ -101,6 +109,8 @@ If the script reports that the hotfix should be offered, install it and reboot b
 sudo ./systemd_hotfix.sh install
 sudo reboot
 ```
+
+The installer selects the current hotfix version from the signed LibreQoS APT repo. LibreQoS support may provide a `HOTFIX_PACKAGE_VERSION` override for a specific incident.
 
 Run the following commands to reload the LibreQoS services.
 
