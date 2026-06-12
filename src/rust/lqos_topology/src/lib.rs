@@ -2754,11 +2754,7 @@ fn resolved_auto_queue_visibility_policy(
     let Some(tree_node) = tree_node.and_then(Value::as_object) else {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     };
-    let is_site = tree_node
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("site"));
-    if !is_site {
+    if !queue_auto_node_kind_can_hide(tree_node) {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     }
     if child_branch_counts
@@ -2778,6 +2774,13 @@ fn resolved_auto_queue_visibility_policy(
     } else {
         TopologyQueueVisibilityPolicy::QueueVisible
     }
+}
+
+fn queue_auto_node_kind_can_hide(tree_node: &Map<String, Value>) -> bool {
+    tree_node
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "site" | "ap"))
 }
 
 fn apply_effective_topology_reparenting_only(
@@ -6867,6 +6870,201 @@ mod tests {
             .as_object()
             .expect("Aggregation should retain its logical children");
         assert!(aggregation_children.get("Edge POP").is_some());
+    }
+
+    fn ap_branch_fixture() -> (
+        Config,
+        Value,
+        TopologyEditorStateFile,
+        TopologyEffectiveStateFile,
+    ) {
+        let mut config = Config::default();
+        config.uisp_integration.enable_uisp = true;
+        config.topology.queue_auto_virtualize_threshold_mbps = 5_000;
+
+        let editor_state = TopologyEditorStateFile {
+            schema_version: 1,
+            source: "uisp/full2".to_string(),
+            generated_unix: None,
+            ingress_identity: None,
+            nodes: vec![
+                TopologyEditorNode {
+                    node_id: "site-root".to_string(),
+                    node_name: "Core".to_string(),
+                    latitude: None,
+                    longitude: None,
+                    current_parent_node_id: None,
+                    current_parent_node_name: None,
+                    current_attachment_id: None,
+                    current_attachment_name: None,
+                    can_move: false,
+                    allowed_parents: Vec::new(),
+                    queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+                    preferred_attachment_id: None,
+                    preferred_attachment_name: None,
+                    effective_attachment_id: None,
+                    effective_attachment_name: None,
+                },
+                TopologyEditorNode {
+                    node_id: "ap-agg".to_string(),
+                    node_name: "Aggregation Switch".to_string(),
+                    latitude: None,
+                    longitude: None,
+                    current_parent_node_id: Some("site-root".to_string()),
+                    current_parent_node_name: Some("Core".to_string()),
+                    current_attachment_id: None,
+                    current_attachment_name: None,
+                    can_move: false,
+                    allowed_parents: Vec::new(),
+                    queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+                    preferred_attachment_id: None,
+                    preferred_attachment_name: None,
+                    effective_attachment_id: None,
+                    effective_attachment_name: None,
+                },
+                TopologyEditorNode {
+                    node_id: "ap-child".to_string(),
+                    node_name: "Access AP".to_string(),
+                    latitude: None,
+                    longitude: None,
+                    current_parent_node_id: Some("ap-agg".to_string()),
+                    current_parent_node_name: Some("Aggregation Switch".to_string()),
+                    current_attachment_id: None,
+                    current_attachment_name: None,
+                    can_move: false,
+                    allowed_parents: Vec::new(),
+                    queue_visibility_policy: TopologyQueueVisibilityPolicy::QueueVisible,
+                    preferred_attachment_id: None,
+                    preferred_attachment_name: None,
+                    effective_attachment_id: None,
+                    effective_attachment_name: None,
+                },
+            ],
+        };
+
+        let canonical = json!({
+            "Core": {
+                "children": {
+                    "Aggregation Switch": {
+                        "children": {
+                            "Access AP": {
+                                "children": {},
+                                "downloadBandwidthMbps": 1000,
+                                "id": "ap-child",
+                                "name": "Access AP",
+                                "type": "AP",
+                                "uploadBandwidthMbps": 1000
+                            }
+                        },
+                        "downloadBandwidthMbps": 10000,
+                        "id": "ap-agg",
+                        "name": "Aggregation Switch",
+                        "type": "AP",
+                        "uploadBandwidthMbps": 10000
+                    }
+                },
+                "downloadBandwidthMbps": 20000,
+                "id": "site-root",
+                "name": "Core",
+                "type": "Site",
+                "uploadBandwidthMbps": 20000
+            }
+        });
+
+        let effective = TopologyEffectiveStateFile {
+            schema_version: 1,
+            generated_unix: None,
+            canonical_generated_unix: None,
+            health_generated_unix: None,
+            nodes: vec![
+                TopologyEffectiveNodeState {
+                    node_id: "site-root".to_string(),
+                    logical_parent_node_id: String::new(),
+                    preferred_attachment_id: None,
+                    effective_attachment_id: None,
+                    fallback_reason: None,
+                    all_attachments_suppressed: false,
+                    attachments: vec![],
+                },
+                TopologyEffectiveNodeState {
+                    node_id: "ap-agg".to_string(),
+                    logical_parent_node_id: "site-root".to_string(),
+                    preferred_attachment_id: None,
+                    effective_attachment_id: None,
+                    fallback_reason: None,
+                    all_attachments_suppressed: false,
+                    attachments: vec![],
+                },
+                TopologyEffectiveNodeState {
+                    node_id: "ap-child".to_string(),
+                    logical_parent_node_id: "ap-agg".to_string(),
+                    preferred_attachment_id: None,
+                    effective_attachment_id: None,
+                    fallback_reason: None,
+                    all_attachments_suppressed: false,
+                    attachments: vec![],
+                },
+            ],
+        };
+
+        (config, canonical, editor_state, effective)
+    }
+
+    #[test]
+    fn queue_auto_marks_large_ap_branch_virtual_without_treeguard() {
+        let (config, canonical, editor_state, effective) = ap_branch_fixture();
+
+        let effective_network = apply_effective_topology_to_network_json(
+            &config,
+            &canonical,
+            &editor_state,
+            &effective,
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let aggregation = root["Core"]["children"]["Aggregation Switch"]
+            .as_object()
+            .expect("Aggregation Switch should remain visible as a virtual node");
+        assert_eq!(
+            aggregation.get("virtual").and_then(Value::as_bool),
+            Some(true)
+        );
+        let aggregation_children = aggregation["children"]
+            .as_object()
+            .expect("Aggregation Switch should retain its logical children");
+        assert!(aggregation_children.get("Access AP").is_some());
+    }
+
+    #[test]
+    fn queue_auto_keeps_large_ap_branch_visible_with_direct_circuit() {
+        let (config, canonical, editor_state, effective) = ap_branch_fixture();
+        let virtualization = QueueVirtualizationContext {
+            direct_circuit_node_ids: HashSet::from(["ap-agg".to_string()]),
+            forced_visible_node_names: HashSet::new(),
+        };
+        let canonical_state = TopologyCanonicalStateFile::from_editor_and_network(
+            &editor_state,
+            &canonical,
+            TopologyCanonicalIngressKind::NativeIntegration,
+        );
+
+        let effective_network = apply_effective_topology_to_network_json_from_canonical(
+            &config,
+            &canonical,
+            &canonical_state,
+            &editor_state,
+            &effective,
+            &virtualization,
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let aggregation = root["Core"]["children"]["Aggregation Switch"]
+            .as_object()
+            .expect("Aggregation Switch should remain exported");
+
+        assert_eq!(aggregation.get("virtual").and_then(Value::as_bool), None);
     }
 
     #[test]

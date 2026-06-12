@@ -70,7 +70,7 @@ pub enum TopologyAttachmentRole {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TopologyQueueVisibilityPolicy {
-    /// The node remains visible in the baseline queue topology.
+    /// The node remains visible unless automatic high-capacity branch rules hide it.
     #[default]
     QueueVisible,
     /// The node remains logical-only for queueing and its children are promoted one level.
