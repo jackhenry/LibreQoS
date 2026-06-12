@@ -2757,12 +2757,16 @@ fn resolved_auto_queue_visibility_policy(
     if !queue_auto_node_kind_can_hide(tree_node) {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     }
-    if child_branch_counts
+    let logical_child_count = child_branch_counts
         .get(ui_node.node_id.as_str())
         .copied()
-        .unwrap_or_default()
-        == 0
-    {
+        .unwrap_or_default();
+    let effective_child_count = tree_node
+        .get("children")
+        .and_then(Value::as_object)
+        .map(Map::len)
+        .unwrap_or_default();
+    if logical_child_count == 0 && effective_child_count == 0 {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     }
     let threshold = config.topology.queue_auto_virtualize_threshold_mbps;
@@ -7034,6 +7038,36 @@ mod tests {
             .as_object()
             .expect("Aggregation Switch should retain its logical children");
         assert!(aggregation_children.get("Access AP").is_some());
+    }
+
+    #[test]
+    fn queue_auto_marks_large_ap_branch_virtual_with_effective_tree_children() {
+        let (config, canonical, mut editor_state, effective) = ap_branch_fixture();
+        let access_ap = editor_state
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == "ap-child")
+            .expect("fixture should include Access AP");
+        access_ap.current_parent_node_id = Some("site-root".to_string());
+        access_ap.current_parent_node_name = Some("Core".to_string());
+
+        let effective_network = apply_effective_topology_to_network_json(
+            &config,
+            &canonical,
+            &editor_state,
+            &effective,
+        );
+        let root = effective_network
+            .as_object()
+            .expect("effective export should remain an object tree");
+        let aggregation = root["Core"]["children"]["Aggregation Switch"]
+            .as_object()
+            .expect("Aggregation Switch should remain visible as a virtual node");
+
+        assert_eq!(
+            aggregation.get("virtual").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
