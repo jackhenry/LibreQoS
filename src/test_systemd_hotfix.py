@@ -77,10 +77,13 @@ class SystemdHotfixScriptTest(unittest.TestCase):
                 #!/bin/sh
                 [ "${HOTFIX_TEST_APT_CACHE_FAIL:-0}" = "1" ] && exit 12
 
+                command="$1"
                 package="$2"
                 version="${HOTFIX_TEST_CANDIDATE_VERSION:-255.4-1ubuntu9999+libreqos1}"
                 priority="${HOTFIX_TEST_CANDIDATE_PRIORITY:-1001}"
                 repo_line="${HOTFIX_TEST_REPO_LINE:-        500 https://repo.libreqos.com noble/main amd64 Packages}"
+                madison_repo_url="${HOTFIX_TEST_MADISON_REPO_URL:-https://repo.libreqos.com}"
+                madison_dist_component="${HOTFIX_TEST_MADISON_DIST_COMPONENT:-noble/main}"
 
                 case ",${HOTFIX_TEST_INCONSISTENT_PACKAGES:-}," in
                   *,"$package",*) version="${HOTFIX_TEST_OTHER_VERSION:-255.4-1ubuntu9999+libreqos2}" ;;
@@ -88,6 +91,11 @@ class SystemdHotfixScriptTest(unittest.TestCase):
 
                 if [ "${HOTFIX_TEST_NO_CANDIDATE_FOR:-}" = "$package" ]; then
                   version="(none)"
+                fi
+
+                if [ "$command" = "madison" ]; then
+                  printf '   %s | %s | %s %s amd64 Packages\\n' "$package" "$version" "$madison_repo_url" "$madison_dist_component"
+                  exit 0
                 fi
 
                 cat <<POLICY
@@ -161,6 +169,29 @@ class SystemdHotfixScriptTest(unittest.TestCase):
         self.assertNotIn("libnss-resolve=", apt_log)
         self.assertIn("package_version=255.4-1ubuntu9999+libreqos1", marker)
 
+    def test_auto_accepts_policy_repo_url_with_trailing_slash(self):
+        result, apt_log, marker = self.run_install(
+            {
+                "HOTFIX_TEST_REPO_LINE": (
+                    "        500 https://repo.libreqos.com/ noble/main amd64 Packages"
+                ),
+                "HOTFIX_TEST_MADISON_REPO_URL": "https://example.invalid",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("systemd=255.4-1ubuntu9999+libreqos1", apt_log)
+        self.assertIn("package_version=255.4-1ubuntu9999+libreqos1", marker)
+
+    def test_auto_uses_madison_when_policy_source_line_is_unrecognized(self):
+        result, apt_log, marker = self.run_install(
+            {"HOTFIX_TEST_REPO_LINE": "        release o=LibreQoS,l=LibreQoS,n=noble"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("systemd=255.4-1ubuntu9999+libreqos1", apt_log)
+        self.assertIn("package_version=255.4-1ubuntu9999+libreqos1", marker)
+
     def test_auto_rejects_ubuntu_candidate(self):
         result, _, _ = self.run_install(
             {"HOTFIX_TEST_CANDIDATE_VERSION": "255.4-1ubuntu8.16"}
@@ -198,7 +229,8 @@ class SystemdHotfixScriptTest(unittest.TestCase):
             {
                 "HOTFIX_TEST_REPO_LINE": (
                     "        500 https://example.invalid noble/main amd64 Packages"
-                )
+                ),
+                "HOTFIX_TEST_MADISON_REPO_URL": "https://example.invalid",
             }
         )
 
@@ -210,7 +242,8 @@ class SystemdHotfixScriptTest(unittest.TestCase):
             {
                 "HOTFIX_TEST_REPO_LINE": (
                     "        500 https://repo.libreqos.com.evil noble/main amd64 Packages"
-                )
+                ),
+                "HOTFIX_TEST_MADISON_REPO_URL": "https://repo.libreqos.com.evil",
             }
         )
 

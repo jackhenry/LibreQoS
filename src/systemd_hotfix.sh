@@ -175,6 +175,15 @@ apt_candidate_has_hotfix_repo() {
         -v version="$version" \
         -v repo_url="$repo_url" \
         -v dist_component="${HOTFIX_REPO_DIST}/${HOTFIX_REPO_COMPONENT}" '
+        function normalized_url(url) {
+            sub(/\/+$/, "", url)
+            return url
+        }
+
+        BEGIN {
+            repo_url = normalized_url(repo_url)
+        }
+
         ($1 == "***" && $2 == version) || ($1 == version && $2 ~ /^[0-9]+$/) {
             in_version = 1
             next
@@ -184,9 +193,50 @@ apt_candidate_has_hotfix_repo() {
             in_version = 0
         }
 
-        in_version && $1 ~ /^[0-9]+$/ && $2 == repo_url && $3 == dist_component {
+        in_version && $1 ~ /^[0-9]+$/ && normalized_url($2) == repo_url && $3 == dist_component {
             found = 1
             exit
+        }
+
+        END { if (!found) exit 1 }
+    '
+}
+
+apt_madison_has_hotfix_repo() {
+    local package="$1"
+    local version="$2"
+    local repo_url="${HOTFIX_REPO_URL%/}"
+
+    LC_ALL=C apt-cache madison "$package" | awk \
+        -F '|' \
+        -v version="$version" \
+        -v repo_url="$repo_url" \
+        -v dist_component="${HOTFIX_REPO_DIST}/${HOTFIX_REPO_COMPONENT}" '
+        function trim(text) {
+            gsub(/^[ \t]+|[ \t]+$/, "", text)
+            return text
+        }
+
+        function normalized_url(url) {
+            sub(/\/+$/, "", url)
+            return url
+        }
+
+        BEGIN {
+            repo_url = normalized_url(repo_url)
+        }
+
+        {
+            candidate_version = trim($2)
+            source = trim($3)
+            split(source, source_parts, /[ \t]+/)
+
+            if (candidate_version == version &&
+                normalized_url(source_parts[1]) == repo_url &&
+                source_parts[2] == dist_component) {
+                found = 1
+                exit
+            }
         }
 
         END { if (!found) exit 1 }
@@ -211,7 +261,9 @@ resolve_hotfix_package_version() {
         [[ "$priority" =~ ^[0-9]+$ ]] || fail "Unable to verify LibreQoS APT pin priority for $package=$version."
         (( priority >= 1001 )) || fail "APT candidate for $package=$version is not pinned from the LibreQoS hotfix repo."
         # apt-cache reports the pin on the version line; the matching source line can remain at archive priority 500.
-        apt_candidate_has_hotfix_repo "$package" "$version" || fail "APT candidate for $package=$version is not from $HOTFIX_REPO_URL $HOTFIX_REPO_DIST/$HOTFIX_REPO_COMPONENT."
+        apt_candidate_has_hotfix_repo "$package" "$version" || \
+            apt_madison_has_hotfix_repo "$package" "$version" || \
+            fail "APT candidate for $package=$version is not from $HOTFIX_REPO_URL $HOTFIX_REPO_DIST/$HOTFIX_REPO_COMPONENT."
 
         if [[ -z "${resolved_version:-}" ]]; then
             resolved_version="$version"
