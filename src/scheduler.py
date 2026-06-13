@@ -33,6 +33,7 @@ shaping_runtime_hash = 0
 INTEGRATION_FAILURE_PREVIEW_LINES = 30
 INTEGRATION_FAILURE_PREVIEW_CHARS = 4000
 TOPOLOGY_RUNTIME_REFRESH_SECONDS = 3
+TOPOLOGY_RUNTIME_REFRESH_PHASE_WARN_SECONDS = 1.0
 STARTUP_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 PARTIAL_TOPOLOGY_RUNTIME_MAX_WAIT_SECONDS = 120
 SCHEDULER_STARTUP_STEP_COUNT = 5
@@ -1669,6 +1670,13 @@ def ensure_topology_runtime_process(wait_for_outputs=False):
     return True
 
 
+def _record_slow_topology_runtime_refresh_phase(phase: str, started: float, slow_phases: list[str]):
+    elapsed = time.monotonic() - started
+    if elapsed >= TOPOLOGY_RUNTIME_REFRESH_PHASE_WARN_SECONDS:
+        slow_phases.append(f"{phase} {elapsed:.1f}s")
+    return elapsed
+
+
 def topology_runtime_refresh_tick():
     global shaping_runtime_hash
 
@@ -1683,24 +1691,48 @@ def topology_runtime_refresh_tick():
     if shaping_runtime_hash == 0:
         return
 
+    tick_started = time.monotonic()
+    slow_phases = []
+    phase_started = time.monotonic()
     ensure_topology_runtime_process()
+    _record_slow_topology_runtime_refresh_phase("ensure_runtime_process", phase_started, slow_phases)
+
+    phase_started = time.monotonic()
     ready, _, _ = topology_runtime_readiness_detail()
+    _record_slow_topology_runtime_refresh_phase("readiness_detail", phase_started, slow_phases)
     if not ready:
         return
+
+    phase_started = time.monotonic()
     new_hash = calculate_shaping_runtime_hash()
+    _record_slow_topology_runtime_refresh_phase("calculate_shaping_runtime_hash", phase_started, slow_phases)
     if new_hash == 0 or new_hash == shaping_runtime_hash:
         return
 
+    refresh_started = time.monotonic()
     try:
         refreshShapers()
     except ValidationFailure as e:
+        elapsed = time.monotonic() - refresh_started
+        phase_summary = f"; slow phases: {', '.join(slow_phases)}" if slow_phases else ""
+        print(
+            f"Topology runtime refresh for shaping runtime hash {new_hash} "
+            f"(previous {shaping_runtime_hash}) blocked by validation after {elapsed:.1f}s{phase_summary}"
+        )
         report_scheduler_validation_failure("Topology runtime refresh blocked by validation", e)
         return
     except Exception as e:
+        elapsed = time.monotonic() - refresh_started
+        phase_summary = f"; slow phases: {', '.join(slow_phases)}" if slow_phases else ""
+        print(
+            f"Topology runtime refresh for shaping runtime hash {new_hash} "
+            f"(previous {shaping_runtime_hash}) failed after {elapsed:.1f}s{phase_summary}"
+        )
         if _defer_stale_shaping_inputs_failure(e, startup=False):
             return
         report_scheduler_runtime_failure("Topology runtime refresh failed", e)
         return
+    refresh_elapsed = _record_slow_topology_runtime_refresh_phase("refreshShapers", refresh_started, slow_phases)
     mark_shaping_runtime_hash_applied(new_hash)
     if shaping_runtime_hash == 0:
         report_scheduler_runtime_failure(
@@ -1709,6 +1741,13 @@ def topology_runtime_refresh_tick():
         )
         return
     clear_scheduler_error_unless_integration_failed()
+    total_elapsed = time.monotonic() - tick_started
+    if slow_phases:
+        print(
+            f"Topology runtime refresh applied shaping runtime hash {new_hash} "
+            f"in {total_elapsed:.1f}s (refreshShapers {refresh_elapsed:.1f}s); "
+            f"slow phases: {', '.join(slow_phases)}"
+        )
     publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
 
 
