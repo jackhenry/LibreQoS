@@ -351,16 +351,13 @@ pub async fn retry_shaping(
 #[cfg(test)]
 mod tests {
     use super::{MergeNetworkModeError, merge_network_mode};
+    use crate::test_support::runtime_config_test_lock;
     use lqos_config::{BridgeConfig, Config, SingleInterfaceConfig};
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_config_env<T>(test_fn: impl FnOnce() -> T) -> T {
-        let _guard = env_lock().lock().expect("network-mode env lock");
+        let _guard = runtime_config_test_lock()
+            .lock()
+            .expect("network-mode env lock should not be poisoned");
         let old_lqos_config = std::env::var_os("LQOS_CONFIG");
         let config_path = std::env::temp_dir().join(format!(
             "lqosd-network-mode-test-{}.toml",
