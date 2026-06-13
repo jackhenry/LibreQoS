@@ -60,6 +60,18 @@ class RequiredOverrideReadError(RuntimeError):
     """Raised when scheduler reloads cannot safely materialize operator overrides."""
 
 
+def mark_shaping_runtime_hash_applied(applied_hash):
+    """
+    Record the runtime payload that a completed shaper refresh targeted.
+
+    If topology runtime publishes a newer payload while refreshShapers() is
+    running, the next topology tick must still see that newer payload as
+    unapplied and run another refresh.
+    """
+    global shaping_runtime_hash
+    shaping_runtime_hash = applied_hash
+
+
 def configure_scheduler_stdio():
     """
     Enable line-buffered scheduler logs when running under systemd.
@@ -1109,6 +1121,7 @@ def importAndShapeFullReload():
         )
         return False
     publish_scheduler_progress(True, "initial_shaping_reload", "Refreshing shaper state", 5, SCHEDULER_STARTUP_STEP_COUNT)
+    refresh_target_hash = calculate_shaping_runtime_hash()
     if not enable_insight_topology():
         try:
             refreshShapers()
@@ -1116,9 +1129,7 @@ def importAndShapeFullReload():
             if _defer_stale_shaping_inputs_failure(e, startup=True):
                 return False
             raise
-        shaping_runtime_hash = calculate_shaping_runtime_hash()
-    else:
-        shaping_runtime_hash = calculate_shaping_runtime_hash()
+    mark_shaping_runtime_hash_applied(refresh_target_hash)
     if shaping_runtime_hash != 0:
         set_scheduler_status_bus_enabled(True)
         return True
@@ -1166,7 +1177,7 @@ def importAndShapePartialReload():
                 return
             report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
             return
-        shaping_runtime_hash = calculate_shaping_runtime_hash()
+        mark_shaping_runtime_hash_applied(new_hash)
         if shaping_runtime_hash != 0:
             set_scheduler_status_bus_enabled(True)
     publish_ready_progress(False, "ready", "Scheduler ready", SCHEDULER_REFRESH_STEP_COUNT, SCHEDULER_REFRESH_STEP_COUNT, percent=100)
@@ -1468,9 +1479,10 @@ def _continue_startup_topology_runtime_wait():
             SCHEDULER_STARTUP_STEP_COUNT,
         )
         try:
+            refresh_target_hash = calculate_shaping_runtime_hash()
             if not enable_insight_topology():
                 refreshShapers()
-            shaping_runtime_hash = calculate_shaping_runtime_hash()
+            mark_shaping_runtime_hash_applied(refresh_target_hash)
         except ValidationFailure as e:
             _reset_startup_topology_runtime_wait()
             report_scheduler_validation_failure(
@@ -1594,7 +1606,7 @@ def _continue_partial_topology_runtime_wait():
                 _reset_partial_topology_runtime_wait()
                 report_scheduler_runtime_failure("Scheduled shaping refresh failed", e)
                 return
-            shaping_runtime_hash = calculate_shaping_runtime_hash()
+            mark_shaping_runtime_hash_applied(new_hash)
             if shaping_runtime_hash == 0:
                 _reset_partial_topology_runtime_wait()
                 report_scheduler_runtime_failure(
@@ -1689,7 +1701,7 @@ def topology_runtime_refresh_tick():
             return
         report_scheduler_runtime_failure("Topology runtime refresh failed", e)
         return
-    shaping_runtime_hash = calculate_shaping_runtime_hash()
+    mark_shaping_runtime_hash_applied(new_hash)
     if shaping_runtime_hash == 0:
         report_scheduler_runtime_failure(
             "Topology runtime refresh failed",

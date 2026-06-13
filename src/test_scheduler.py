@@ -505,11 +505,7 @@ class TestSchedulerLogging(unittest.TestCase):
                 "topology_runtime_readiness_detail",
                 return_value=(True, "", "generation-1"),
             ):
-                with patch.object(
-                    scheduler,
-                    "calculate_shaping_runtime_hash",
-                    side_effect=[5, 5],
-                ):
+                with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=5):
                     with patch.object(scheduler, "refreshShapers") as mock_refresh:
                         with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
                             with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
@@ -530,28 +526,25 @@ class TestSchedulerLogging(unittest.TestCase):
             )
         )
 
-    def test_topology_runtime_refresh_tick_reports_missing_hash_after_success(self):
+    def test_topology_runtime_refresh_tick_records_hash_that_triggered_refresh(self):
         with patch.object(scheduler, "ensure_topology_runtime_process"):
             with patch.object(
                 scheduler,
                 "topology_runtime_readiness_detail",
                 return_value=(True, "", "generation-1"),
             ):
-                with patch.object(
-                    scheduler,
-                    "calculate_shaping_runtime_hash",
-                    side_effect=[5, 0],
-                ):
-                    with patch.object(scheduler, "refreshShapers"):
+                with patch.object(scheduler, "calculate_shaping_runtime_hash") as mock_hash:
+                    mock_hash.side_effect = [5]
+                    with patch.object(scheduler, "refreshShapers") as mock_refresh:
                         with patch.object(scheduler, "scheduler_error") as mock_scheduler_error:
-                            with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
+                            with patch.object(scheduler, "clear_scheduler_error"):
                                 scheduler.shaping_runtime_hash = 1
                                 scheduler.topology_runtime_refresh_tick()
 
-        mock_clear_error.assert_not_called()
-        mock_scheduler_error.assert_called_once_with(
-            "Topology runtime refresh failed: Shaping runtime hash was not published after topology runtime refresh."
-        )
+        mock_refresh.assert_called_once()
+        mock_scheduler_error.assert_not_called()
+        self.assertEqual(scheduler.shaping_runtime_hash, 5)
+        self.assertEqual(mock_hash.call_count, 1)
 
     def test_topology_runtime_refresh_tick_skips_until_initial_shaping_succeeds(self):
         with patch.object(scheduler, "ensure_topology_runtime_process") as mock_ensure:
@@ -719,7 +712,7 @@ class TestSchedulerLogging(unittest.TestCase):
             return_value=(True, "", "generation-1"),
         ):
             with patch.object(scheduler, "refreshShapers") as mock_refresh:
-                with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=9):
+                with patch.object(scheduler, "calculate_shaping_runtime_hash", return_value=9) as mock_hash:
                     with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
                         with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:
                             with patch("builtins.print"):
@@ -727,6 +720,7 @@ class TestSchedulerLogging(unittest.TestCase):
 
         mock_refresh.assert_called_once()
         mock_clear_error.assert_called_once()
+        mock_hash.assert_called_once()
         self.assertEqual(scheduler.shaping_runtime_hash, 9)
         self.assertFalse(scheduler.startup_topology_runtime_pending)
         self.assertTrue(
@@ -777,7 +771,7 @@ class TestSchedulerLogging(unittest.TestCase):
                 with patch.object(
                     scheduler,
                     "calculate_shaping_runtime_hash",
-                    side_effect=[9, 9],
+                    return_value=9,
                 ):
                     with patch.object(scheduler, "publish_scheduler_progress") as mock_progress:
                         with patch.object(scheduler, "clear_scheduler_error") as mock_clear_error:

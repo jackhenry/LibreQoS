@@ -2690,6 +2690,22 @@ fn logical_child_branch_counts(ui_state: &TopologyEditorStateFile) -> HashMap<St
     counts
 }
 
+fn effective_attachment_branch_counts(
+    effective: &TopologyEffectiveStateFile,
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for node in &effective.nodes {
+        let Some(attachment_id) = node.effective_attachment_id.as_deref() else {
+            continue;
+        };
+        if attachment_id.trim().is_empty() {
+            continue;
+        }
+        *counts.entry(attachment_id.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
 fn read_node_rate_mbps(node: &Map<String, Value>, key: &str) -> Option<u64> {
     node.get(key).and_then(|value| {
         value
@@ -2709,6 +2725,7 @@ fn resolved_queue_visibility_policy(
     ui_node: &TopologyEditorNode,
     tree_node: Option<&Value>,
     child_branch_counts: &HashMap<String, usize>,
+    attachment_branch_counts: &HashMap<String, usize>,
     virtualization: &QueueVirtualizationContext,
 ) -> TopologyQueueVisibilityPolicy {
     if virtualization
@@ -2729,6 +2746,7 @@ fn resolved_queue_visibility_policy(
             ui_node,
             tree_node,
             child_branch_counts,
+            attachment_branch_counts,
             virtualization,
         ),
         TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren => {
@@ -2739,6 +2757,7 @@ fn resolved_queue_visibility_policy(
             ui_node,
             tree_node,
             child_branch_counts,
+            attachment_branch_counts,
             virtualization,
         ),
     }
@@ -2749,6 +2768,7 @@ fn resolved_auto_queue_visibility_policy(
     ui_node: &TopologyEditorNode,
     tree_node: Option<&Value>,
     child_branch_counts: &HashMap<String, usize>,
+    attachment_branch_counts: &HashMap<String, usize>,
     _virtualization: &QueueVirtualizationContext,
 ) -> TopologyQueueVisibilityPolicy {
     let Some(tree_node) = tree_node.and_then(Value::as_object) else {
@@ -2761,12 +2781,11 @@ fn resolved_auto_queue_visibility_policy(
         .get(ui_node.node_id.as_str())
         .copied()
         .unwrap_or_default();
-    let effective_child_count = tree_node
-        .get("children")
-        .and_then(Value::as_object)
-        .map(Map::len)
+    let attachment_child_count = attachment_branch_counts
+        .get(ui_node.node_id.as_str())
+        .copied()
         .unwrap_or_default();
-    if logical_child_count == 0 && effective_child_count == 0 {
+    if logical_child_count == 0 && attachment_child_count == 0 {
         return TopologyQueueVisibilityPolicy::QueueVisible;
     }
     let threshold = config.topology.queue_auto_virtualize_threshold_mbps;
@@ -2985,6 +3004,7 @@ fn mark_node_virtual_by_id(map: &mut Map<String, Value>, target_id: &str) -> boo
 fn apply_queue_hidden_node_virtualization(
     config: &Config,
     ui_state: &TopologyEditorStateFile,
+    effective: &TopologyEffectiveStateFile,
     root: &mut Map<String, Value>,
     virtualization: &QueueVirtualizationContext,
 ) {
@@ -2994,6 +3014,7 @@ fn apply_queue_hidden_node_virtualization(
         .map(|node| (node.node_id.as_str(), node))
         .collect::<HashMap<_, _>>();
     let child_branch_counts = logical_child_branch_counts(ui_state);
+    let attachment_branch_counts = effective_attachment_branch_counts(effective);
     let hidden_node_ids = queue_hidden_node_ids_in_promotion_order(ui_state);
     for hidden_node_id in hidden_node_ids {
         let Some(ui_node) = ui_by_id.get(hidden_node_id.as_str()).copied() else {
@@ -3004,6 +3025,7 @@ fn apply_queue_hidden_node_virtualization(
             ui_node,
             find_node_by_id(root, &hidden_node_id),
             &child_branch_counts,
+            &attachment_branch_counts,
             virtualization,
         );
         if resolved_policy != TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren {
@@ -4265,6 +4287,7 @@ fn validate_effective_topology_network_from_canonical(
         count_node_ids(child, &mut counts);
     }
     let child_branch_counts = logical_child_branch_counts(ui_state);
+    let attachment_branch_counts = effective_attachment_branch_counts(effective);
 
     for node in &ui_state.nodes {
         if !node.node_id.contains(":site:") {
@@ -4275,6 +4298,7 @@ fn validate_effective_topology_network_from_canonical(
             node,
             queue_policy_root.and_then(|root| find_node_by_id(root, &node.node_id)),
             &child_branch_counts,
+            &attachment_branch_counts,
             virtualization,
         ) == TopologyQueueVisibilityPolicy::QueueHiddenPromoteChildren
         {
@@ -4340,7 +4364,7 @@ fn apply_effective_topology_to_network_json_from_canonical(
     let mut out = apply_effective_topology_reparenting_only(canonical_network, ui_state, effective);
     if let Some(root) = out.as_object_mut() {
         recompile_effective_network_bandwidths(root, canonical, ui_state, effective);
-        apply_queue_hidden_node_virtualization(config, ui_state, root, virtualization);
+        apply_queue_hidden_node_virtualization(config, ui_state, effective, root, virtualization);
         apply_runtime_squashing(config, ui_state, effective, root);
     }
     out
@@ -7042,7 +7066,7 @@ mod tests {
 
     #[test]
     fn queue_auto_marks_large_ap_branch_virtual_with_effective_tree_children() {
-        let (config, canonical, mut editor_state, effective) = ap_branch_fixture();
+        let (config, canonical, mut editor_state, mut effective) = ap_branch_fixture();
         let access_ap = editor_state
             .nodes
             .iter_mut()
@@ -7050,6 +7074,22 @@ mod tests {
             .expect("fixture should include Access AP");
         access_ap.current_parent_node_id = Some("site-root".to_string());
         access_ap.current_parent_node_name = Some("Core".to_string());
+        let access_ap_effective = effective
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == "ap-child")
+            .expect("fixture should include Access AP effective state");
+        access_ap_effective.logical_parent_node_id = "site-root".to_string();
+        access_ap_effective.effective_attachment_id = Some("ap-agg".to_string());
+        access_ap_effective.attachments = vec![TopologyEffectiveAttachmentState {
+            attachment_id: "ap-agg".to_string(),
+            effective_selected: true,
+            health_reason: None,
+            health_status: TopologyAttachmentHealthStatus::Healthy,
+            probe_enabled: false,
+            probeable: false,
+            suppressed_until_unix: None,
+        }];
 
         let effective_network = apply_effective_topology_to_network_json(
             &config,
