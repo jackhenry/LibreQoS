@@ -353,36 +353,82 @@ mod tests {
     use super::{MergeNetworkModeError, merge_network_mode};
     use crate::test_support::runtime_config_test_lock;
     use lqos_config::{BridgeConfig, Config, SingleInterfaceConfig};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn network_mode_test_runtime_dir() -> PathBuf {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "lqosd-network-mode-test-{}-{unique_suffix}",
+            std::process::id()
+        ))
+    }
+
+    fn write_network_mode_test_config(runtime_dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(runtime_dir).expect("create network-mode runtime dir");
+        let config_path = runtime_dir.join("lqos.conf");
+        let runtime_dir_string = runtime_dir.display().to_string();
+        let state_dir_string = runtime_dir.join("state").display().to_string();
+        let raw = include_str!("../../../../lqos_config/src/etc/v15/example.toml")
+            .replace("/opt/libreqos/src", &runtime_dir_string)
+            .replace("/opt/libreqos/state", &state_dir_string)
+            .replace("node_id = \"0000-0000-0000\"", "node_id = \"node\"");
+        std::fs::write(&config_path, raw).expect("write network-mode test config");
+        config_path
+    }
+
+    struct NetworkModeTestContext {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old_lqos_config: Option<OsString>,
+        old_lqos_directory: Option<OsString>,
+        runtime_dir: PathBuf,
+    }
+
+    impl NetworkModeTestContext {
+        fn new() -> Self {
+            let guard = runtime_config_test_lock()
+                .lock()
+                .expect("network-mode env lock should not be poisoned");
+            let runtime_dir = network_mode_test_runtime_dir();
+            let config_path = write_network_mode_test_config(&runtime_dir);
+            let old_lqos_config = std::env::var_os("LQOS_CONFIG");
+            let old_lqos_directory = std::env::var_os("LQOS_DIRECTORY");
+            unsafe {
+                std::env::set_var("LQOS_CONFIG", &config_path);
+                std::env::set_var("LQOS_DIRECTORY", &runtime_dir);
+            }
+            lqos_config::clear_cached_config();
+            Self {
+                _guard: guard,
+                old_lqos_config,
+                old_lqos_directory,
+                runtime_dir,
+            }
+        }
+    }
+
+    impl Drop for NetworkModeTestContext {
+        fn drop(&mut self) {
+            match &self.old_lqos_config {
+                Some(value) => unsafe { std::env::set_var("LQOS_CONFIG", value) },
+                None => unsafe { std::env::remove_var("LQOS_CONFIG") },
+            }
+            match &self.old_lqos_directory {
+                Some(value) => unsafe { std::env::set_var("LQOS_DIRECTORY", value) },
+                None => unsafe { std::env::remove_var("LQOS_DIRECTORY") },
+            }
+            lqos_config::clear_cached_config();
+            let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        }
+    }
 
     fn with_config_env<T>(test_fn: impl FnOnce() -> T) -> T {
-        let _guard = runtime_config_test_lock()
-            .lock()
-            .expect("network-mode env lock should not be poisoned");
-        let old_lqos_config = std::env::var_os("LQOS_CONFIG");
-        let config_path = std::env::temp_dir().join(format!(
-            "lqosd-network-mode-test-{}.toml",
-            std::process::id()
-        ));
-        let raw = include_str!("../../../../lqos_config/src/etc/v15/example.toml");
-        std::fs::write(&config_path, raw).expect("write config");
-        lqos_config::clear_cached_config();
-
-        unsafe {
-            std::env::set_var("LQOS_CONFIG", &config_path);
-        }
-        let result = test_fn();
-
-        match old_lqos_config {
-            Some(value) => unsafe {
-                std::env::set_var("LQOS_CONFIG", value);
-            },
-            None => unsafe {
-                std::env::remove_var("LQOS_CONFIG");
-            },
-        }
-        lqos_config::clear_cached_config();
-        let _ = std::fs::remove_file(config_path);
-        result
+        let _context = NetworkModeTestContext::new();
+        test_fn()
     }
 
     #[test]
