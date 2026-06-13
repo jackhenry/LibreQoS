@@ -45,8 +45,9 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use lqos_bus::BusRequest;
 use lqos_probe::ProbeClient;
+use once_cell::sync::Lazy;
 use serde_cbor::Value as CborValue;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{Semaphore, mpsc::Sender};
 use tracing::{info, warn};
 
 pub(crate) mod messages;
@@ -58,7 +59,12 @@ mod ticker;
 const WS_VERSION: &str = include_str!("../../../../VERSION_STRING");
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const CONTROL_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const TOPOLOGY_MANAGER_BLOCKING_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT_SECS: u64 = 15;
+static TOPOLOGY_MANAGER_READ_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(1)));
+static TOPOLOGY_MANAGER_BLOCKING_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(1)));
 
 async fn send_control_command(
     control_tx: &tokio::sync::mpsc::Sender<ControlChannelCommand>,
@@ -72,6 +78,78 @@ async fn send_control_command(
             false
         }
     }
+}
+
+async fn run_topology_manager_blocking<F>(
+    operation: &'static str,
+    work: F,
+) -> Result<topology_manager::TopologyManagerStateData, StatusCode>
+where
+    F: FnOnce() -> Result<topology_manager::TopologyManagerStateData, StatusCode> + Send + 'static,
+{
+    run_topology_manager_blocking_with_timeout(
+        operation,
+        TOPOLOGY_MANAGER_BLOCKING_TIMEOUT,
+        TOPOLOGY_MANAGER_READ_PERMITS.clone(),
+        work,
+    )
+    .await
+}
+
+async fn run_topology_manager_mutation_blocking<F>(
+    operation: &'static str,
+    work: F,
+) -> Result<topology_manager::TopologyManagerStateData, StatusCode>
+where
+    F: FnOnce() -> Result<topology_manager::TopologyManagerStateData, StatusCode> + Send + 'static,
+{
+    run_topology_manager_blocking_with_timeout(
+        operation,
+        TOPOLOGY_MANAGER_BLOCKING_TIMEOUT,
+        TOPOLOGY_MANAGER_BLOCKING_PERMITS.clone(),
+        work,
+    )
+    .await
+}
+
+async fn run_topology_manager_blocking_with_timeout<F>(
+    operation: &'static str,
+    timeout_duration: Duration,
+    permits: Arc<Semaphore>,
+    work: F,
+) -> Result<topology_manager::TopologyManagerStateData, StatusCode>
+where
+    F: FnOnce() -> Result<topology_manager::TopologyManagerStateData, StatusCode> + Send + 'static,
+{
+    let permit = match tokio::time::timeout(timeout_duration, permits.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            warn!(
+                operation,
+                "Topology manager blocking semaphore is unavailable"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_) => {
+            warn!(
+                operation,
+                timeout_ms = timeout_duration.as_millis(),
+                "Timed out waiting for topology manager blocking slot"
+            );
+            return Err(StatusCode::GATEWAY_TIMEOUT);
+        }
+    };
+
+    tokio::task::block_in_place(move || {
+        let _permit = permit;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(operation, "Topology manager blocking task panicked");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    })
 }
 
 /// Provides an Axum router for the websocket system. Exposes a single /ws route that supports
@@ -1838,7 +1916,12 @@ async fn receive_channel_message(
             }
         }
         WsRequest::GetTopologyManagerState => {
-            match topology_manager::get_topology_manager_state(*request_state.login) {
+            let login = *request_state.login;
+            match run_topology_manager_blocking("get_topology_manager_state", move || {
+                topology_manager::get_topology_manager_state(login)
+            })
+            .await
+            {
                 Ok(data) => {
                     let response = WsResponse::GetTopologyManagerState { data };
                     if send_ws_response(&tx, response).await {
@@ -1890,8 +1973,12 @@ async fn receive_channel_message(
             }
         }
         WsRequest::SetTopologyManagerOverride { update } => {
-            let result =
-                topology_manager::set_topology_manager_override(*request_state.login, update);
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "set_topology_manager_override",
+                move || topology_manager::set_topology_manager_override(login, update),
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::SetTopologyManagerOverrideResult {
@@ -1930,8 +2017,12 @@ async fn receive_channel_message(
             }
         }
         WsRequest::ClearTopologyManagerOverride { clear } => {
-            let result =
-                topology_manager::clear_topology_manager_override(*request_state.login, clear);
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "clear_topology_manager_override",
+                move || topology_manager::clear_topology_manager_override(login, clear),
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::ClearTopologyManagerOverrideResult {
@@ -1970,8 +2061,12 @@ async fn receive_channel_message(
             }
         }
         WsRequest::SetTopologyManagerProbePolicy { update } => {
-            let result =
-                topology_manager::set_topology_manager_probe_policy(*request_state.login, update);
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "set_topology_manager_probe_policy",
+                move || topology_manager::set_topology_manager_probe_policy(login, update),
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::SetTopologyManagerProbePolicyResult {
@@ -2010,10 +2105,14 @@ async fn receive_channel_message(
             }
         }
         WsRequest::SetTopologyManagerAttachmentRateOverride { update } => {
-            let result = topology_manager::set_topology_manager_attachment_rate_override(
-                *request_state.login,
-                update,
-            );
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "set_topology_manager_attachment_rate_override",
+                move || {
+                    topology_manager::set_topology_manager_attachment_rate_override(login, update)
+                },
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::SetTopologyManagerAttachmentRateOverrideResult {
@@ -2052,10 +2151,14 @@ async fn receive_channel_message(
             }
         }
         WsRequest::ClearTopologyManagerAttachmentRateOverride { clear } => {
-            let result = topology_manager::clear_topology_manager_attachment_rate_override(
-                *request_state.login,
-                clear,
-            );
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "clear_topology_manager_attachment_rate_override",
+                move || {
+                    topology_manager::clear_topology_manager_attachment_rate_override(login, clear)
+                },
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::ClearTopologyManagerAttachmentRateOverrideResult {
@@ -2094,10 +2197,14 @@ async fn receive_channel_message(
             }
         }
         WsRequest::SetTopologyManagerManualAttachmentGroup { update } => {
-            let result = topology_manager::set_topology_manager_manual_attachment_group(
-                *request_state.login,
-                update,
-            );
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "set_topology_manager_manual_attachment_group",
+                move || {
+                    topology_manager::set_topology_manager_manual_attachment_group(login, update)
+                },
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::SetTopologyManagerManualAttachmentGroupResult {
@@ -2136,10 +2243,14 @@ async fn receive_channel_message(
             }
         }
         WsRequest::ClearTopologyManagerManualAttachmentGroup { clear } => {
-            let result = topology_manager::clear_topology_manager_manual_attachment_group(
-                *request_state.login,
-                clear,
-            );
+            let login = *request_state.login;
+            let result = run_topology_manager_mutation_blocking(
+                "clear_topology_manager_manual_attachment_group",
+                move || {
+                    topology_manager::clear_topology_manager_manual_attachment_group(login, clear)
+                },
+            )
+            .await;
             match result {
                 Ok(data) => {
                     let response = WsResponse::ClearTopologyManagerManualAttachmentGroupResult {
@@ -2540,16 +2651,22 @@ fn payload_hint(payload: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_ws_request, maybe_schedule_lts_signup_shutdown};
+    use super::{
+        decode_ws_request, maybe_schedule_lts_signup_shutdown,
+        run_topology_manager_blocking_with_timeout, run_topology_manager_mutation_blocking,
+    };
     use crate::node_manager::local_api::urgent::{UrgentList, UrgentStatus};
     use crate::node_manager::ws::messages::WsRequest;
     use crate::node_manager::ws::messages::{WsResponse, encode_ws_message};
+    use axum::http::StatusCode;
     use serde_cbor::Value as CborValue;
     use std::collections::BTreeMap;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     fn text(value: &str) -> CborValue {
         CborValue::Text(value.to_string())
@@ -2591,6 +2708,130 @@ mod tests {
             ("upload_max_mbps", float(200.0)),
             ("comment", text("")),
         ])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_blocking_propagates_status_errors() {
+        let result = run_topology_manager_blocking_with_timeout(
+            "test_status_error",
+            Duration::from_millis(50),
+            Arc::new(Semaphore::new(1)),
+            || Err(StatusCode::BAD_REQUEST),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_blocking_returns_success_data() {
+        let result =
+            run_topology_manager_blocking_with_timeout(
+                "test_success",
+                Duration::from_millis(50),
+                Arc::new(Semaphore::new(1)),
+                || {
+                    Ok(crate::node_manager::local_api::topology_manager::TopologyManagerStateData {
+                    writable: true,
+                    source: "test".to_string(),
+                    schema_version: 1,
+                    nodes: Vec::new(),
+                    global_warnings: Vec::new(),
+                })
+                },
+            )
+            .await
+            .expect("topology manager state should be returned");
+
+        assert!(result.writable);
+        assert_eq!(result.source, "test");
+        assert_eq!(result.schema_version, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_blocking_maps_panics_to_internal_server_error() {
+        let result = run_topology_manager_blocking_with_timeout(
+            "test_panic",
+            Duration::from_millis(50),
+            Arc::new(Semaphore::new(1)),
+            || panic!("topology manager test panic"),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_blocking_times_out_waiting_for_slot() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held_permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore is open");
+
+        let result = run_topology_manager_blocking_with_timeout(
+            "test_timeout",
+            Duration::from_millis(5),
+            permits,
+            || panic!("work should not start without a topology manager slot"),
+        )
+        .await;
+
+        drop(held_permit);
+        assert_eq!(result.unwrap_err(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_mutations_are_serialized() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let first_active = active.clone();
+        let first_max = max_active.clone();
+        let first = tokio::spawn(async move {
+            run_topology_manager_mutation_blocking("test_mutation_one", move || {
+                let now_active = first_active.fetch_add(1, Ordering::SeqCst) + 1;
+                first_max.fetch_max(now_active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                first_active.fetch_sub(1, Ordering::SeqCst);
+                Err(StatusCode::BAD_REQUEST)
+            })
+            .await
+        });
+
+        let second_active = active.clone();
+        let second_max = max_active.clone();
+        let second = tokio::spawn(async move {
+            run_topology_manager_mutation_blocking("test_mutation_two", move || {
+                let now_active = second_active.fetch_add(1, Ordering::SeqCst) + 1;
+                second_max.fetch_max(now_active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                second_active.fetch_sub(1, Ordering::SeqCst);
+                Err(StatusCode::BAD_REQUEST)
+            })
+            .await
+        });
+
+        assert_eq!(first.await.unwrap().unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(second.await.unwrap().unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topology_manager_mutation_maps_panics_to_internal_server_error() {
+        let result = run_topology_manager_mutation_blocking("test_mutation_panic", || {
+            panic!("topology manager mutation test panic");
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let recovered = run_topology_manager_mutation_blocking("test_mutation_after_panic", || {
+            Err(StatusCode::BAD_REQUEST)
+        })
+        .await;
+        assert_eq!(recovered.unwrap_err(), StatusCode::BAD_REQUEST);
     }
 
     fn create_shaped_device_payload(device: CborValue) -> Vec<u8> {

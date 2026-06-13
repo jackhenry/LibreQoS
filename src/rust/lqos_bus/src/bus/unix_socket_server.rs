@@ -5,7 +5,13 @@ use crate::{
     BUS_SOCKET_PATH, BusReply, BusRequest, BusResponse,
     bus::client::{MAGIC_NUMBER, MAGIC_RESPONSE},
 };
-use std::{ffi::CString, fs::remove_file, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::CString,
+    fmt::Write,
+    fs::remove_file,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -32,12 +38,51 @@ fn timeout_reply(request_count: usize) -> BusReply {
     }
 }
 
+fn request_kind_summary(request_kinds: &[&'static str]) -> String {
+    if request_kinds.is_empty() {
+        return "<none>".to_string();
+    }
+
+    let mut counts = BTreeMap::new();
+    for kind in request_kinds {
+        *counts.entry(*kind).or_insert(0usize) += 1;
+    }
+
+    let mut summary = String::new();
+    for (idx, (kind, count)) in counts.into_iter().enumerate() {
+        if idx > 0 {
+            summary.push_str(", ");
+        }
+        let _ = write!(summary, "{kind}={count}");
+    }
+    summary
+}
+
 async fn handle_requests_with_deadline(
     handle_bus_requests: fn(&[BusRequest], &mut Vec<BusResponse>),
     requests: Vec<BusRequest>,
+    request_source: &'static str,
+) -> BusReply {
+    handle_requests_with_deadline_for_duration(
+        handle_bus_requests,
+        requests,
+        request_source,
+        BUS_HANDLER_TIMEOUT,
+    )
+    .await
+}
+
+async fn handle_requests_with_deadline_for_duration(
+    handle_bus_requests: fn(&[BusRequest], &mut Vec<BusResponse>),
+    requests: Vec<BusRequest>,
+    request_source: &'static str,
+    timeout_duration: Duration,
 ) -> BusReply {
     let request_count = requests.len();
-    let handler = spawn_blocking(move || {
+    let request_kinds = requests.iter().map(BusRequest::kind).collect::<Vec<_>>();
+    let can_fail_fast = requests.iter().all(BusRequest::can_fail_fast_on_timeout);
+    let start = Instant::now();
+    let mut handler = spawn_blocking(move || {
         let mut response = BusReply {
             responses: Vec::with_capacity(request_count),
         };
@@ -45,19 +90,81 @@ async fn handle_requests_with_deadline(
         response
     });
 
-    match timeout(BUS_HANDLER_TIMEOUT, handler).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(err)) => {
-            warn!("Bus request handler task failed: {err}");
+    if can_fail_fast {
+        return match timeout(timeout_duration, handler).await {
+            Ok(result) => handle_bus_result(
+                result,
+                request_source,
+                request_count,
+                &request_kinds,
+                "Bus request handler task failed",
+            ),
+            Err(_) => {
+                warn!(
+                    source = request_source,
+                    request_count,
+                    request_kinds = %request_kind_summary(&request_kinds),
+                    elapsed_ms = start.elapsed().as_millis(),
+                    timeout_ms = timeout_duration.as_millis(),
+                    "Bus request handler timed out"
+                );
+                timeout_reply(request_count)
+            }
+        };
+    }
+
+    tokio::select! {
+        result = &mut handler => {
+            handle_bus_result(
+                result,
+                request_source,
+                request_count,
+                &request_kinds,
+                "Side-effecting bus request handler task failed",
+            )
+        }
+        _ = tokio::time::sleep(timeout_duration) => {
+            warn!(
+                source = request_source,
+                request_count,
+                request_kinds = %request_kind_summary(&request_kinds),
+                elapsed_ms = start.elapsed().as_millis(),
+                timeout_ms = timeout_duration.as_millis(),
+                "Side-effecting bus request handler exceeded deadline; waiting for completion"
+            );
+            handle_bus_result(
+                handler.await,
+                request_source,
+                request_count,
+                &request_kinds,
+                "Side-effecting bus request handler task failed after deadline",
+            )
+        }
+    }
+}
+
+fn handle_bus_result(
+    result: Result<BusReply, tokio::task::JoinError>,
+    request_source: &'static str,
+    request_count: usize,
+    request_kinds: &[&'static str],
+    failure_message: &'static str,
+) -> BusReply {
+    match result {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                source = request_source,
+                request_count,
+                request_kinds = %request_kind_summary(request_kinds),
+                error = %err,
+                "{failure_message}"
+            );
             BusReply {
                 responses: (0..request_count)
                     .map(|_| BusResponse::Fail("Bus request handler failed".to_string()))
                     .collect(),
             }
-        }
-        Err(_) => {
-            warn!("Bus request handler timed out after {BUS_HANDLER_TIMEOUT:?}");
-            timeout_reply(request_count)
         }
     }
 }
@@ -155,7 +262,11 @@ impl UnixSocketServer {
               ret = bus_rx.recv() => {
                 // We received a channel-based message
                 if let Some((reply_channel, msg)) = ret {
-                  let response = handle_requests_with_deadline(handle_bus_requests, vec![msg]).await;
+                  let response = handle_requests_with_deadline(
+                      handle_bus_requests,
+                      vec![msg],
+                      "internal_channel",
+                  ).await;
                   if let Err(reply) = reply_channel.send(response) {
                       warn!(
                           dropped_response_count = dropped_reply_response_count(&reply),
@@ -223,9 +334,12 @@ impl UnixSocketServer {
                         debug!("Received request: {:?}", request);
 
                         // Handle the request and build the response
-                        let response =
-                            handle_requests_with_deadline(handle_bus_requests, request.requests)
-                                .await;
+                        let response = handle_requests_with_deadline(
+                            handle_bus_requests,
+                            request.requests,
+                            "unix_socket",
+                        )
+                        .await;
 
                         // Encode the response
                         let Ok(encoded_response) = encode_reply_cbor(&response) else {
@@ -278,8 +392,12 @@ pub enum UnixSocketServerError {
 
 #[cfg(test)]
 mod tests {
-    use super::dropped_reply_response_count;
-    use crate::{BusReply, BusResponse};
+    use super::{
+        dropped_reply_response_count, handle_requests_with_deadline_for_duration,
+        request_kind_summary,
+    };
+    use crate::{BusReply, BusRequest, BusResponse};
+    use std::time::Duration;
 
     #[test]
     fn dropped_reply_summary_only_counts_responses() {
@@ -288,5 +406,99 @@ mod tests {
         };
 
         assert_eq!(dropped_reply_response_count(&reply), 3);
+    }
+
+    #[test]
+    fn request_kind_summary_counts_by_request_type() {
+        assert_eq!(
+            request_kind_summary(&["Ping", "GetNetworkMap", "Ping"]),
+            "GetNetworkMap=1, Ping=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_handler_success_returns_handler_responses_in_order() {
+        fn success_handler(requests: &[BusRequest], responses: &mut Vec<BusResponse>) {
+            for request in requests {
+                responses.push(BusResponse::Fail(format!("handled {}", request.kind())));
+            }
+        }
+
+        let response = handle_requests_with_deadline_for_duration(
+            success_handler,
+            vec![BusRequest::Ping, BusRequest::GetCurrentThroughput],
+            "test",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(
+            response.responses,
+            vec![
+                BusResponse::Fail("handled Ping".to_string()),
+                BusResponse::Fail("handled GetCurrentThroughput".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_handler_timeout_returns_failure_per_request() {
+        fn slow_handler(_requests: &[BusRequest], _responses: &mut Vec<BusResponse>) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let response = handle_requests_with_deadline_for_duration(
+            slow_handler,
+            vec![BusRequest::Ping, BusRequest::GetCurrentThroughput],
+            "test",
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(
+            response.responses,
+            vec![
+                BusResponse::Fail("Bus request handler timed out".to_string()),
+                BusResponse::Fail("Bus request handler timed out".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn side_effecting_request_waits_for_handler_after_deadline() {
+        fn slow_mutating_handler(_requests: &[BusRequest], responses: &mut Vec<BusResponse>) {
+            std::thread::sleep(Duration::from_millis(20));
+            responses.push(BusResponse::Ack);
+        }
+
+        let response = handle_requests_with_deadline_for_duration(
+            slow_mutating_handler,
+            vec![BusRequest::ClearHotCache],
+            "test",
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(response.responses, vec![BusResponse::Ack]);
+    }
+
+    #[tokio::test]
+    async fn request_handler_panic_returns_failure_per_request() {
+        fn panic_handler(_requests: &[BusRequest], _responses: &mut Vec<BusResponse>) {
+            panic!("bus handler test panic");
+        }
+
+        let response = handle_requests_with_deadline_for_duration(
+            panic_handler,
+            vec![BusRequest::Ping],
+            "test",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(
+            response.responses,
+            vec![BusResponse::Fail("Bus request handler failed".to_string())]
+        );
     }
 }
