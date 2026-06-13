@@ -1106,7 +1106,6 @@ def write_network_json(path: str, network: dict):
 
 
 def importAndShapeFullReload():
-    global shaping_runtime_hash
     importFromCRM()
     publish_scheduler_progress(True, "starting_topology_runtime", "Starting topology runtime", 4, SCHEDULER_STARTUP_STEP_COUNT)
     if not ensure_topology_runtime_process(wait_for_outputs=True):
@@ -1138,8 +1137,6 @@ def importAndShapeFullReload():
 
 
 def importAndShapePartialReload():
-    global shaping_runtime_hash
-
     importFromCRM(
         integration_phase="partial_integration",
         integration_label="Running scheduled integration refresh",
@@ -1552,7 +1549,6 @@ def _continue_startup_topology_runtime_wait():
 
 
 def _continue_partial_topology_runtime_wait():
-    global shaping_runtime_hash
     global partial_topology_runtime_generation
     global partial_topology_runtime_started_monotonic
     global partial_topology_runtime_last_report_state
@@ -1678,8 +1674,6 @@ def _record_slow_topology_runtime_refresh_phase(phase: str, started: float, slow
 
 
 def topology_runtime_refresh_tick():
-    global shaping_runtime_hash
-
     if startup_topology_runtime_pending:
         _continue_startup_topology_runtime_wait()
         return
