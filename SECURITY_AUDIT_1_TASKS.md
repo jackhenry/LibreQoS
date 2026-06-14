@@ -3,6 +3,11 @@
 Date: 2026-05-15
 Branch goal: move the current security branch from a solid B posture to an A-grade release posture.
 
+2026-06-15 branch note: `chore/security_audit_2026_06_15` intentionally
+excludes the eBPF/XDP/TC structural changes and related `lqos_sys` Rust-side
+changes from the May audit branch. Tasks that require those surfaces remain
+deferred here until they can be reintroduced with live load validation.
+
 Source notes reviewed:
 
 - `SECURITY_AUDIT_2026_05_15_update1.md`
@@ -99,6 +104,10 @@ Done when:
 
 ### 4. Remove panic and silent-failure paths on operator-controlled inputs
 
+Status: Deferred on the 2026-06-15 branch. The original mixed commit touched
+operator-input hardening and XDP/TC cleanup visibility in the same patch, so it
+was left out of this branch to keep `lqos_sys` unchanged.
+
 Why:
 
 DeepSeek found several low-to-medium reliability/security issues where malformed operator files, imported API data, or cleanup failures panic or silently hide an operational failure. These are not direct remote compromise vectors, but they are exactly the sort of hardening work that separates a B from an A.
@@ -131,6 +140,9 @@ Done when:
 
 ### 5. Add low-cost eBPF backpressure visibility
 
+Status: Deferred on the 2026-06-15 branch because it requires eBPF map and
+`lqos_sys` reader changes.
+
 Why:
 
 The RTT `flowbee_events` ring-buffer path still ignores `bpf_ringbuf_output` failure. Heimdall now checks copy/output errors, but drop visibility should be consistent. This should be done with extreme care because recent eBPF changes already hit verifier and size limits.
@@ -156,9 +168,16 @@ Done when:
 
 ### 6. Expand malformed-traffic coverage without growing the hot path recklessly
 
+Status: Deferred on the 2026-06-15 branch because it changes XDP/TC packet
+parsing and verifier-sensitive eBPF code.
+
 Why:
 
-The branch fixed IPv4 header length, total length, version, and fragment handling, but the audit still points at IPv6 extension headers, IPv6 fragments, MPLS parser coverage, and fragment policy. Full parser expansion may be too expensive for XDP, so the task should be conservative.
+The May audit branch fixed IPv4 header length, total length, version, and
+fragment handling, but this 2026-06-15 branch does not carry that eBPF parser
+work. The audit still points at IPv6 extension headers, IPv6 fragments, MPLS
+parser coverage, and fragment policy. Full parser expansion may be too
+expensive for XDP, so the task should be conservative.
 
 Paths:
 
@@ -262,7 +281,7 @@ Done when:
 
 Why:
 
-The final A grade should be based on proof, not just code inspection.
+The final grade should be based on proof, not just code inspection.
 
 Work:
 
@@ -274,7 +293,7 @@ Work:
 
 Done when:
 
-- The branch has an evidence-backed security summary that explains why the remaining risks are accepted for an A grade.
+- The branch has an evidence-backed security summary that explains why the remaining risks are accepted for the release target.
 
 ## Deferred Unless Time Allows
 
