@@ -10,8 +10,11 @@ fi
 
 echo "[test-node-manager] Running frontend contract tests..."
 node --test \
+  "${SCRIPT_DIR}/src/helpers/builders.test.mjs" \
+  "${SCRIPT_DIR}/src/circuit_packet_capture_dom.test.mjs" \
   "${SCRIPT_DIR}/src/config/shaped_device_wire.test.mjs" \
   "${SCRIPT_DIR}/src/config/config_interface_mtu.test.mjs" \
+  "${SCRIPT_DIR}/src/config/network_mode_storage.test.mjs" \
   "${SCRIPT_DIR}/src/config/ssl_redirect.test.mjs" \
   "${SCRIPT_DIR}/src/pubsub/ws.test.mjs"
 

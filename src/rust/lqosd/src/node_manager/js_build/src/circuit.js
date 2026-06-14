@@ -1,6 +1,6 @@
 // Obtain URL parameters
 import {DirectChannel} from "./pubsub/direct_channels";
-import {clearDiv, formatLastSeen, simpleRow, simpleRowHtml, theading} from "./helpers/builders";
+import {clearDiv, formatLastSeen, simpleRow, simpleRowTrustedHtml, theading} from "./helpers/builders";
 import {
     formatRetransmitFraction,
     formatRtt,
@@ -29,6 +29,11 @@ import {CakeDrops} from "./graphs/cake_drops";
 import {QueuingActivityWaveform} from "./graphs/queuing_activity_waveform";
 import {getNodeIdMap, linkToTreeNode} from "./executive_utils";
 import {loadConfig} from "./config/config_helper";
+import {
+    appendRedactableText,
+    setIconText,
+    setPacketCaptureDownloadButton,
+} from "./circuit_packet_capture_dom.mjs";
 
 const params = new Proxy(new URLSearchParams(window.location.search), {
     get: (searchParams, prop) => searchParams.get(prop),
@@ -58,6 +63,7 @@ let excludeRttLastValue = false;
 let excludeRttBusy = false;
 let latestCakeMsg = null;
 let cakeGraphs = null;
+
 let cakeQueueUnavailable = false;
 let queueStatsMode = "live";
 let circuitSqmOverride = "";
@@ -1914,14 +1920,14 @@ function renderTopAsnTab() {
 
             row.appendChild(truncatedTrafficCell(rowData.asn_name, "lqos-circuit-traffic-asn-cell"));
             row.appendChild(truncatedTrafficCell(rowData.asn_country, "lqos-circuit-traffic-country-cell"));
-            row.appendChild(simpleRowHtml(formatThroughput(rowData.down_bps, plan.down)));
-            row.appendChild(simpleRowHtml(formatThroughput(rowData.up_bps, plan.up)));
-            row.appendChild(simpleRowHtml(formatRttNanos(rowData.rtt_down_nanos)));
-            row.appendChild(simpleRowHtml(formatRttNanos(rowData.rtt_up_nanos)));
-            row.appendChild(simpleRowHtml(formatQooScore(rowData.qoo_down)));
-            row.appendChild(simpleRowHtml(formatQooScore(rowData.qoo_up)));
-            row.appendChild(simpleRowHtml(rowData.retransmit_down_pct > 0 ? formatRetransmitFraction(rowData.retransmit_down_pct) : "-"));
-            row.appendChild(simpleRowHtml(rowData.retransmit_up_pct > 0 ? formatRetransmitFraction(rowData.retransmit_up_pct) : "-"));
+            row.appendChild(simpleRowTrustedHtml(formatThroughput(rowData.down_bps, plan.down)));
+            row.appendChild(simpleRowTrustedHtml(formatThroughput(rowData.up_bps, plan.up)));
+            row.appendChild(simpleRowTrustedHtml(formatRttNanos(rowData.rtt_down_nanos)));
+            row.appendChild(simpleRowTrustedHtml(formatRttNanos(rowData.rtt_up_nanos)));
+            row.appendChild(simpleRowTrustedHtml(formatQooScore(rowData.qoo_down)));
+            row.appendChild(simpleRowTrustedHtml(formatQooScore(rowData.qoo_up)));
+            row.appendChild(simpleRowTrustedHtml(rowData.retransmit_down_pct > 0 ? formatRetransmitFraction(rowData.retransmit_down_pct) : "-"));
+            row.appendChild(simpleRowTrustedHtml(rowData.retransmit_up_pct > 0 ? formatRetransmitFraction(rowData.retransmit_up_pct) : "-"));
             row.appendChild(simpleRow(scaleNumber(rowData.flow_count)));
 
             tbody.appendChild(row);
@@ -2003,18 +2009,18 @@ function renderTrafficTab() {
             row.style.opacity = toNumber(rowData.opacity, 1);
 
             row.appendChild(truncatedTrafficCell(rowData.protocol_name, "lqos-circuit-traffic-protocol-cell"));
-            row.appendChild(simpleRowHtml(formatThroughput(rowData.down_bps, plan.down)));
-            row.appendChild(simpleRowHtml(formatThroughput(rowData.up_bps, plan.up)));
+            row.appendChild(simpleRowTrustedHtml(formatThroughput(rowData.down_bps, plan.down)));
+            row.appendChild(simpleRowTrustedHtml(formatThroughput(rowData.up_bps, plan.up)));
             row.appendChild(simpleRow(scaleNumber(rowData.bytes_sent_down)));
             row.appendChild(simpleRow(scaleNumber(rowData.bytes_sent_up)));
             row.appendChild(simpleRow(scaleNumber(rowData.packets_sent_down)));
             row.appendChild(simpleRow(scaleNumber(rowData.packets_sent_up)));
-            row.appendChild(simpleRowHtml(rowData.retransmit_down_pct > 0 ? formatRetransmitFraction(rowData.retransmit_down_pct) : "-"));
-            row.appendChild(simpleRowHtml(rowData.retransmit_up_pct > 0 ? formatRetransmitFraction(rowData.retransmit_up_pct) : "-"));
-            row.appendChild(simpleRowHtml(formatRttNanos(rowData.rtt_down_nanos)));
-            row.appendChild(simpleRowHtml(formatRttNanos(rowData.rtt_up_nanos)));
-            row.appendChild(simpleRowHtml(formatQooScore(rowData.qoo_down)));
-            row.appendChild(simpleRowHtml(formatQooScore(rowData.qoo_up)));
+            row.appendChild(simpleRowTrustedHtml(rowData.retransmit_down_pct > 0 ? formatRetransmitFraction(rowData.retransmit_down_pct) : "-"));
+            row.appendChild(simpleRowTrustedHtml(rowData.retransmit_up_pct > 0 ? formatRetransmitFraction(rowData.retransmit_up_pct) : "-"));
+            row.appendChild(simpleRowTrustedHtml(formatRttNanos(rowData.rtt_down_nanos)));
+            row.appendChild(simpleRowTrustedHtml(formatRttNanos(rowData.rtt_up_nanos)));
+            row.appendChild(simpleRowTrustedHtml(formatQooScore(rowData.qoo_down)));
+            row.appendChild(simpleRowTrustedHtml(formatQooScore(rowData.qoo_up)));
             row.appendChild(truncatedTrafficCell(rowData.asn_name, "lqos-circuit-traffic-asn-cell"));
             row.appendChild(truncatedTrafficCell(rowData.asn_country, "lqos-circuit-traffic-country-cell"));
             row.appendChild(simpleRow(rowData.remote_ip));
@@ -2161,7 +2167,10 @@ function initialDevices(circuits) {
 
         let name = document.createElement("h5");
         name.classList.add("redactable");
-        name.innerHTML = "<i class='fa fa-computer'></i> " + circuit.device_name;
+        const deviceIcon = document.createElement("i");
+        deviceIcon.classList.add("fa", "fa-computer");
+        name.appendChild(deviceIcon);
+        name.appendChild(document.createTextNode(` ${circuit.device_name ?? ""}`));
         d.appendChild(name);
 
         let infoTableWrap = document.createElement("div");
@@ -2181,7 +2190,7 @@ function initialDevices(circuits) {
         td.classList.add("table-value-cell");
         td.classList.add("redactable");
         td.colSpan = 2;
-        td.innerHTML = circuit.mac;
+        td.textContent = circuit.mac ?? "";
         tr.appendChild(td);
         tbody.appendChild(tr);
 
@@ -2194,7 +2203,7 @@ function initialDevices(circuits) {
         td = document.createElement("td");
         td.classList.add("table-value-cell");
         td.colSpan = 2;
-        td.innerHTML = circuit.comment;
+        td.textContent = circuit.comment ?? "";
         tr2.appendChild(td);
         tbody.appendChild(tr2);
 
@@ -2498,7 +2507,7 @@ function wireupAnalysis(circuits) {
     listBtn.id = "CaptureTopBtn";
     listBtn.classList.add("btn", "btn-secondary", "dropdown-toggle", "btn-sm");
     listBtn.setAttribute("data-bs-toggle", "dropdown");
-    listBtn.innerHTML = "<i class='fa fa-search'></i> Packet Capture";
+    setIconText(listBtn, ["fa", "fa-search"], "Packet Capture");
     list.appendChild(listBtn);
 
     let listUl = document.createElement("ul");
@@ -2507,8 +2516,9 @@ function wireupAnalysis(circuits) {
         let entry = document.createElement("li");
         let item = document.createElement("a");
         item.classList.add("dropdown-item");
-        item.innerHTML = "<i class='fa fa-search'></i> Capture packets from <span class='redactable'>" + ip[0] + "</span>";
         let address = ip[0]; // For closure capture
+        setIconText(item, ["fa", "fa-search"], "Capture packets from ");
+        appendRedactableText(item, address);
         item.onclick = () => {
             //console.log("Clicky " + address);
             listenOnce("RequestAnalysisResult", (msg) => {
@@ -2522,13 +2532,13 @@ function wireupAnalysis(circuits) {
                 let sessionId = okData.session_id;
                 let btn = document.getElementById("CaptureTopBtn");
                 btn.disabled = true;
-                btn.innerHTML = "<i class='fa fa-spinner fa-spin'></i> Capturing Packets (" + counter + ")";
+                setIconText(btn, ["fa", "fa-spinner", "fa-spin"], "Capturing Packets (" + counter + ")");
                 let interval = setInterval(() => {
                     counter--;
                     if (counter === -1) {
                         clearInterval(interval);
                         btn.disabled = false;
-                        btn.innerHTML = "<i class='fa fa-download'></i> Download Packet Capture for <span class='redactable'>" + address + "</span>";
+                        setPacketCaptureDownloadButton(btn, address);
                         btn.classList.remove("btn-secondary");
                         btn.classList.add("btn-success");
                         btn.onclick = () => {
@@ -2543,7 +2553,7 @@ function wireupAnalysis(circuits) {
                         }
                         return;
                     }
-                    btn.innerHTML = "<i class='fa fa-spinner fa-spin'></i> Capturing Packets (" + counter + ")";
+                    setIconText(btn, ["fa", "fa-spinner", "fa-spin"], "Capturing Packets (" + counter + ")");
                 }, 1000);
             });
             wsClient.send({ RequestAnalysis: { ip: address } });
